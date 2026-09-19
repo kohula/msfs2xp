@@ -1,0 +1,23 @@
+# Build output
+/build/
+/dist/
+*.spec.bak
+
+# Runtime caches and scratch space
+/_cache/
+/_temp/
+__pycache__/
+*.pyc
+
+# Local, per-machine settings (recreated automatically on first run)
+msfs2xp_config.json
+
+# Microsoft/Asobo MSFS SDK data -- not ours to redistribute, see
+# spb2xml/NOTICE.md and exe.bat. Point Settings -> "Propdefs folder"
+# (or MSFS2XP_PROPDEFS_DIR) at your own copy instead.
+/spb2xml/propdefs/
+/spb2xml/propdefs.zip
+
+# Editor/OS cruft
+.DS_Store
+Thumbs.db

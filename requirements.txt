@@ -1,0 +1,16 @@
+numpy
+Pillow
+texture2ddecoder
+zstandard
+py7zr            # read 7z-compressed default X-Plane scenery DSFs -- required
+                 # for terrain_fit (large-building ground-elevation warp).
+                 # Still feature-detected (terrain_dem.py try/imports it), so
+                 # the app runs without it, just with terrain_fit disabled.
+
+# Optional -- fails gracefully (feature-detected, not imported
+# unconditionally) when not installed:
+#   pyopencl        gpu_accel.py's OpenCL batch path; falls back to numpy
+# pyopencl
+
+# Build-only, not needed to run from source:
+# pyinstaller
