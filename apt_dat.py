@@ -459,26 +459,6 @@ def anonymize_visual_pavement(block_lines, keep_lighting=True):
 
 _APT_DAT_VERSION = "1100"
 
-_NAME_MARKER = "(msfs2xp)"
-
-
-def _tag_airport_name(block_lines):
-    """Append a marker to the row-1 airport NAME so it's obvious in X-Plane's
-    airport picker / ATC / map whether THIS block (vs the default Global
-    Airports one) is the one that actually won the override. Purely
-    diagnostic and harmless -- X-Plane treats everything after the ICAO on
-    row 1 as free-text display name."""
-    out = []
-    tagged = False
-    for line in block_lines:
-        parts = line.split()
-        if not tagged and parts[:1] == ["1"] and len(parts) >= 6 and _NAME_MARKER not in line:
-            out.append(line.rstrip() + " " + _NAME_MARKER)
-            tagged = True
-        else:
-            out.append(line)
-    return out
-
 
 def _dist_m(a, b):
     """Flat local approximation (same as geo_transform.metres_per_degree's
@@ -730,7 +710,7 @@ def write_apt_dat(out_path: Path, block_lines, source_note: str, keep_lighting=T
     if native_layout is not None and not native_layout.is_empty():
         block_lines = reposition_runways(block_lines, native_layout.runway_centers)
         block_lines = replace_taxi_network_and_starts(block_lines, native_layout, airport_name=airport_name)
-    block_lines = _tag_airport_name(anonymize_visual_pavement(block_lines, keep_lighting=keep_lighting))
+    block_lines = anonymize_visual_pavement(block_lines, keep_lighting=keep_lighting)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     # Header version 1100: every surviving row code (anonymize_visual_
     # pavement already drops anything needing a newer spec, e.g. 1500

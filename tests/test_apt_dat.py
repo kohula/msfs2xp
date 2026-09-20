@@ -232,10 +232,11 @@ class TestAptDat(unittest.TestCase):
             # Header 1100 -- a 1200 header was not overriding the 1130 Global
             # Airports block; every working custom-airport pack ships 1000/1100.
             self.assertTrue(main_lines[1].startswith("1100"))
-            # The airport NAME on row 1 is tagged so it's visible in X-Plane
-            # which block actually won the override.
+            # The airport NAME on row 1 is left exactly as the source block
+            # had it -- no "(msfs2xp)" tag appended (removed per user request:
+            # X-Plane's airport picker/ATC/map should show the real name).
             row1 = next(l for l in main_lines if l.startswith("1 "))
-            self.assertTrue(row1.rstrip().endswith("(msfs2xp)"))
+            self.assertFalse(row1.rstrip().endswith("(msfs2xp)"))
             # anonymize_visual_pavement now drops auto-jetways from the main
             # file too (the package ships converted MSFS jetways), so neither
             # output carries row 1500.
