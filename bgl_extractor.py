@@ -1050,7 +1050,7 @@ def _resolve_propdefs_dir(explicit, spb2xml_dir, _log):
     return None
 
 
-def extract_spb_placements(spb_path: Path, airport_lat: float, airport_lon: float, airport_alt: float, existing_placements: list, _log, name_map: dict = None, propdefs_dir: str = None):
+def extract_spb_placements(spb_path: Path, airport_lat: float, airport_lon: float, airport_alt: float, existing_placements: list, _log, name_map: dict = None, propdefs_dir: str = None, allow_fallback: bool = True):
     import sys
     import uuid
 
@@ -1102,13 +1102,31 @@ def extract_spb_placements(spb_path: Path, airport_lat: float, airport_lon: floa
     # A SimPropContainer's GUID is placed once per real-world instance in
     # the scenery BGL (an apron light/lamp fixture can repeat 50+ times).
     # Expand the container against EVERY matching placement (one
-    # attached-model instance per container instance), falling back to
-    # airport-centre only when the BGL places the container nowhere.
+    # attached-model instance per container instance).
+    #
+    # A container whose GUID is only ever produced by ANOTHER .spb's
+    # attach output (nested attach chains -- e.g. a seat/furniture
+    # cluster attached to a master container that is itself
+    # SPB-attached, not a raw BGL placement) legitimately has no anchor
+    # the first time it's processed, purely because of file-processing
+    # order. extract()'s own orchestration runs a MULTI-PASS retry:
+    # allow_fallback=False here returns None -- a distinct "retry me
+    # after other .spb files have had a chance to resolve" signal, never
+    # placed at the airport's reference point as a guess. Only once a
+    # full pass makes no further progress does extract() drop what's
+    # still pending (confirmed real symptom of a too-blunt single-pass
+    # skip: 2616 -> 1477 unique placement groups on a real EGLC
+    # conversion, breaking interior content -- "the seats of the
+    # building... outside of the building"). allow_fallback=True (the
+    # default, used by direct callers e.g. tests) keeps the single-pass
+    # airport-centre fallback for compatibility.
     anchors = []
     if container_guid_hex:
         anchors = [p for p in existing_placements if p.get("guid") == container_guid_hex]
     used_fallback = not anchors
     if used_fallback:
+        if not allow_fallback:
+            return None
         if airport_lat is None or airport_lon is None:
             _log(f"      [SPB] {spb_path.name}: Parent container placement NOT FOUND. Skipping.", "error")
             return []
@@ -2025,14 +2043,42 @@ def extract(target_path: Path, out_dir: Path, log_callback=None, msfs_install_ro
         # otherwise the wrapper must survive so it still reaches the
         # unresolved picker.
         _resolvably_expanded = set()
-        for spb_path in spb_files:
-            spb_placements = extract_spb_placements(spb_path, airport_lat, airport_lon, airport_alt, placements, _log, name_map=name_map, propdefs_dir=propdefs_dir)
-            if spb_placements:
-                cg = spb_placements[0].get("container_guid")
-                is_fallback = "Fallback" in (spb_placements[0].get("source") or "")
-                if cg and not is_fallback and any(c.get("guid") in guid_map for c in spb_placements):
-                    _resolvably_expanded.add(cg)
-                placements.extend(spb_placements)
+        # Multi-pass: a container whose own real-world anchor is only
+        # producible by ANOTHER .spb's attach output (nested attach
+        # chains) has no anchor yet on an early pass purely because of
+        # file order, not because it's genuinely orphaned -- see
+        # extract_spb_placements' own docstring/comment. Retry whatever
+        # didn't resolve after every pass that made progress; once a full
+        # pass resolves nothing new, anything still pending has no
+        # ancestor chain reaching a real placement at all and is dropped
+        # (never placed at the airport's reference point as a guess).
+        _pending = list(spb_files)
+        while _pending:
+            _next_pending = []
+            _progress = False
+            for spb_path in _pending:
+                spb_placements = extract_spb_placements(
+                    spb_path, airport_lat, airport_lon, airport_alt, placements, _log,
+                    name_map=name_map, propdefs_dir=propdefs_dir, allow_fallback=False)
+                if spb_placements is None:
+                    _next_pending.append(spb_path)
+                    continue
+                _progress = True
+                if spb_placements:
+                    cg = spb_placements[0].get("container_guid")
+                    if cg and any(c.get("guid") in guid_map for c in spb_placements):
+                        _resolvably_expanded.add(cg)
+                    placements.extend(spb_placements)
+            if not _progress:
+                if _next_pending:
+                    _log(f"      {len(_next_pending)} SPB file(s) never found their own container's "
+                         f"real-world placement (not a raw BGL placement, and no chain through "
+                         f"another .spb resolved it either) -- their content has no legitimate "
+                         f"position and was dropped rather than guessed at the airport's reference "
+                         f"point: {', '.join(p.name for p in _next_pending[:8])}"
+                         f"{', ...' if len(_next_pending) > 8 else ''}", "warning")
+                break
+            _pending = _next_pending
         if _resolvably_expanded:
             _before = len(placements)
             placements = [

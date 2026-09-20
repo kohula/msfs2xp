@@ -493,24 +493,36 @@ def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_d
             result[stem] = (stem, False, "not_applicable")
             continue
 
-        # DRAPED geometry is NEVER position-warped: X-Plane re-projects
-        # every ATTR_draped surface onto the compiled terrain mesh at
-        # render time regardless of the OBJ's own Y, so a per-vertex warp
-        # here would be invisible in-sim while still forcing an
-        # unnecessary *_tfit_* copy that reshuffles draped_merge.py's own
-        # ranking. `skip_draped_positions` (.pol mode) is redundant with
-        # this but kept for call-site compatibility.
+        # CONFIRMED REAL REGRESSION: this was hardcoded to False, on the
+        # reasoning that a per-vertex warp of draped geometry is invisible
+        # in-sim (X-Plane re-projects every ATTR_draped surface onto the
+        # compiled terrain mesh at render time regardless of the OBJ's own
+        # Y) -- true for the main beauty-pass render, but X-Plane 12's
+        # shadow pass reads authored Y even though the beauty pass
+        # doesn't, so a flat/un-warped Y produced a shadow tracking a
+        # flat plane instead of the real (often gently sloped) surface
+        # underneath it. Confirmed against an older working snapshot
+        # (predates this regression) whose own comment on this exact line
+        # names the real-world symptom directly: making draped siblings
+        # reach this warp -- and therefore the corrected-copy + sidecar
+        # write below, which is what makes them visible to draped_merge.
+        # py's own welding/dedup pass -- is what fixed "duplicated/
+        # unwelded pavement". `skip_draped_positions` (.pol mode) still
+        # skips it: a real DRAPED_POLYGON has no elevation field of its
+        # own at all, and draped_merge._triangles_to_polygons never reads
+        # Y when serializing, so the warp's output would be silently
+        # discarded downstream anyway in that mode.
         # RIGID geometry gets a single rigid rotation (see module
         # docstring for why per-vertex would shear it). Light positions
         # are corrected regardless of the sibling's draped flag -- each
         # LIGHT_SPILL_CUSTOM is an independent point, not mesh topology,
         # so moving it carries none of the shear/re-drape concerns above.
-        warp_positions = False
+        warp_positions = bool(len(ir.positions)) and ir.draped and not skip_draped_positions
         rigid_tilt = bool(len(ir.positions)) and not ir.draped and rigid_rotation is not None
         warp_lights = bool(ir.lights)
         if not warp_positions and not rigid_tilt and not warp_lights:
-            if ir.draped and len(ir.positions):
-                result[stem] = (stem, False, "draped_not_warped")
+            if ir.draped and skip_draped_positions and len(ir.positions):
+                result[stem] = (stem, False, "skipped_for_polygon_mode")
             else:
                 result[stem] = (stem, False, "rigid_skip" if len(ir.positions) else "disqualified")
             continue

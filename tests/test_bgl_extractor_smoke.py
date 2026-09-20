@@ -193,6 +193,214 @@ class TestExtractSpbPlacementsHeightChain(unittest.TestCase):
         self.assertNotAlmostEqual(entry["height_offset"], 4.915, places=3)
 
 
+class TestExtractSpbPlacementsFallbackAnchorIsKept(unittest.TestCase):
+    """REGRESSION GUARD: a same-session attempt to make extract_spb_placements
+    SKIP (return []) whenever no existing_placements entry shares the
+    container's own GUID -- reasoning that a wrongly-positioned duplicate
+    (EGLC's EGLC_POI_Excel_Footbridge.spb landing at the airport's dead
+    centre) was worse than dropping it -- was ITSELF a much bigger real
+    regression, confirmed on a live EGLC re-conversion: existing_placements
+    grows as extract()'s own loop processes spb_files (`placements.extend
+    (spb_placements)` between iterations, see extract()'s SPB loop), so a
+    container whose GUID is only ever produced by ANOTHER .spb's attach
+    output (nested attach chains -- e.g. a seat/furniture cluster attached
+    to a master container that is itself SPB-attached, never a raw BGL
+    placement) legitimately has no anchor at the point it's processed
+    PURELY due to file order. Skipping outright collapsed terrain-fit's
+    own unique placement-group count from 2616 to 1477 on a real
+    conversion and visibly broke interior content (user: "the seats of
+    the building... [got placed] outside of the building").
+
+    This single-call, allow_fallback=True (the default) path is what any
+    DIRECT caller still gets -- e.g. a test, or a one-off inspection.
+    extract()'s own orchestration now calls with allow_fallback=False and
+    a multi-pass retry instead (see TestExtractSpbPlacementsNoFallbackMode
+    below and extract_spb_placements' own docstring), so a real
+    conversion no longer needs this fallback for nested chains -- only a
+    truly orphaned container (no ancestor chain reaches a real placement
+    at all, even after every .spb has had a chance to resolve) is
+    dropped there, never guessed at the airport's reference point."""
+
+    def _patched_decompile(self, container_guid, attach_guid):
+        root = ET.Element("SimPropContainer")
+        guid_el = ET.SubElement(root, "SimBase.GUID")
+        guid_el.text = container_guid
+        attach = ET.SubElement(root, "SimPropAttach")
+        attach.set("DisplayName", "Footbridge")
+        mdl = ET.SubElement(attach, "WorldBase.MDLGuid")
+        mdl.text = attach_guid
+        off = ET.SubElement(attach, "OffsetXYZ")
+        off.text = "0.0,0.0,0.0"
+        orient = ET.SubElement(attach, "Orientation")
+        orient.text = "0.0,0.0,0.0"
+        return root
+
+    def test_no_matching_container_placement_still_falls_back_to_airport_center(self):
+        spb2xml_dir = Path(bgl_extractor.__file__).resolve().parent / "spb2xml"
+        sys.path.insert(0, str(spb2xml_dir))
+        import decompiler
+
+        container_guid = "{aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee}"
+        attach_guid = "{11111111-2222-3333-4444-555555555555}"
+
+        propdefs_dir = tempfile.mkdtemp()
+        (Path(propdefs_dir) / "dummy.xml").write_text("<x/>", encoding="utf-8")
+        bgl_extractor._PROPDEFS_CACHE[propdefs_dir] = {}
+
+        # existing_placements has nothing sharing the container's own
+        # GUID -- the BGL never placed this container anywhere (e.g. it's
+        # only ever reachable through another .spb's attach output, not
+        # captured in this minimal fixture).
+        existing_placements = [{
+            "guid": _spb_guid_hex("{99999999-8888-7777-6666-555555555555}"),
+            "lat": 51.5, "lon": 0.05, "alt": 5.0, "height_offset": 5.0,
+            "pitch": 0.0, "roll": 0.0, "hdg": 0.0, "is_agl": True,
+        }]
+
+        fake_root = self._patched_decompile(container_guid, attach_guid)
+        with mock.patch.object(decompiler.Decompiler, "__init__", return_value=None), \
+             mock.patch.object(decompiler.Decompiler, "decompile", return_value=fake_root):
+            spb_path = Path(tempfile.mkdtemp()) / "EGLC_POI_Excel_Footbridge.spb"
+            spb_path.write_bytes(b"")
+            found = bgl_extractor.extract_spb_placements(
+                spb_path, airport_lat=51.5053, airport_lon=0.0553, airport_alt=6.0,
+                existing_placements=existing_placements,
+                _log=lambda *a, **k: None, propdefs_dir=propdefs_dir)
+
+        self.assertEqual(len(found), 1,
+            "no container placement -> must still fall back to the airport's reference point, not vanish")
+        self.assertAlmostEqual(found[0]["lat"], 51.5053, places=6)
+        self.assertAlmostEqual(found[0]["lon"], 0.0553, places=6)
+        self.assertIn("Fallback", found[0]["source"])
+
+    def test_airport_ref_point_also_unavailable_still_skips(self):
+        """The one case that genuinely has to skip: no container placement
+        AND no airport reference point to fall back to either."""
+        spb2xml_dir = Path(bgl_extractor.__file__).resolve().parent / "spb2xml"
+        sys.path.insert(0, str(spb2xml_dir))
+        import decompiler
+
+        container_guid = "{bbbbbbbb-cccc-dddd-eeee-ffffffffffff}"
+        attach_guid = "{22222222-3333-4444-5555-666666666666}"
+
+        propdefs_dir = tempfile.mkdtemp()
+        (Path(propdefs_dir) / "dummy.xml").write_text("<x/>", encoding="utf-8")
+        bgl_extractor._PROPDEFS_CACHE[propdefs_dir] = {}
+
+        fake_root = self._patched_decompile(container_guid, attach_guid)
+        with mock.patch.object(decompiler.Decompiler, "__init__", return_value=None), \
+             mock.patch.object(decompiler.Decompiler, "decompile", return_value=fake_root):
+            spb_path = Path(tempfile.mkdtemp()) / "Orphan.spb"
+            spb_path.write_bytes(b"")
+            found = bgl_extractor.extract_spb_placements(
+                spb_path, airport_lat=None, airport_lon=None, airport_alt=0.0,
+                existing_placements=[],
+                _log=lambda *a, **k: None, propdefs_dir=propdefs_dir)
+
+        self.assertEqual(found, [])
+
+
+class TestExtractSpbPlacementsNoFallbackMode(unittest.TestCase):
+    """extract_spb_placements(allow_fallback=False) -- what extract()'s own
+    multi-pass orchestration actually calls with (see its comment).
+    "No anchor found" must come back as None, a distinct "try me again
+    once other .spb files have resolved" signal, never the same as
+    resolving to an empty/fallback-anchored list -- and it must NOT do
+    the airport-centre placement at all, per the user's explicit request
+    ("remove the non anchored objects, don't place it in the origin")."""
+
+    def _patched_decompile(self, container_guid, attach_guid):
+        root = ET.Element("SimPropContainer")
+        guid_el = ET.SubElement(root, "SimBase.GUID")
+        guid_el.text = container_guid
+        attach = ET.SubElement(root, "SimPropAttach")
+        attach.set("DisplayName", "Footbridge")
+        mdl = ET.SubElement(attach, "WorldBase.MDLGuid")
+        mdl.text = attach_guid
+        off = ET.SubElement(attach, "OffsetXYZ")
+        off.text = "0.0,0.0,0.0"
+        orient = ET.SubElement(attach, "Orientation")
+        orient.text = "0.0,0.0,0.0"
+        return root
+
+    def test_no_anchor_returns_none_not_a_fallback_placement(self):
+        spb2xml_dir = Path(bgl_extractor.__file__).resolve().parent / "spb2xml"
+        sys.path.insert(0, str(spb2xml_dir))
+        import decompiler
+
+        container_guid = "{aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee}"
+        attach_guid = "{11111111-2222-3333-4444-555555555555}"
+
+        propdefs_dir = tempfile.mkdtemp()
+        (Path(propdefs_dir) / "dummy.xml").write_text("<x/>", encoding="utf-8")
+        bgl_extractor._PROPDEFS_CACHE[propdefs_dir] = {}
+
+        fake_root = self._patched_decompile(container_guid, attach_guid)
+        with mock.patch.object(decompiler.Decompiler, "__init__", return_value=None), \
+             mock.patch.object(decompiler.Decompiler, "decompile", return_value=fake_root):
+            spb_path = Path(tempfile.mkdtemp()) / "EGLC_POI_Excel_Footbridge.spb"
+            spb_path.write_bytes(b"")
+            found = bgl_extractor.extract_spb_placements(
+                spb_path, airport_lat=51.5053, airport_lon=0.0553, airport_alt=6.0,
+                existing_placements=[], _log=lambda *a, **k: None,
+                propdefs_dir=propdefs_dir, allow_fallback=False)
+
+        self.assertIsNone(found, "no anchor with allow_fallback=False must be None (retry-able), "
+                                  "never a placement at the airport's reference point")
+
+    def test_nested_attach_chain_resolves_once_its_own_anchor_exists(self):
+        """The exact scenario the multi-pass retry exists for: this
+        container's own real-world anchor doesn't come from a raw BGL
+        placement at all, only from ANOTHER .spb's attach output. On the
+        first attempt (existing_placements without that output yet) it
+        must retry (None); once the anchor is added (simulating a later
+        pass after the producing .spb resolved), it must resolve for
+        real -- proving allow_fallback=False doesn't just permanently
+        kill nested content, only genuinely-orphaned content."""
+        spb2xml_dir = Path(bgl_extractor.__file__).resolve().parent / "spb2xml"
+        sys.path.insert(0, str(spb2xml_dir))
+        import decompiler
+
+        container_guid = "{cccccccc-dddd-eeee-ffff-000000000000}"
+        attach_guid = "{33333333-4444-5555-6666-777777777777}"
+        container_guid_hex = _spb_guid_hex(container_guid)
+
+        propdefs_dir = tempfile.mkdtemp()
+        (Path(propdefs_dir) / "dummy.xml").write_text("<x/>", encoding="utf-8")
+        bgl_extractor._PROPDEFS_CACHE[propdefs_dir] = {}
+
+        fake_root = self._patched_decompile(container_guid, attach_guid)
+        spb_path = Path(tempfile.mkdtemp()) / "SeatCluster.spb"
+        spb_path.write_bytes(b"")
+
+        with mock.patch.object(decompiler.Decompiler, "__init__", return_value=None), \
+             mock.patch.object(decompiler.Decompiler, "decompile", return_value=fake_root):
+            # Pass 1: nothing shares this container's GUID yet.
+            first = bgl_extractor.extract_spb_placements(
+                spb_path, airport_lat=51.5053, airport_lon=0.0553, airport_alt=6.0,
+                existing_placements=[], _log=lambda *a, **k: None,
+                propdefs_dir=propdefs_dir, allow_fallback=False)
+            self.assertIsNone(first)
+
+            # Pass 2: an earlier-in-this-pass .spb's own attach output now
+            # provides this container's real-world anchor (exactly what
+            # extract()'s loop does: placements.extend(spb_placements)).
+            existing_placements = [{
+                "guid": container_guid_hex, "lat": 51.5049, "lon": 0.0505,
+                "alt": 4.0, "height_offset": 4.0,
+                "pitch": 0.0, "roll": 0.0, "hdg": 0.0, "is_agl": True,
+            }]
+            second = bgl_extractor.extract_spb_placements(
+                spb_path, airport_lat=51.5053, airport_lon=0.0553, airport_alt=6.0,
+                existing_placements=existing_placements, _log=lambda *a, **k: None,
+                propdefs_dir=propdefs_dir, allow_fallback=False)
+
+        self.assertIsNotNone(second)
+        self.assertEqual(len(second), 1)
+        self.assertAlmostEqual(second[0]["lat"], 51.5049, places=6)
+        self.assertNotIn("Fallback", second[0]["source"])
+
+
 def _build_riff_model_container(name: str, glb_bytes: bytes) -> bytes:
     """Minimal RIFF/GLTF container matching extract_riff_model's own
     reader: a GXML sub-chunk carrying name="..." and a GLBD sub-chunk

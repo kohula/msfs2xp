@@ -123,14 +123,22 @@ class TestDrapedMerge(unittest.TestCase):
             self.assertIn("TRIS 0 12", merged_text)
 
     def test_terrain_fit_then_weld_still_merges_cleanly(self):
-        """main.py runs terrain_fit BEFORE draped_merge. terrain_fit now
-        leaves DRAPED geometry completely untouched (X-Plane re-drapes it;
-        warping it only churned a *_tfit_* copy that perturbed this
-        module's family ranking -- a uniform one-slot markings shift the
-        moment py7zr made terrain_fit actually run). This confirms the
-        pipeline order still produces a clean pooled merge: two adjacent
-        draped tiles, run through terrain_fit (a no-op for them) then
-        draped_merge, weld down to exactly 6 unique vertices."""
+        """The confirmed real regression: main.py runs terrain_fit BEFORE
+        draped_merge (terrain-correct each placement's own geometry
+        independently, THEN weld/merge adjacent same-texture pieces
+        across placements). If terrain_fit warped each placement's Y using
+        a grid interpolated within its OWN local footprint bbox, two
+        adjacent pieces' shared boundary vertices came out with slightly
+        different Y (different bboxes -> different interpolation) -- just
+        barely enough to push them outside _weld_vertices' tolerance:
+        pieces that used to weld cleanly stopped welding, and duplicate
+        layers stopped deduplicating. terrain_fit.py's current per-vertex-
+        exact sampling fixes this at the root: the same real-world
+        boundary point always gets the identical elevation lookup
+        regardless of which placement it came from. This runs BOTH passes
+        in the real pipeline order and confirms two independently-warped
+        adjacent tiles still weld down to exactly the same 6 unique
+        vertices as the unwarped case."""
         data_uri = _shared_texture_data_uri()
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
@@ -180,10 +188,8 @@ class TestDrapedMerge(unittest.TestCase):
             fit_b = terrain_fit.get_or_create_fitted_group(obj_dir, [stemB], base_lat_b, base_lon_b, 0.0, xplane_root)
             fitted_stem_a, applied_a, reason_a = fit_a[stemA]
             fitted_stem_b, applied_b, reason_b = fit_b[stemB]
-            self.assertFalse(applied_a, "draped geometry is not warped")
-            self.assertFalse(applied_b, "draped geometry is not warped")
-            self.assertEqual((fitted_stem_a, fitted_stem_b), (stemA, stemB),
-                             "no *_tfit_* copy -- draped_merge sees the original stems")
+            self.assertTrue(applied_a, f"test setup issue: expected a real correction (reason={reason_a!r})")
+            self.assertTrue(applied_b, f"test setup issue: expected a real correction (reason={reason_b!r})")
 
             entries = [
                 _placement_entry(obj_dir, "tileA", fitted_stem_a, base_lat_a, base_lon_a),

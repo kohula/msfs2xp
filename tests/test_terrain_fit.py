@@ -69,16 +69,20 @@ class TestTerrainFit(unittest.TestCase):
         b.add_node(mesh_index=mesh, name=name)
         path.write_bytes(b.build())
 
-    def test_draped_siblings_stay_flat_but_the_lights_companion_is_still_corrected(self):
+    def test_draped_siblings_and_lights_companion_all_get_the_identical_correction(self):
         """Both "Walls" and "Trim" are flat quads here, so convert() emits
-        both as ATTR_draped ground-level geometry -- which is NEVER
-        position-warped (X-Plane re-drapes it at render time; warping it
-        only churns a *_tfit_* copy that perturbs draped_merge's ranking).
-        The synthetic "_lights" companion is NOT draped mesh topology --
-        each LIGHT_SPILL_CUSTOM is an independent point -- so it still gets
-        moved to its own real elevation. The group's "one consistent
-        decision" contract still holds: every draped sibling is treated
-        identically (left flat), independent of its own size."""
+        both as ATTR_draped ground-level geometry -- draped content is
+        eligible for the real per-vertex terrain warp now (same as rigid
+        buildings; ATTR_draped still re-projects it at render time
+        regardless, so this doesn't change the main render, only what's
+        available to whatever else reads authored Y -- see terrain_fit's
+        own module docstring). Trim's own footprint is compact relative to
+        ITS OWN bbox (not just the group's shared bbox dominated by Walls),
+        so it must NOT be mistaken for sparse/GPU-instanced-looking content
+        and skipped -- all three siblings, including the synthetic "_lights"
+        companion, must land on the exact same Y correction at their shared
+        real-world point, pinning the "one consistent decision for the
+        whole group" grouping contract this module has always guaranteed."""
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             xplane_root = td / "XPlaneRoot"
@@ -133,11 +137,9 @@ class TestTerrainFit(unittest.TestCase):
             stems = [walls_stem, trim_stem, lights_stem]
             results = terrain_fit.get_or_create_fitted_group(obj_dir, stems, base_lat, base_lon, heading, xplane_root)
 
-            self.assertFalse(results[walls_stem][1], "draped sibling must be left flat")
-            self.assertFalse(results[trim_stem][1], "draped sibling must be left flat")
-            self.assertEqual(results[walls_stem][2], "draped_not_warped")
-            self.assertEqual(results[trim_stem][2], "draped_not_warped")
-            self.assertTrue(results[lights_stem][1], "lights companion is still corrected")
+            self.assertTrue(results[walls_stem][1], "large sibling should qualify")
+            self.assertTrue(results[trim_stem][1], "too-small-alone sibling should still be corrected as part of the group")
+            self.assertTrue(results[lights_stem][1], "lights companion should also be corrected")
 
             def y_at(obj_stem, target_x, target_z):
                 text = (obj_dir / f"{results[obj_stem][0]}.obj").read_text(encoding="utf-8")
@@ -150,25 +152,33 @@ class TestTerrainFit(unittest.TestCase):
 
             walls_y = y_at(walls_stem, 15.0, 10.0)
             trim_y = y_at(trim_stem, 15.0, 10.0)
-            self.assertAlmostEqual(walls_y, 0.0, places=5, msg="draped Y stays exactly as authored")
-            self.assertAlmostEqual(trim_y, 0.0, places=5, msg="draped Y stays exactly as authored")
+            self.assertIsNotNone(walls_y)
+            self.assertIsNotNone(trim_y)
+            self.assertNotAlmostEqual(walls_y, 0.0, places=3, msg="draped geometry must now receive the real terrain warp")
+            self.assertAlmostEqual(walls_y, trim_y, places=5,
+                                    msg="Trim must get the identical correction as Walls at their shared point, "
+                                        "not be skipped as sparse/instanced-looking just because it's small")
 
             light_text = (obj_dir / f"{results[lights_stem][0]}.obj").read_text(encoding="utf-8")
             # LIGHT_PARAM <name> px py pz ...  -> py is token index 3
             light_line = next(l for l in light_text.splitlines() if l.startswith("LIGHT_PARAM "))
             light_py = float(light_line.split()[3])
-            self.assertNotAlmostEqual(light_py, 8.5, places=3,
-                                      msg="the lights companion IS still moved to its own real elevation")
+            self.assertAlmostEqual(light_py - 8.5, walls_y, places=5,
+                                    msg="the lights companion must get the same correction as the draped siblings too")
 
-    def test_draped_siblings_left_untouched_but_lights_companion_still_corrected(self):
-        """DRAPED siblings' own geometry is left completely untouched
-        (result_stem == the original stem, applied=False,
-        reason="draped_not_warped"), whether or not skip_draped_positions
-        is passed -- X-Plane re-projects ATTR_draped geometry onto its own
-        terrain at render time, so warping it is invisible in-sim and only
-        churns a *_tfit_* copy that perturbs draped_merge's ranking. The
+    def test_skip_draped_positions_leaves_draped_siblings_unwarped_but_still_corrects_lights(self):
+        """Per the user's own explicit instruction for the .pol/DSF-polygon
+        conversion path: "the terrain fit should be applied to every object
+        placed on the ground, except the polygons, as they are going to be
+        DRAPED". skip_draped_positions=True must leave every DRAPED
+        sibling's own geometry completely untouched (result_stem == the
+        original stem, applied=False, reason="skipped_for_polygon_mode") --
+        a real DRAPED_POLYGON has no elevation field of its own at all, so
+        warping it here would be silently discarded downstream anyway (see
+        this module's own docstring for get_or_create_fitted_group). The
         lights companion is a separate, independent point (not connected
-        mesh topology) and is still corrected."""
+        mesh topology) and must still be corrected exactly as before --
+        this flag only ever gates the draped position warp, nothing else."""
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             xplane_root = td / "XPlaneRoot"
@@ -204,7 +214,7 @@ class TestTerrainFit(unittest.TestCase):
             results = terrain_fit.get_or_create_fitted_group(
                 obj_dir, stems, base_lat, base_lon, heading, xplane_root, skip_draped_positions=True)
 
-            self.assertEqual(results[walls_stem], (walls_stem, False, "draped_not_warped"))
+            self.assertEqual(results[walls_stem], (walls_stem, False, "skipped_for_polygon_mode"))
             self.assertTrue(results[lights_stem][1], "lights companion is still corrected")
 
     def test_large_tilted_building_gets_a_rigid_rotation_not_a_shear(self):
@@ -692,15 +702,18 @@ class TestTerrainFit(unittest.TestCase):
             self.assertLess(abs(mid_dy), abs(base_dy) - 1e-6, "blend zone gets LESS than the full band")
             self.assertAlmostEqual(top_dy, 0.0, delta=1e-6, msg="superstructure gets none of the skirt residual")
 
-    def test_huge_draped_quad_is_never_position_warped(self):
-        """Draped/pavement geometry is NEVER position-warped: X-Plane
-        re-projects every ATTR_draped surface onto its own compiled terrain
-        at render time, ignoring authored Y entirely, so a per-vertex Y
-        warp here is invisible in-sim -- and it isn't free (it forces a
-        *_tfit_* copy that draped_merge then ranks instead of the original,
-        which measurably reshuffled the markings-band family fold). The
-        object is returned untouched with reason 'draped_not_warped', not
-        disqualified for a misleading reason, and its Y stays flat."""
+    def test_huge_draped_quad_gets_warped_like_a_building_now(self):
+        """Draped/pavement geometry is eligible for the real per-vertex
+        terrain warp again, same as rigid buildings -- ATTR_draped still
+        re-projects it onto X-Plane's own terrain at render time regardless
+        of authored Y, so this doesn't change the main render, but keeps
+        authored Y realistically close to the real ground contour instead
+        of a flat plane (closes the residual "shadow floating slightly
+        above the surface" gap the flat-Y-only fix left behind). This is
+        the real 5518m x 3003m "TileSeams" footprint from a converted
+        package -- with per-vertex-exact sampling (no shared-bbox grid to
+        get misled by a huge footprint) there's no size-based reason to
+        disqualify or special-case it at all."""
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             xplane_root = td / "XPlaneRoot"
@@ -716,25 +729,29 @@ class TestTerrainFit(unittest.TestCase):
             stem = result[0].stem
             self.assertIn("ATTR_draped", result[0].read_text(encoding="utf-8").splitlines(),
                           "test setup issue: expected this flat decal fixture to convert as draped")
-            before = {round(float(line.split()[2]), 5)
-                      for line in result[0].read_text(encoding="utf-8").splitlines() if line.startswith("VT ")}
 
             results = terrain_fit.get_or_create_fitted_group(obj_dir, [stem], 47.5, 8.5, 0.0, xplane_root)
             result_stem, applied, reason = results[stem]
-            self.assertFalse(applied, "draped geometry must not be position-warped")
-            self.assertEqual(reason, "draped_not_warped")
-            self.assertEqual(result_stem, stem, "no *_tfit_* copy -- the original stem is placed")
-            after = {round(float(line.split()[2]), 5)
-                     for line in (obj_dir / f"{result_stem}.obj").read_text(encoding="utf-8").splitlines()
-                     if line.startswith("VT ")}
-            self.assertEqual(before, after, "draped Y must stay exactly as authored (flat)")
+            self.assertTrue(applied, f"a huge but genuinely continuous draped footprint must not be disqualified (reason={reason!r})")
 
-    def test_scattered_draped_points_are_left_exactly_flat(self):
-        """A draped scattered-points fixture (GPU-instanced-looking content
-        -- one small motif repeated far apart) is left completely
-        untouched: draped geometry is never position-warped (X-Plane
-        re-drapes it), so every vertex Y stays exactly 0.0 and no *_tfit_*
-        copy is written."""
+            corrected_text = (obj_dir / f"{result_stem}.obj").read_text(encoding="utf-8")
+            self.assertIn("ATTR_draped", corrected_text.splitlines(),
+                          "must still be draped -- the main render is unaffected either way")
+            y_values = {round(float(line.split()[2]), 5) for line in corrected_text.splitlines() if line.startswith("VT ")}
+            self.assertNotEqual(y_values, {0.0},
+                                 "a real continuous draped surface should now receive the real terrain warp, not stay flat")
+
+    def test_scattered_points_each_get_their_own_exact_elevation(self):
+        """The old grid-interpolation approach's confirmed failure mode: a
+        "footprint" bbox spanning many scattered small clusters (like
+        GPU-instanced content -- one small motif repeated far apart across
+        a wide area) produced a warp with no relationship to any
+        individual cluster's real position, because a shared-bbox grid
+        blends distant sample points together. Per-vertex-exact sampling
+        has no such blending -- each of these two far-apart clusters must
+        come out matching a DIRECT, independent elevation computation at
+        its own real-world position, not some value interpolated from the
+        other cluster or from anywhere in between."""
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             xplane_root = td / "XPlaneRoot"
@@ -759,10 +776,29 @@ class TestTerrainFit(unittest.TestCase):
             base_lat, base_lon, heading = 47.5, 8.5, 0.0
             results = terrain_fit.get_or_create_fitted_group(obj_dir, [stem], base_lat, base_lon, heading, xplane_root)
             result_stem, applied, reason = results[stem]
-            self.assertFalse(applied)
-            self.assertEqual(reason, "draped_not_warped")
-            self.assertEqual(result_stem, stem, "the original stem is placed")
-            self.assertEqual(list(obj_dir.glob("*_tfit_*")), [], "no *_tfit_* copy written for draped geometry")
+            self.assertTrue(applied, f"reason={reason!r}")
+
+            origin_elev = terrain_dem.get_elevation(xplane_root, base_lat, base_lon)
+
+            def expected_delta(local_x, local_z):
+                import geo_transform
+                lat, lon = geo_transform.local_offset_to_latlon(base_lat, base_lon, heading, local_x, local_z)
+                return terrain_dem.get_elevation(xplane_root, lat, lon) - origin_elev
+
+            corrected_text = (obj_dir / f"{result_stem}.obj").read_text(encoding="utf-8")
+            vt_by_xz = {}
+            for line in corrected_text.splitlines():
+                if line.startswith("VT "):
+                    p = line.split()
+                    vt_by_xz[(round(float(p[1]), 3), round(float(p[3]), 3))] = float(p[2])
+
+            near_corner_y = vt_by_xz[(-2759.0, -1502.0)]
+            far_corner_y = vt_by_xz[(2759.0, 1502.0)]
+            self.assertAlmostEqual(near_corner_y, expected_delta(-2759.0, -1502.0), places=3)
+            self.assertAlmostEqual(far_corner_y, expected_delta(2759.0, 1502.0), places=3)
+            self.assertNotAlmostEqual(near_corner_y, far_corner_y, places=1,
+                                       msg="two far-apart clusters on genuinely different real terrain must not "
+                                           "come out with the same (grid-blended) correction")
 
     def test_too_small_group_is_disqualified(self):
         with tempfile.TemporaryDirectory() as td:
