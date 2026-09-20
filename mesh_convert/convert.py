@@ -453,23 +453,34 @@ def compute_file_flatness_and_reference(gltf, buffers, world_transforms, flat_ep
         (see convert()).
 
       - node_stats: {(node_idx, material_idx): (flat_fraction,
-        reference_height)}, the exact same two tallies as above but
-        broken out per (node, MATERIAL) pair instead of aggregated across
-        the whole file. Keyed on material, not just node, because a real
-        MSFS export routinely packs an entire ground-poly system (two
-        dozen+ distinct pavement/marking materials, plus a genuinely-3D
-        transition piece) as separate PRIMITIVES inside ONE node's mesh --
-        a per-NODE-only key would measure the exact same file-wide mix
-        for every one of those materials, no finer than the file-wide
-        verdict. convert() uses this (not the file-wide flat_fraction/
-        reference_height) to decide flattening and ATTR_draped per
-        builder (mat_idx, animated_node_id) -- the file-wide, all-or-
-        nothing version used to mean one non-flat material anywhere in a
-        file silently disabled draping for every OTHER, genuinely flat
-        marking layer in the same file too, which could bury them in/
-        under the compiled terrain or leave them rigid enough to float/
-        glitch against the real compiled terrain. TILTED's own decision
-        is untouched by this and still uses only the file-wide aggregate
+        reference_height, y_span)}, broken out per (node, MATERIAL) pair
+        instead of aggregated across the whole file. Keyed on material,
+        not just node, because a real MSFS export routinely packs an
+        entire ground-poly system (two dozen+ distinct pavement/marking
+        materials, plus a genuinely-3D transition piece) as separate
+        PRIMITIVES inside ONE node's mesh -- a per-NODE-only key would
+        measure the exact same file-wide mix for every one of those
+        materials, no finer than the file-wide verdict. flat_fraction/
+        reference_height are the same two tallies as the file-wide ones
+        above (reference_height derived only from the triangles that
+        individually pass the flat+horizontal test); y_span is this
+        material's OWN overall Y range across EVERY one of its triangles
+        regardless of that per-triangle test -- confirmed real gap: a
+        material that's genuinely thin/ground-level overall (a scattered
+        ground-stain decal, each patch given a slightly different random
+        rotation for visual variety) can still fail the strict per-
+        triangle orientation test on individual patches even at a few
+        CENTIMETRES of total Y span, so convert() also accepts a small
+        y_span as its own, independent qualification for draping. convert()
+        uses this (not the file-wide flat_fraction/reference_height) to
+        decide flattening and ATTR_draped per builder (mat_idx,
+        animated_node_id) -- the file-wide, all-or-nothing version used
+        to mean one non-flat material anywhere in a file silently
+        disabled draping for every OTHER, genuinely flat marking layer in
+        the same file too, which could bury them in/under the compiled
+        terrain or leave them rigid enough to float/glitch against the
+        real compiled terrain. TILTED's own decision is untouched by this
+        and still uses only the file-wide aggregate
         above.
     """
     total_tris = 0
@@ -488,6 +499,7 @@ def compute_file_flatness_and_reference(gltf, buffers, world_transforms, flat_ep
     node_total_tris = {}
     node_flat_tris = {}
     node_flat_y_values = {}
+    node_all_y_values = {}
 
     for node_idx, node in enumerate(gltf.get("nodes", [])):
         if "mesh" not in node:
@@ -596,6 +608,9 @@ def compute_file_flatness_and_reference(gltf, buffers, world_transforms, flat_ep
             node_flat_tris[prim_key] = node_flat_tris.get(prim_key, 0) + int(is_flat.sum())
             if is_flat.any():
                 node_flat_y_values.setdefault(prim_key, []).append(y[tri[is_flat]].reshape(-1))
+            # ALL of this material's own Y values, regardless of the
+            # per-triangle orientation gate above -- see node_y_span below.
+            node_all_y_values.setdefault(prim_key, []).append(y[tri].reshape(-1))
 
     node_stats = {}
     for prim_key, n_total in node_total_tris.items():
@@ -603,9 +618,35 @@ def compute_file_flatness_and_reference(gltf, buffers, world_transforms, flat_ep
         n_reference_height = None
         n_flat_ys = node_flat_y_values.get(prim_key)
         if n_flat_ys:
-            n_all_y = np.concatenate(n_flat_ys)
-            _, _, n_reference_height, _ = _cluster_height_bands(n_all_y, merge_gap=merge_gap)
-        node_stats[prim_key] = (n_flat_fraction, n_reference_height)
+            n_flat_all_y = np.concatenate(n_flat_ys)
+            _, _, n_reference_height, _ = _cluster_height_bands(n_flat_all_y, merge_gap=merge_gap)
+        # This material's OWN overall Y span, from every one of its
+        # triangles regardless of the per-triangle orientation gate above
+        # -- see node_y_span's own use at the call site (convert()) for
+        # why this exists: a material whose real geometry is genuinely
+        # flat/thin overall (a scattered ground-stain decal, each patch
+        # given a slightly different random rotation for visual variety)
+        # can still fail the STRICT per-triangle test on individual
+        # patches, even though the material as a whole obviously belongs
+        # on the ground, not standing up as a rigid 3D object.
+        n_y_span = None
+        n_all_ys = node_all_y_values.get(prim_key)
+        if n_all_ys:
+            n_all_y = np.concatenate(n_all_ys)
+            if len(n_all_y):
+                n_y_span = float(n_all_y.max() - n_all_y.min())
+                # FALLBACK reference height, from every vertex rather than
+                # just the flat-classified ones -- needed for the extreme
+                # end of the same case above: if EVERY one of this
+                # material's own triangles individually fails the per-
+                # triangle orientation test (a decal made entirely of
+                # small tilted patches, none of them flat enough alone),
+                # n_reference_height above stays None even though the
+                # material's overall Y span can still be tiny -- there
+                # would be no height left to flatten to at all otherwise.
+                if n_reference_height is None:
+                    _, _, n_reference_height, _ = _cluster_height_bands(n_all_y, merge_gap=merge_gap)
+        node_stats[prim_key] = (n_flat_fraction, n_reference_height, n_y_span)
 
     flat_fraction = (flat_tris / total_tris) if total_tris else 0.0
 
@@ -1769,6 +1810,25 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
     # file-wide, verdict to drape correctly at all). See
     # tests/test_flatness_tilted_exclusivity.py's own module docstring.
     _NODE_FLAT_FRACTION_THRESHOLD = 0.90
+    # A SECOND, independent way for a material to qualify for draping:
+    # its own overall Y span, regardless of the stricter per-triangle
+    # orientation test above. Confirmed real gap on the same live EGLC
+    # package: a scattered ground-stain decal (each small patch given a
+    # slightly different random rotation for visual variety) measured
+    # only 3 CENTIMETRES tall across its whole ~2000m-wide footprint, yet
+    # the per-triangle test still failed most of its individual patches
+    # (each patch's own slight rotation reads as "not near-vertical
+    # enough"), keeping the whole material rigid -- exactly the reported
+    # "transparent layers floating in the air" AND, separately, objects
+    # near a hold-short line reappearing as visible duplicates
+    # (draped_merge.py's own weld/dedup pipeline only ever considers
+    # ir.draped objects as candidates at all, so a material wrongly kept
+    # rigid skips that dedup too, not just the terrain warp). 1.5m
+    # comfortably covers real pavement grading/drainage slope plus a
+    # curb/lip's worth of relief, while still excluding anything
+    # building-scale (EGLC's own genuinely-3D slope/transition material
+    # measured 1.73m and correctly stays excluded).
+    _NODE_FLAT_ABSOLUTE_Y_SPAN_M = 1.5
     file_flat_fraction, file_reference_height, file_max_radius, file_max_horizontal_radius, node_flatness_stats = compute_file_flatness_and_reference(gltf, buffers, world_transforms)
     file_is_flat_only = file_flat_fraction >= flat_fraction_threshold and file_reference_height is not None
 
@@ -2065,9 +2125,39 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                 # (concrete/transitions/markings) drape correctly while
                 # the one genuinely-3D material (the slope) correctly
                 # stays rigid and keeps its real shape.
-                node_flat_fraction, node_dominant_height = node_flatness_stats.get((node_idx, mat_idx), (0.0, None))
+                node_flat_fraction, node_dominant_height, node_y_span = node_flatness_stats.get(
+                    (node_idx, mat_idx), (0.0, None, None))
+                # CONFIRMED REAL BUG (found on the same live EGLC package,
+                # right after the per-(node,material) fix above): the
+                # strict per-triangle orientation test (face normal near-
+                # vertical) can still fail on a material that's obviously
+                # thin/ground-level OVERALL -- confirmed measured case: a
+                # scattered ground-stain decal (each small patch given a
+                # slightly different random rotation for visual variety,
+                # a common technique to avoid a repeating/tiled look) only
+                # 3 CENTIMETRES tall across its entire ~2000x230m
+                # footprint measured just 27.6% "flat" per-triangle, so it
+                # stayed rigid -- reverting to its flat, un-warped
+                # authored geometry instead of X-Plane's native terrain
+                # draping, which is exactly the reported "transparent
+                # layers floating in the air" (draped_merge.py's own
+                # module docstring already names this failure mode:
+                # z-fighting/"floating-veil artifacts" -- draped_merge
+                # only ever considers ir.draped objects as merge/weld
+                # candidates at all, so a material wrongly kept rigid
+                # skips its whole welding/seam-closing pipeline, not just
+                # the terrain warp). A material whose own overall Y span
+                # is small enough to obviously be ground-level content
+                # (not a real standing 3D structure) qualifies for
+                # draping on that basis alone, regardless of the stricter
+                # per-triangle verdict -- reusing whatever reference
+                # height the per-triangle pass already found (even from a
+                # minority of its own triangles) is still representative
+                # once the geometry is this thin overall.
                 this_node_is_flat = (
-                    node_flat_fraction >= _NODE_FLAT_FRACTION_THRESHOLD and node_dominant_height is not None
+                    node_dominant_height is not None
+                    and (node_flat_fraction >= _NODE_FLAT_FRACTION_THRESHOLD
+                         or (node_y_span is not None and node_y_span <= _NODE_FLAT_ABSOLUTE_Y_SPAN_M))
                 )
                 node_reference_height = (
                     _clamp_flat_reference_height(node_dominant_height, f"node {node_idx}", glb_path.name)

@@ -14,6 +14,7 @@ while a node wrongly left rigid visibly floats/sinks on sloped terrain --
 so the per-node threshold (0.90) is deliberately more lenient than the
 file-wide TILTED threshold (0.98).
 """
+import math
 import sys
 import tempfile
 import unittest
@@ -399,6 +400,75 @@ class TestFlatnessTiltedExclusivity(unittest.TestCase):
             slope_text = slope_obj.read_text(encoding="utf-8")
             self.assertNotIn("ATTR_draped", slope_text,
                               "the genuinely-3D slope material must stay rigid, not be flattened")
+
+    def test_scattered_tilted_decal_patches_with_tiny_overall_y_span_still_drape(self):
+        """CONFIRMED REAL BUG on a live EGLC package (found right after the
+        per-(node,material) fix landed): a scattered ground-stain decal --
+        many small patches, each given a slightly different rotation for
+        visual variety (a common technique to avoid a repeating/tiled
+        look) -- measured only 3 CENTIMETRES tall across its entire
+        ~2000x230m footprint, yet the strict per-triangle orientation
+        test (face normal within ~25.8 degrees of vertical) still failed
+        most of its individual patches: each patch's own slight tilt
+        reads as "not near-vertical enough" even though the material as
+        a whole is obviously ground-level content, not a standing 3D
+        object. This is the confirmed mechanism behind "transparent
+        layers floating in the air" (reappeared after being solved in an
+        earlier revision -- draped_merge.py's own module docstring names
+        this exact failure mode, z-fighting/"floating-veil artifacts")
+        and, separately, duplicated-looking objects reappearing near a
+        hold-short line: draped_merge.py's weld/dedup pipeline only ever
+        considers ir.draped objects as candidates at all, so a material
+        wrongly kept rigid skips that dedup too, not just the terrain
+        warp. This fixture: 20 small quads, each tilted 40 degrees (well
+        past the per-triangle orientation cutoff), scattered across 40m
+        with a small base-height jitter -- individually each patch fails
+        the per-triangle test, but the WHOLE material's own Y span stays
+        under a metre, so it must still drape."""
+        b = GltfBuilder()
+        tex = b.add_image_data_uri((160, 160, 160, 255))
+        texi = b.add_texture(tex)
+        mat = b.add_material("ScatteredStain", base_color_texture_index=texi)
+
+        verts, tris = [], []
+        tilt = math.radians(40.0)
+        hw = 0.15  # half-width of each tiny patch, in its own tilt direction
+        for i in range(20):
+            base = len(verts)
+            cx = -38.0 + i * 4.0
+            cz = -10.0 if i % 2 == 0 else 10.0
+            base_y = 0.05 * (i % 3)  # small jitter: 0.0 / 0.05 / 0.10
+            # A small quad tilted around the X axis by `tilt`: its own Z
+            # extent projects onto both Y and Z by cos/sin of the tilt.
+            dz, dy = hw * math.cos(tilt), hw * math.sin(tilt)
+            verts += [
+                (cx - hw, base_y - dy, cz - dz), (cx + hw, base_y - dy, cz - dz),
+                (cx + hw, base_y + dy, cz + dz), (cx - hw, base_y + dy, cz + dz),
+            ]
+            tris += [(base, base + 1, base + 2), (base, base + 2, base + 3)]
+        indices = [i for tri in tris for i in tri]
+        mesh = b.add_mesh(
+            verts, indices, normals=[(0.0, 1.0, 0.0)] * len(verts),
+            uvs=[(0.0, 0.0)] * len(verts), material_index=mat,
+        )
+        b.add_node(mesh_index=mesh, name="ScatteredStain")
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            glb_path = td / "scattered_stain.glb"
+            glb_path.write_bytes(b.build())
+            obj_dir = td / "objects"
+            tex_dir = td / "textures"
+            obj_dir.mkdir()
+            tex_dir.mkdir()
+
+            result = mesh_convert.convert(glb_path, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
+            self.assertTrue(result)
+            text = result[0].read_text(encoding="utf-8")
+            self.assertIn("ATTR_draped", text,
+                           "a material with a tiny overall Y span must drape even though many of "
+                           "its own individual (tilted) triangles fail the per-triangle test")
+            self.assertNotIn("TILTED", text.splitlines())
 
     def test_genuine_3d_building_stays_rigid(self):
         """A real building (20% flat: roof only) must never be flattened/
