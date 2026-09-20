@@ -1955,19 +1955,27 @@ class ModularPythonConverterApp:
             self.log(f"\n{'='*50}\n4. COMPILING DSF TILES\n{'='*50}", "header")
 
             # Clear last run's terrain-fit copies. terrain_fit names each
-            # *_tfit_<digest>.obj purely from the placement's lat/lon/hdg,
-            # NOT the source .obj's content, and skips the write when a file
-            # of that name already exists -- so after the source .obj
-            # changes (a new light format, a geometry fix) but the
-            # placement doesn't move, the DSF keeps pulling in the STALE
+            # *_tfit_<digest>.obj (own-group fit) or *_tfitlink_<digest>.obj
+            # (retroactive shared-rotation link) purely from the placement's
+            # lat/lon/hdg, NOT the source .obj's content, and skips the
+            # write when a file of that name already exists -- so after the
+            # source .obj changes (a new light format, a geometry fix) but
+            # the placement doesn't move, the DSF keeps pulling in the STALE
             # copy from a previous run (confirmed: every one of 1217
             # *_tfit_* files survived a full re-convert, silently undoing
             # the LIGHT_SPILL / wig-wag / down-light fixes for every
             # terrain-fitted placement). Also clears the orphans left when
             # a placement DOES move. terrain_fit regenerates what this run
             # needs; its in-process group cache still de-dupes the work.
+            #
+            # CONFIRMED REAL BUG: this used to glob "*_tfit_*" only, which
+            # does NOT match "*_tfitlink_*" (no "_tfit_" substring inside
+            # "_tfitlink_" -- "link" follows "tfit" with no underscore) --
+            # found a real *_tfitlink_* file a full day stale sitting next
+            # to today's fresh geometry for the same object on a real EGLC
+            # run. Widened to "*_tfit*" so both variants are always cleared.
             _tfit_cleared = 0
-            for _tf in list(obj_dir.glob("*_tfit_*")):
+            for _tf in list(obj_dir.glob("*_tfit*")):
                 try:
                     _tf.unlink()
                     if _tf.suffix == ".obj":
