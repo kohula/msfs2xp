@@ -347,19 +347,32 @@ class TestTerrainFit(unittest.TestCase):
                 original_ir.positions[base_mask], corrected_ir.positions[base_mask], atol=1e-6),
                 "the ground-contact band should have been nudged to match real sampled terrain")
 
-    def test_oversized_footprint_rejects_the_rotation_instead_of_tearing_it_apart(self):
-        """Confirmed real bug: a single glTF that bundles one real building
-        together with a swath of unrelated nearby ground/decal geometry
-        reports a footprint far larger than the building itself (a real
-        control tower model came out 640x640 m). The SAME terrain relief
-        that produces a small, correct tilt for a normal-sized building
-        (see test_large_tilted_building_gets_rigid_rotation_correction,
-        identical terrain) fits a much steeper plane across that inflated
-        span -- rotating the whole combined mesh rigidly by it would swing
-        whichever of its sub-parts sit far from the shared local origin by
-        many metres (the "one wall/window panel floating away from the
-        rest of the building" the user actually saw). Must be rejected
-        outright, not applied."""
+    def test_oversized_footprint_rejects_the_rotation_but_still_gets_ground_skirt(self):
+        """CONFIRMED REAL BUG (part 1): a single glTF that bundles one real
+        building together with a swath of unrelated nearby ground/decal
+        geometry reports a footprint far larger than the building itself
+        (a real control tower model came out 640x640 m). The SAME terrain
+        relief that produces a small, correct tilt for a normal-sized
+        building (see test_large_tilted_building_gets_rigid_rotation_
+        correction, identical terrain) fits a much steeper plane across
+        that inflated span -- rotating the whole combined mesh rigidly by
+        it would swing whichever of its sub-parts sit far from the shared
+        local origin by many metres (the "one wall/window panel floating
+        away from the rest of the building" the user actually saw). The
+        ROTATION must be rejected outright, not applied.
+
+        CONFIRMED REAL BUG (part 2, found on a live EGLC package): a
+        genuinely large SINGLE building -- not bundled-unrelated-content,
+        a real continuous terminal structure -- can ALSO exceed
+        _MAX_SIDE_M (EGLC's own terminal measured 380m wide). Rejecting
+        the rotation used to mean NO correction at all, leaving the whole
+        building floating/sunk relative to real terrain with zero ground
+        contact -- worse than the excessive tilt this guard was meant to
+        avoid. _MAX_SIDE_M's own justification for rejecting the ROTATION
+        is about a SEPARATE, differently-anchored sibling desyncing from
+        it -- irrelevant to the ground skirt, which applies zero rotation
+        (identity only). So an oversized footprint still gets its base
+        conformed to real terrain, exactly like the height-rejected case."""
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             xplane_root = td / "XPlaneRoot"
@@ -375,11 +388,32 @@ class TestTerrainFit(unittest.TestCase):
             stem = result[0].stem
             self.assertIn("TILTED", result[0].read_text(encoding="utf-8").splitlines(),
                           "test setup issue: expected this box fixture to convert as TILTED")
+            original_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{stem}.obj"))
 
             results = terrain_fit.get_or_create_fitted_group(obj_dir, [stem], 47.5, 8.5, 0.0, xplane_root)
             result_stem, applied, reason = results[stem]
-            self.assertFalse(applied, f"an oversized footprint's rotation must be rejected (reason={reason})")
-            self.assertEqual(result_stem, stem, "a rejected object's original file must be left alone")
+            self.assertTrue(applied, "the ground band must still be corrected even though the oversized rotation is rejected")
+            self.assertEqual(reason, "ground_skirt_only")
+            self.assertNotEqual(result_stem, stem, "a corrected copy should have been written")
+
+            corrected_text = (obj_dir / f"{result_stem}.obj").read_text(encoding="utf-8")
+            self.assertNotIn("TILTED", corrected_text.splitlines(),
+                              "TILTED must be replaced by the (identity) correction, not stack with it")
+
+            corrected_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{result_stem}.obj"))
+            # Roof (top face, height 6.0 -- _build_box_glb's default) must
+            # be UNCHANGED -- no rotation means no roof swing at all.
+            roof_mask = original_ir.positions[:, 1] > 3.0
+            self.assertTrue(roof_mask.any(), "test setup issue: expected some roof-height vertices")
+            self.assertTrue(np.allclose(
+                original_ir.positions[roof_mask], corrected_ir.positions[roof_mask], atol=1e-6),
+                "the roof must stay exactly at its original position -- no rotation should reach it")
+            # Base must actually have moved -- the whole point of the skirt.
+            base_mask = original_ir.positions[:, 1] < 0.1
+            self.assertTrue(base_mask.any(), "test setup issue: expected some ground-level vertices")
+            self.assertFalse(np.allclose(
+                original_ir.positions[base_mask], corrected_ir.positions[base_mask], atol=1e-6),
+                "the ground-contact band should have been nudged to match real sampled terrain")
 
     def test_small_tilted_object_stays_disqualified_and_unmodified(self):
         """A TILTED object too small for terrain_fit's own size gate (but
@@ -620,16 +654,18 @@ class TestTerrainFit(unittest.TestCase):
 
     def test_shared_rotation_is_a_noop_when_the_source_group_never_tilted(self):
         """get_cached_transform on a group that legitimately never got a
-        rotation (rejected for an oversized/bogus footprint -- see
-        test_oversized_footprint_rejects_the_rotation_instead_of_tearing_
-        it_apart, same terrain/fixture) must make apply_shared_rotation_
-        to_group a no-op, not synthesize a spurious rotation --
-        propagating "no correction" is exactly as valid a shared decision
-        as propagating a real one. (A group disqualified at the earlier
-        too-small-footprint gate never reaches the transform cache write
-        at all -- see test_get_cached_transform_returns_none_for_an_
-        unprocessed_group; this test targets the oversized-footprint gate
-        specifically, which does.)"""
+        ROTATION (rejected for an oversized/bogus footprint -- see
+        test_oversized_footprint_rejects_the_rotation_but_still_gets_
+        ground_skirt, same terrain/fixture -- the group still gets a
+        ground-skirt-only correction now, but that's an identity rotation,
+        not a real one) must make apply_shared_rotation_to_group a no-op,
+        not synthesize a spurious rotation -- propagating "no rotation to
+        share" is exactly as valid a shared decision as propagating a
+        real one. (A group disqualified at the earlier too-small-footprint
+        gate never reaches the transform cache write at all -- see
+        test_get_cached_transform_returns_none_for_an_unprocessed_group;
+        this test targets the oversized-footprint gate specifically,
+        which does.)"""
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             xplane_root = td / "XPlaneRoot"
@@ -647,11 +683,14 @@ class TestTerrainFit(unittest.TestCase):
             anchor_lat, anchor_lon, anchor_hdg = 47.5, 8.5, 0.0
             group_key = (tuple(sorted([stem])), round(anchor_lat, 6), round(anchor_lon, 6), round(anchor_hdg, 2), False)
             fit_results = terrain_fit.get_or_create_fitted_group(obj_dir, [stem], anchor_lat, anchor_lon, anchor_hdg, xplane_root)
-            self.assertFalse(fit_results[stem][1], "test setup issue: expected the oversized footprint to be rejected")
+            _, applied, reason = fit_results[stem]
+            self.assertEqual((applied, reason), (True, "ground_skirt_only"),
+                              "test setup issue: expected the oversized footprint's rotation rejected, "
+                              "but a ground-skirt-only correction still applied")
 
             transform = terrain_fit.get_cached_transform(group_key)
             self.assertIsNotNone(transform, "an oversized-footprint group still reaches the transform cache write")
-            self.assertIsNone(transform["rigid_rotation"])
+            self.assertIsNone(transform["rigid_rotation"], "ground_skirt_only has no real rotation to cache/share")
 
             other_stem = "some_other_stem_at_the_same_anchor"
             results = terrain_fit.apply_shared_rotation_to_group(obj_dir, [other_stem], transform, xplane_root)

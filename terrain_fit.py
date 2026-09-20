@@ -503,13 +503,26 @@ def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_d
     # sloped enough to fail the roof-height check, that leaves a visible
     # gap under one whole side of the base (not just the roof) -- WORSE
     # than the excessive tilt this guard was meant to fix, and especially
-    # visible through a glass facade. A group rejected specifically for
-    # height (not an oversized footprint or a degenerate/no fit) still
-    # gets its base conformed to real terrain -- identity rotation (no
-    # tilt) plus the skirt band using the FULL sampled delta (a zero
-    # plane, not the fitted one, since there's no rotation for the skirt
-    # to subtract a residual against) -- without ever swinging the roof.
-    ground_skirt = height_rejected and fitted_ab is not None
+    # visible through a glass facade.
+    #
+    # CONFIRMED REAL BUG (part 2, found on a live EGLC package): the same
+    # gap exists for oversized_footprint, and it's not a rare edge case
+    # -- a real, single, continuous terminal building (not bundled-
+    # unrelated-content the 200m cap was meant to catch) measured 380m
+    # wide, comfortably over _MAX_SIDE_M despite that constant's own
+    # docstring claiming 200m "comfortably covers any real building...
+    # including large terminals". _MAX_SIDE_M's whole justification for
+    # rejecting the ROTATION is about a SEPARATE, differently-anchored
+    # sibling desyncing from it (see _MAX_SIDE_M's own docstring) -- a
+    # concern that doesn't exist for the ground skirt at all, since it
+    # applies ZERO rotation (identity only): there's nothing for a
+    # sibling to desync from. So both height_rejected and
+    # oversized_footprint still get the base conformed to real terrain
+    # -- identity rotation (no tilt) plus the skirt band using the FULL
+    # sampled delta (a zero plane, not the fitted one, since there's no
+    # rotation for the skirt to subtract a residual against) -- without
+    # ever swinging the roof or risking an internal shear.
+    ground_skirt = (height_rejected or oversized_footprint) and fitted_ab is not None
 
     # Cached regardless of whether rigid_rotation ended up None (an
     # explicit "this group has no rotation to offer" is as useful to a
