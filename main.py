@@ -339,6 +339,94 @@ def _built_up_exclusion_rects(lats, lons, cell_m=200.0, dilate=1, min_points=5, 
             "north": lat0 + ((gy1 + 1) * _cell) / m_per_deg_lat + pad_lat,
         })
     return out
+
+
+def _points_in_polygon(px, py, poly_x, poly_y):
+    """Vectorized ray-casting point-in-polygon test (crossing-number
+    algorithm). px/py: 1-D arrays of query points. poly_x/poly_y: the
+    polygon's own vertices, in order (implicitly closed -- the last
+    vertex connects back to the first). Returns a bool array, one per
+    query point. No external geometry library in this project (numpy +
+    Pillow only), so this is a from-scratch, dependency-free
+    implementation of the standard algorithm."""
+    n = len(poly_x)
+    inside = np.zeros(len(px), dtype=bool)
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly_x[i], poly_y[i]
+        xj, yj = poly_x[j], poly_y[j]
+        # Edge (j -> i) crosses the horizontal ray from (px, py) iff its
+        # two endpoints straddle py, and the edge's own X at that Y is
+        # to the right of px -- each qualifying crossing flips "inside".
+        straddles = (yi > py) != (yj > py)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            x_at_y = xj + (py - yj) * (xi - xj) / (yi - yj)
+        crosses = straddles & (px < x_at_y)
+        inside ^= crosses
+        j = i
+    return inside
+
+
+def _polygon_interior_exclusion_rects(boundary_points, cell_m=100.0, max_rects=80):
+    """Axis-aligned lat/lon rectangles that tightly cover a REAL boundary
+    ring's own INTERIOR shape -- not just its bounding box. A long, thin
+    runway-shaped boundary (or an L-shaped/irregular airport perimeter)
+    has a bounding box far larger than the ring itself; rasterizing the
+    ring's actual interior and greedy-rectangling that mask (same
+    pattern as _built_up_exclusion_rects) stays tight to the real shape
+    instead. boundary_points: [(lat, lon), ...] ring vertices (as
+    apt_dat.extract_boundary_ring returns them). Returns [] for a
+    degenerate ring (fewer than 3 points) or if the rasterized grid would
+    be pathologically large."""
+    if len(boundary_points) < 3:
+        return []
+    arr = np.asarray(boundary_points, dtype=np.float64)
+    lats, lons = arr[:, 0], arr[:, 1]
+    lat0, lon0 = float(lats.min()), float(lons.min())
+    ref_lat = float(lats.mean())
+    m_per_deg_lat = 111320.0
+    m_per_deg_lon = 111320.0 * max(math.cos(math.radians(ref_lat)), 1e-6)
+
+    poly_x = (lons - lon0) * m_per_deg_lon
+    poly_y = (lats - lat0) * m_per_deg_lat
+
+    chosen = None
+    for _cell in (cell_m, cell_m * 2, cell_m * 4, cell_m * 8):
+        nx = int(np.ceil(float(poly_x.max()) / _cell)) + 1
+        ny = int(np.ceil(float(poly_y.max()) / _cell)) + 1
+        if nx * ny > 4_000_000:
+            return []
+        if max(nx, ny) > 1200:
+            continue
+        gy, gx = np.meshgrid(np.arange(ny), np.arange(nx), indexing="ij")
+        cell_cx = (gx.ravel() + 0.5) * _cell
+        cell_cy = (gy.ravel() + 0.5) * _cell
+        inside = _points_in_polygon(cell_cx, cell_cy, poly_x, poly_y)
+        mask = inside.reshape(ny, nx)
+        if not mask.any():
+            continue
+        mask = _dilate_mask(mask, 1)
+        rects = _greedy_rects_from_mask(mask)
+        if len(rects) <= max_rects:
+            chosen = (_cell, rects)
+            break
+    if chosen is None:
+        return []
+
+    _cell, rects = chosen
+    pad_lat = 5.0 / m_per_deg_lat
+    pad_lon = 5.0 / m_per_deg_lon
+    out = []
+    for (gy0, gx0, gy1, gx1) in rects:
+        out.append({
+            "west":  lon0 + (gx0 * _cell) / m_per_deg_lon - pad_lon,
+            "east":  lon0 + ((gx1 + 1) * _cell) / m_per_deg_lon + pad_lon,
+            "south": lat0 + (gy0 * _cell) / m_per_deg_lat - pad_lat,
+            "north": lat0 + ((gy1 + 1) * _cell) / m_per_deg_lat + pad_lat,
+        })
+    return out
+
+
 TRANSPARENT_KEY = "#000001"  # Color key used for window corner rounding transparency
 
 # Vulkan Format Mapping for KTX2
@@ -2555,41 +2643,57 @@ class ModularPythonConverterApp:
                         "warning")
                     reference_bbox = None
 
-            combined_bbox = None
-            for candidate in (boundary_bbox, placements_bbox, reference_bbox):
-                if candidate is None:
-                    continue
-                if combined_bbox is None:
-                    combined_bbox = dict(candidate)
-                else:
-                    combined_bbox["west"] = min(combined_bbox["west"], candidate["west"])
-                    combined_bbox["south"] = min(combined_bbox["south"], candidate["south"])
-                    combined_bbox["east"] = max(combined_bbox["east"], candidate["east"])
-                    combined_bbox["north"] = max(combined_bbox["north"], candidate["north"])
+            # CONFIRMED REAL BUG: unioning boundary_bbox/placements_bbox/
+            # reference_bbox into ONE combined rectangle (their bounding
+            # box's bounding box) reliably balloons past the real airport
+            # -- a real boundary ring or placement extent is rarely a
+            # clean rectangle, and reference_bbox alone is a blunt 5km-
+            # wide square. Confirmed on a real EGLC conversion: this wiped
+            # out X-Plane's default scenery over a huge area of unrelated
+            # surrounding city, well past the airport itself. Shape-aware
+            # replacement: rasterize the REAL boundary ring's own interior
+            # (_polygon_interior_exclusion_rects, not just its bbox) and
+            # separately the real placed-object extent
+            # (_built_up_exclusion_rects, same rasterize+dilate+greedy-
+            # rectangle-cover pattern already used for roads/rail below),
+            # union the two rectangle SETS -- falls back to the crude
+            # reference_bbox radius only when NEITHER shape-aware source
+            # produced anything at all.
+            shaped_rects = []
+            if boundary_points:
+                shaped_rects.extend(_polygon_interior_exclusion_rects(boundary_points))
+            if placements_bbox is not None and all_lats:
+                shaped_rects.extend(_built_up_exclusion_rects(all_lats, all_lons, cell_m=150.0, dilate=1))
 
             # Replace (not append to) the package's own small, per-BGL
             # "obj"-only Exclusion rectangles: those are real data (the
             # original MSFS scenery author's own fine-grained "don't draw
             # this one default tree here" cutouts), but rendering the
             # scenery as dozens of scattered small rectangles alongside
-            # the one big airport-wide box is confusing to inspect and,
-            # since the big box already excludes every category (not just
-            # "obj") across the airport's whole extent, makes every one of
-            # those small rectangles strictly redundant -- the single big
-            # box already covers everything they cover and more. Only
-            # fall back to the small per-feature ones when no combined box
-            # could be built at all (no apt.dat match AND no placements),
-            # so at least something suppresses default objects.
-            if combined_bbox:
+            # this run's own shape-aware ones is confusing to inspect and,
+            # since the shape-aware set already excludes every category
+            # (not just "obj") across the airport's whole extent, makes
+            # every one of those small rectangles strictly redundant --
+            # the shape-aware set already covers everything they cover
+            # and more. Only fall back to the small per-feature ones when
+            # nothing shape-aware could be built at all (no apt.dat match
+            # AND no placements), so at least something suppresses
+            # default objects.
+            if shaped_rects or reference_bbox:
                 superseded_count = len(all_exclusions)
-                combined_bbox["categories"] = tuple(dsf_compiler.EXCLUSION_PROP_KEYS.keys())
-                all_exclusions = [combined_bbox]
+                if shaped_rects:
+                    for r in shaped_rects:
+                        r["categories"] = tuple(dsf_compiler.EXCLUSION_PROP_KEYS.keys())
+                    all_exclusions = shaped_rects
+                else:
+                    reference_bbox["categories"] = tuple(dsf_compiler.EXCLUSION_PROP_KEYS.keys())
+                    all_exclusions = [reference_bbox]
                 source_parts = []
-                if boundary_bbox:
-                    source_parts.append(f"{matched_apt_ident}'s default boundary ({len(boundary_points)} point(s))")
+                if boundary_points and shaped_rects:
+                    source_parts.append(f"{matched_apt_ident}'s default boundary shape ({len(boundary_points)} point(s))")
                 if placements_bbox:
-                    source_parts.append("placed-object extent")
-                if reference_bbox:
+                    source_parts.append("placed-object extent (every category, including roads/rail)")
+                if not shaped_rects and reference_bbox:
                     source_parts.append("a 2.5km fixed radius around the airport reference point")
                 source_note = " + ".join(source_parts) if source_parts else "no source available"
                 # Roads/rail (net, str) get their OWN set of exclusion
@@ -2622,8 +2726,8 @@ class ModularPythonConverterApp:
                 else:
                     road_note = "no road exclusion (no placements, no reference point)"
                 superseded_note = f" -- superseding {superseded_count} small per-BGL exclusion rectangle(s)" if superseded_count else ""
-                self.log(f"Using a single airport-wide exclusion rectangle covering {source_note} "
-                         f"(every category, including roads/rail){superseded_note}, {road_note}.", "info")
+                self.log(f"Using {len(shaped_rects) or 1} shape-aware exclusion rectangle(s) covering "
+                         f"{source_note}{superseded_note}, {road_note}.", "info")
             else:
                 self.log(
                     "No airport-boundary exclusion could be built (no default apt.dat match, no "

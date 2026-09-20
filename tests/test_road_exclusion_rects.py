@@ -63,6 +63,72 @@ class TestBuiltUpExclusionRects(unittest.TestCase):
         self.assertLessEqual(len(rects), 80)
 
 
+class TestPolygonInteriorExclusionRects(unittest.TestCase):
+    """main._polygon_interior_exclusion_rects -- the shape-aware
+    replacement for the old single-combined-bbox exclusion (CONFIRMED REAL
+    BUG: unioning a real airport boundary/placement extent with an
+    always-present ~5km-wide fixed-radius fallback ballooned the exclusion
+    far past the airport, wiping default scenery over a huge area of
+    unrelated surrounding city -- confirmed on a real EGLC conversion).
+    Rasterizes the REAL boundary ring's own shape instead of just its
+    bounding box, so a long thin runway-shaped ring doesn't drag a huge
+    square along with it."""
+
+    def _rect_ring(self, lat0, lon0, length_m, width_m):
+        """A simple rectangular boundary ring (4 corners), long axis
+        north-south -- stands in for a runway-shaped real boundary."""
+        m = 111320.0
+        dlat = (length_m / 2.0) / m
+        dlon = (width_m / 2.0) / (m * math.cos(math.radians(lat0)))
+        return [
+            (lat0 - dlat, lon0 - dlon), (lat0 - dlat, lon0 + dlon),
+            (lat0 + dlat, lon0 + dlon), (lat0 + dlat, lon0 - dlon),
+        ]
+
+    def test_covers_points_well_inside_the_ring(self):
+        ring = self._rect_ring(47.43, 19.26, length_m=1800.0, width_m=200.0)
+        rects = main._polygon_interior_exclusion_rects(ring)
+        self.assertTrue(rects)
+        self.assertTrue(_covers(rects, 47.43, 19.26), "the ring's own center must be covered")
+
+    def test_elongated_runway_shaped_ring_does_not_balloon_to_a_wide_square(self):
+        """The confirmed real failure mode: a long, THIN ring (a runway)
+        must stay thin in the exclusion too -- not get treated as if its
+        own bounding SQUARE (as wide as it is long) were the real shape."""
+        ring = self._rect_ring(47.43, 19.26, length_m=1800.0, width_m=200.0)
+        rects = main._polygon_interior_exclusion_rects(ring)
+        self.assertTrue(rects)
+        m = 111320.0
+        # A point offset sideways (east-west, the SHORT axis) by 300m --
+        # outside the 200m-wide ring plus a reasonable margin -- must NOT
+        # be covered. The ring's bounding box alone (900m x 200m) would
+        # already exclude this correctly, but a regression back to a
+        # squared-off union would not.
+        far_lon = 19.26 + 300.0 / (m * math.cos(math.radians(47.43)))
+        self.assertFalse(_covers(rects, 47.43, far_lon))
+
+    def test_stays_local_does_not_reach_far_field(self):
+        ring = self._rect_ring(47.43, 19.26, length_m=1800.0, width_m=200.0)
+        rects = main._polygon_interior_exclusion_rects(ring)
+        far_lat = 47.43 + 3000.0 / 111320.0
+        self.assertFalse(_covers(rects, far_lat, 19.26))
+
+    def test_degenerate_ring_returns_empty(self):
+        self.assertEqual(main._polygon_interior_exclusion_rects([]), [])
+        self.assertEqual(main._polygon_interior_exclusion_rects([(47.4, 19.2), (47.4, 19.3)]), [])
+
+
+class TestPointsInPolygon(unittest.TestCase):
+    def test_classifies_inside_and_outside_a_square(self):
+        import numpy as np
+        poly_x = np.array([0.0, 10.0, 10.0, 0.0])
+        poly_y = np.array([0.0, 0.0, 10.0, 10.0])
+        px = np.array([5.0, 15.0, -5.0])
+        py = np.array([5.0, 5.0, 5.0])
+        result = main._points_in_polygon(px, py, poly_x, poly_y)
+        self.assertEqual(list(result), [True, False, False])
+
+
 class TestGreedyRectsFromMask(unittest.TestCase):
     def test_solid_block_is_one_rect(self):
         import numpy as np
