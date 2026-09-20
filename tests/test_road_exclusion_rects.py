@@ -7,9 +7,14 @@ placement, stays local, falls back cleanly, and can't explode the prop
 count.
 """
 import math
+import tempfile
 import unittest
+from pathlib import Path
+
+import numpy as np
 
 import main
+from mesh_convert import mesh_ir
 
 
 def _covers(rects, lat, lon):
@@ -147,6 +152,107 @@ class TestGreedyRectsFromMask(unittest.TestCase):
         for (y0, x0, y1, x1) in rects:
             covered[y0:y1 + 1, x0:x1 + 1] = True
         self.assertTrue((covered == mask).all())
+
+
+class TestPerObjectExclusionRects(unittest.TestCase):
+    """main._per_object_exclusion_rects -- explicit user instruction: default
+    scenery exclusion should be scoped to each converted object's OWN real
+    footprint (+3m), not one shared shape covering the whole airport's
+    combined extent (which swallowed genuine gaps between buildings --
+    grass, taxiways, empty apron -- that were never actually part of any
+    placed object)."""
+
+    def _make_sidecar(self, obj_dir, stem, x_range, z_range):
+        ir = mesh_ir.MeshIR(
+            name=stem,
+            positions=np.array([
+                [x_range[0], 0.0, z_range[0]],
+                [x_range[1], 0.0, z_range[0]],
+                [x_range[1], 0.0, z_range[1]],
+                [x_range[0], 0.0, z_range[1]],
+            ], dtype=np.float64),
+        )
+        mesh_ir.save(ir, mesh_ir.sidecar_path_for(obj_dir / f"{stem}.obj"))
+
+    def test_single_object_footprint_is_padded_by_3m(self):
+        with tempfile.TemporaryDirectory() as td:
+            obj_dir = Path(td)
+            self._make_sidecar(obj_dir, "Building_A", x_range=(-5.0, 5.0), z_range=(-5.0, 5.0))
+            rects = main._per_object_exclusion_rects(
+                obj_dir, [(["Building_A"], 47.0, 19.0, 0.0)])
+            self.assertEqual(len(rects), 1)
+            r = rects[0]
+            m_per_deg_lat = 111320.0
+            m_per_deg_lon = 111320.0 * math.cos(math.radians(47.0))
+            # Unpadded half-extent is 5m; padded should be 8m (5 + 3).
+            expected_half_lat = 8.0 / m_per_deg_lat
+            expected_half_lon = 8.0 / m_per_deg_lon
+            self.assertAlmostEqual(47.0 - r["south"], expected_half_lat, places=6)
+            self.assertAlmostEqual(r["north"] - 47.0, expected_half_lat, places=6)
+            self.assertAlmostEqual(19.0 - r["west"], expected_half_lon, places=6)
+            self.assertAlmostEqual(r["east"] - 19.0, expected_half_lon, places=6)
+
+    def test_two_distant_objects_stay_strictly_their_own_area(self):
+        """The whole point vs. the old airport-wide shape: the empty gap
+        between two well-separated objects must NOT be covered by either
+        rect, or by any single combined one."""
+        with tempfile.TemporaryDirectory() as td:
+            obj_dir = Path(td)
+            self._make_sidecar(obj_dir, "Building_A", x_range=(-2.0, 2.0), z_range=(-2.0, 2.0))
+            self._make_sidecar(obj_dir, "Building_B", x_range=(-2.0, 2.0), z_range=(-2.0, 2.0))
+            rects = main._per_object_exclusion_rects(obj_dir, [
+                (["Building_A"], 47.0000, 19.0000, 0.0),
+                (["Building_B"], 47.0100, 19.0000, 0.0),  # ~1.1km north
+            ])
+            self.assertEqual(len(rects), 2)
+            self.assertTrue(_covers(rects, 47.0000, 19.0000))
+            self.assertTrue(_covers(rects, 47.0100, 19.0000))
+            # Roughly halfway between the two objects -- well outside either
+            # object's own small padded footprint.
+            self.assertFalse(_covers(rects, 47.0050, 19.0000))
+
+    def test_heading_rotates_the_footprint(self):
+        """A footprint that's wide in X and narrow in Z, placed at
+        heading=90, must come out wide in the north/south direction and
+        narrow east/west -- confirms the same local_offset_to_latlon
+        heading convention used everywhere else in the pipeline is applied
+        here too, not a naive axis-aligned copy of local X/Z."""
+        with tempfile.TemporaryDirectory() as td:
+            obj_dir = Path(td)
+            self._make_sidecar(obj_dir, "LongBuilding", x_range=(-20.0, 20.0), z_range=(-2.0, 2.0))
+            rects = main._per_object_exclusion_rects(
+                obj_dir, [(["LongBuilding"], 47.0, 19.0, 90.0)])
+            self.assertEqual(len(rects), 1)
+            r = rects[0]
+            m_per_deg_lat = 111320.0
+            m_per_deg_lon = 111320.0 * math.cos(math.radians(47.0))
+            lat_span_m = (r["north"] - r["south"]) * m_per_deg_lat
+            lon_span_m = (r["east"] - r["west"]) * m_per_deg_lon
+            self.assertGreater(lat_span_m, lon_span_m,
+                                "a 40m-long object at heading 90 must span more north/south than east/west")
+
+    def test_multiple_stems_for_one_placement_combine_into_one_rect(self):
+        """generated_stems (multiple .obj siblings from one original model,
+        e.g. per-material split) must combine into ONE rect covering their
+        union, not one rect per sibling."""
+        with tempfile.TemporaryDirectory() as td:
+            obj_dir = Path(td)
+            self._make_sidecar(obj_dir, "Roof_Mat", x_range=(-5.0, 5.0), z_range=(-5.0, 5.0))
+            self._make_sidecar(obj_dir, "Wall_Mat", x_range=(-3.0, 8.0), z_range=(-3.0, 3.0))
+            rects = main._per_object_exclusion_rects(
+                obj_dir, [(["Roof_Mat", "Wall_Mat"], 47.0, 19.0, 0.0)])
+            self.assertEqual(len(rects), 1)
+
+    def test_missing_sidecar_is_skipped_not_crashed(self):
+        with tempfile.TemporaryDirectory() as td:
+            obj_dir = Path(td)
+            rects = main._per_object_exclusion_rects(
+                obj_dir, [(["NoSuchStem"], 47.0, 19.0, 0.0)])
+            self.assertEqual(rects, [])
+
+    def test_empty_candidates_returns_empty(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(main._per_object_exclusion_rects(Path(td), []), [])
 
 
 if __name__ == "__main__":

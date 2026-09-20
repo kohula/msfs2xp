@@ -10,6 +10,7 @@ import io
 import hashlib
 import threading
 import multiprocessing
+import pickle
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -31,6 +32,7 @@ import draped_merge
 import pick_replacements
 import scenery_viewer
 import geo_transform
+from mesh_convert import mesh_ir
 
 CONFIG_FILE = Path("msfs2xp_config.json")
 
@@ -425,6 +427,84 @@ def _polygon_interior_exclusion_rects(boundary_points, cell_m=100.0, max_rects=8
             "north": lat0 + ((gy1 + 1) * _cell) / m_per_deg_lat + pad_lat,
         })
     return out
+
+
+def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=3.0):
+    """One tight exclusion rectangle PER converted object (not one shared
+    airport-wide set) -- user's explicit ask: default X-Plane scenery
+    should only be suppressed exactly where this run's own objects sit,
+    not the object's whole airport's combined extent (which, for an
+    airport with real gaps between buildings, wiped out default scenery
+    in areas nothing was ever placed). Only roads/rail (net/str, see
+    _built_up_exclusion_rects) stay airport-wide -- those aren't tied to
+    one object's own footprint.
+
+    footprint_candidates: [(generated_stems, base_lat, base_lon,
+    heading_deg), ...] -- one entry per real placement, collected during
+    the main placement loop (base_lat/base_lon are that placement's own
+    ALREADY mid_x/mid_z-recentering-compensated anchor, matching the
+    local coordinate frame each generated stem's .meshir.pkl sidecar was
+    written in). For each entry, every named stem's sidecar (if any) is
+    loaded for its real local X/Z vertex extent; the resulting bounding
+    box's 4 corners are rotated into real-world lat/lon by the placement's
+    own heading (geo_transform.local_offset_to_latlon, same convention
+    used everywhere else in this pipeline) and padded by `pad_m` on every
+    side. Terrain-fit's own corrected copies aren't needed here: rigid
+    rotation and draped Y-warps don't materially change an object's own
+    XZ footprint, and reading the pre-terrain-fit original avoids a
+    dependency on terrain-fit having already run for this stem.
+
+    Skips stems with no sidecar or no real geometry (lights-only/animated-
+    only objects have no footprint to exclude). Returns [] if nothing
+    produced a usable footprint at all, so the caller can fall back to
+    the airport-wide shape.
+    """
+    m_per_deg_lat = 111320.0
+    rects = []
+    sidecar_cache = {}
+    for generated_stems, base_lat, base_lon, heading_deg in footprint_candidates:
+        x_min = x_max = z_min = z_max = None
+        for stem in generated_stems:
+            if stem in sidecar_cache:
+                positions = sidecar_cache[stem]
+            else:
+                sidecar = mesh_ir.sidecar_path_for(obj_dir / f"{stem}.obj")
+                positions = None
+                if sidecar.exists():
+                    try:
+                        ir = mesh_ir.load(sidecar)
+                        if len(ir.positions):
+                            positions = ir.positions
+                    except (OSError, EOFError, pickle.UnpicklingError):
+                        positions = None
+                sidecar_cache[stem] = positions
+            if positions is None:
+                continue
+            sx0, sx1 = float(positions[:, 0].min()), float(positions[:, 0].max())
+            sz0, sz1 = float(positions[:, 2].min()), float(positions[:, 2].max())
+            x_min = sx0 if x_min is None else min(x_min, sx0)
+            x_max = sx1 if x_max is None else max(x_max, sx1)
+            z_min = sz0 if z_min is None else min(z_min, sz0)
+            z_max = sz1 if z_max is None else max(z_max, sz1)
+        if x_min is None:
+            continue
+
+        corners = [(x_min, z_min), (x_max, z_min), (x_max, z_max), (x_min, z_max)]
+        lats, lons = [], []
+        for cx, cz in corners:
+            la, lo = geo_transform.local_offset_to_latlon(base_lat, base_lon, heading_deg, cx, cz)
+            lats.append(la)
+            lons.append(lo)
+        m_per_deg_lon = 111320.0 * max(math.cos(math.radians(base_lat)), 1e-6)
+        pad_lat = pad_m / m_per_deg_lat
+        pad_lon = pad_m / m_per_deg_lon
+        rects.append({
+            "west": min(lons) - pad_lon,
+            "east": max(lons) + pad_lon,
+            "south": min(lats) - pad_lat,
+            "north": max(lats) + pad_lat,
+        })
+    return rects
 
 
 TRANSPARENT_KEY = "#000001"  # Color key used for window corner rounding transparency
@@ -2118,6 +2198,11 @@ class ModularPythonConverterApp:
             # after this loop, once every placement's own fit is known.
             _anchor_cluster_candidates = []
 
+            # Per-object exclusion-zone footprints: collected here (real
+            # geometry + real placement anchor), resolved into rectangles
+            # in one pass after this loop -- see _per_object_exclusion_rects.
+            _footprint_exclusion_candidates = []
+
             for p in all_placements:
                 original_stem = _resolve_original_stem(p)
                 offset = offsets.get(original_stem.lower(), (0.0, 0.0, 0.0)) if original_stem else None
@@ -2156,6 +2241,7 @@ class ModularPythonConverterApp:
                         agl_placement_count += 1
 
                     generated_stems = converted_stems_map[original_stem]
+                    _footprint_exclusion_candidates.append((generated_stems, abs_lat, abs_lon, p["hdg"]))
 
                     # Large-building terrain fit: a rigid mesh assumes flat
                     # ground under its whole footprint, but real X-Plane
@@ -2658,20 +2744,31 @@ class ModularPythonConverterApp:
             # clean rectangle, and reference_bbox alone is a blunt 5km-
             # wide square. Confirmed on a real EGLC conversion: this wiped
             # out X-Plane's default scenery over a huge area of unrelated
-            # surrounding city, well past the airport itself. Shape-aware
-            # replacement: rasterize the REAL boundary ring's own interior
-            # (_polygon_interior_exclusion_rects, not just its bbox) and
-            # separately the real placed-object extent
-            # (_built_up_exclusion_rects, same rasterize+dilate+greedy-
-            # rectangle-cover pattern already used for roads/rail below),
-            # union the two rectangle SETS -- falls back to the crude
-            # reference_bbox radius only when NEITHER shape-aware source
-            # produced anything at all.
-            shaped_rects = []
-            if boundary_points:
-                shaped_rects.extend(_polygon_interior_exclusion_rects(boundary_points))
-            if placements_bbox is not None and all_lats:
-                shaped_rects.extend(_built_up_exclusion_rects(all_lats, all_lons, cell_m=150.0, dilate=1))
+            # surrounding city, well past the airport itself.
+            #
+            # PREFERRED source, per explicit user instruction: one tight
+            # rectangle PER converted object (_per_object_exclusion_rects),
+            # not one shared shape covering the airport's whole combined
+            # extent -- a real airport has genuine gaps between buildings
+            # (grass, taxiways, empty apron) that an airport-wide shape
+            # still swallowed whole, suppressing default scenery in places
+            # nothing was ever placed. Only falls back to the OLD
+            # airport-wide shape-aware union (rasterize the real boundary
+            # ring's own interior via _polygon_interior_exclusion_rects,
+            # plus the real placed-object extent via
+            # _built_up_exclusion_rects, same rasterize+dilate+greedy-
+            # rectangle-cover pattern used for roads/rail below) when the
+            # per-object pass produced nothing at all (no sidecars
+            # available for any placement). Roads/rail (net/str) are
+            # deliberately NOT part of this -- those stay airport-wide,
+            # built separately below.
+            shaped_rects = _per_object_exclusion_rects(obj_dir, _footprint_exclusion_candidates)
+            _used_per_object_rects = bool(shaped_rects)
+            if not shaped_rects:
+                if boundary_points:
+                    shaped_rects.extend(_polygon_interior_exclusion_rects(boundary_points))
+                if placements_bbox is not None and all_lats:
+                    shaped_rects.extend(_built_up_exclusion_rects(all_lats, all_lons, cell_m=150.0, dilate=1))
 
             # Replace (not append to) the package's own small, per-BGL
             # "obj"-only Exclusion rectangles: those are real data (the
@@ -2690,17 +2787,28 @@ class ModularPythonConverterApp:
             if shaped_rects or reference_bbox:
                 superseded_count = len(all_exclusions)
                 if shaped_rects:
+                    # net/str deliberately excluded here even when shaped_rects
+                    # fell back to the old airport-wide shape -- roads/rail
+                    # always get their own, separately-built airport-wide
+                    # rectangles below (road_rects), so including them here
+                    # too would only be redundant, never wrong, but leaving
+                    # it out keeps exactly one source of truth for road
+                    # exclusion regardless of which shaped_rects branch ran.
+                    _non_road_categories = tuple(k for k in dsf_compiler.EXCLUSION_PROP_KEYS.keys() if k not in ("net", "str"))
                     for r in shaped_rects:
-                        r["categories"] = tuple(dsf_compiler.EXCLUSION_PROP_KEYS.keys())
+                        r["categories"] = _non_road_categories
                     all_exclusions = shaped_rects
                 else:
                     reference_bbox["categories"] = tuple(dsf_compiler.EXCLUSION_PROP_KEYS.keys())
                     all_exclusions = [reference_bbox]
                 source_parts = []
-                if boundary_points and shaped_rects:
-                    source_parts.append(f"{matched_apt_ident}'s default boundary shape ({len(boundary_points)} point(s))")
-                if placements_bbox:
-                    source_parts.append("placed-object extent (every category, including roads/rail)")
+                if _used_per_object_rects:
+                    source_parts.append(f"{len(shaped_rects)} converted object(s)' own footprints (per-object, +3m each)")
+                else:
+                    if boundary_points and shaped_rects:
+                        source_parts.append(f"{matched_apt_ident}'s default boundary shape ({len(boundary_points)} point(s))")
+                    if placements_bbox and shaped_rects:
+                        source_parts.append("placed-object extent")
                 if not shaped_rects and reference_bbox:
                     source_parts.append("a 2.5km fixed radius around the airport reference point")
                 source_note = " + ".join(source_parts) if source_parts else "no source available"
