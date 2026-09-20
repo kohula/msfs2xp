@@ -129,6 +129,7 @@ class MatBuilder:
         self.double_sided = False
         self.is_glass = False
         self.is_decal = False
+        self.is_near_ground_flat = False  # per-material draping fallback -- see convert()
         self.all_source_nodes_flat = True  # AND-reduced across every contributing node -- see convert()
         self.block_footprint_areas = []  # per-node-block XZ bbox area, m^2 -- see convert()'s footprint write-up
 
@@ -454,15 +455,40 @@ def compute_file_flatness_and_reference(gltf, buffers, world_transforms, flat_ep
 
       - node_stats: {node_idx: (flat_fraction, reference_height)}, the
         exact same two tallies as above but broken out PER NODE instead of
-        aggregated across the whole file. convert() uses this (not the
-        file-wide flat_fraction/reference_height) to decide flattening and
-        ATTR_draped per node/builder -- the file-wide, all-or-nothing
-        version used to mean one non-flat node anywhere in a file (e.g. a
-        single mis-authored triangle) silently disabled draping for every
-        OTHER, genuinely flat marking layer in the same file too, which
-        could bury them in/under the compiled terrain. TILTED's own
-        decision is untouched by this and still uses only the file-wide
-        aggregate above.
+        aggregated across the whole file. Computed but currently UNUSED by
+        convert() (this_node_is_flat = file_is_flat_only everywhere -- see
+        that assignment's own comment for why per-node was tried and
+        reverted: it can split one continuous real-world surface into a
+        draped half and a rigid half that can never weld against each
+        other). Kept for any future diagnostic use.
+
+      - material_stats: {mat_idx: (flat_fraction, reference_height)}, the
+        same two tallies broken out PER MATERIAL instead -- matches the
+        actual granularity convert() builds output objects at (one
+        "builder" per mat_idx, see builder_key in convert()), unlike
+        node_stats above. Used as a narrow, OPT-IN fallback for materials
+        the file-wide verdict rejects: a real EGLC ground-layer model
+        packs ~25 unrelated materials (asphalt, concrete, paint markings,
+        individual paver/tile decals, plus one genuinely 3D ramp detail)
+        into ONE file, and that one non-flat material vetoes ATTR_draped
+        for every other material too under the file-wide, all-or-nothing
+        check -- confirmed real symptom: paver/tile materials each
+        individually ~100% flat (by this SAME strict test) end up written
+        as RIGID objects instead, at whatever small nonzero local Y they
+        happened to be authored at (a baked authoring-tool artifact,
+        confirmed ~1.5m for one real case), which repro's exactly as
+        "pavement floating above the ground" once compiled (rigid
+        geometry renders its authored Y as-is; only ATTR_draped discards
+        it and re-projects onto real terrain at render time). convert()
+        only trusts material_stats for a material when its own
+        reference_height is ALSO close to the file's overall
+        reference_height (see _NEAR_GROUND_FLAT_TOLERANCE_M in convert())
+        -- flatness alone isn't enough, since a building's flat ROOF or a
+        bridge deck's flat TOP would also pass a pure per-material
+        flatness test despite being meters above the file's own ground
+        level, and must stay rigid (this is exactly the failure mode an
+        earlier, more aggressive per-material attempt hit this session:
+        it had no ground-proximity check at all).
     """
     total_tris = 0
     flat_tris = 0
@@ -480,6 +506,14 @@ def compute_file_flatness_and_reference(gltf, buffers, world_transforms, flat_ep
     node_total_tris = {}
     node_flat_tris = {}
     node_flat_y_values = {}
+
+    # Per-material breakdown -- see material_stats in the return value's
+    # own docstring entry above for why this is tracked at material
+    # granularity (matching convert()'s own builder_key) rather than
+    # per-node.
+    mat_total_tris = {}
+    mat_flat_tris = {}
+    mat_flat_y_values = {}
 
     for node_idx, node in enumerate(gltf.get("nodes", [])):
         if "mesh" not in node:
@@ -575,6 +609,22 @@ def compute_file_flatness_and_reference(gltf, buffers, world_transforms, flat_ep
             if is_flat.any():
                 node_flat_y_values.setdefault(node_idx, []).append(y[tri[is_flat]].reshape(-1))
 
+            mat_idx = prim.get("material")
+            mat_total_tris[mat_idx] = mat_total_tris.get(mat_idx, 0) + len(spread)
+            mat_flat_tris[mat_idx] = mat_flat_tris.get(mat_idx, 0) + int(is_flat.sum())
+            if is_flat.any():
+                mat_flat_y_values.setdefault(mat_idx, []).append(y[tri[is_flat]].reshape(-1))
+
+    material_stats = {}
+    for mat_idx, m_total in mat_total_tris.items():
+        m_flat_fraction = (mat_flat_tris.get(mat_idx, 0) / m_total) if m_total else 0.0
+        m_reference_height = None
+        m_flat_ys = mat_flat_y_values.get(mat_idx)
+        if m_flat_ys:
+            m_all_y = np.concatenate(m_flat_ys)
+            _, _, m_reference_height, _ = _cluster_height_bands(m_all_y, merge_gap=merge_gap)
+        material_stats[mat_idx] = (m_flat_fraction, m_reference_height)
+
     node_stats = {}
     for node_idx, n_total in node_total_tris.items():
         n_flat_fraction = (node_flat_tris.get(node_idx, 0) / n_total) if n_total else 0.0
@@ -592,7 +642,7 @@ def compute_file_flatness_and_reference(gltf, buffers, world_transforms, flat_ep
         all_y = np.concatenate(flat_y_values)
         _, _, reference_height, _ = _cluster_height_bands(all_y, merge_gap=merge_gap)
 
-    return flat_fraction, reference_height, max_radius, max_horizontal_radius, node_stats
+    return flat_fraction, reference_height, max_radius, max_horizontal_radius, node_stats, material_stats
 
 
 def _cluster_height_bands(y_values, merge_gap=0.05):
@@ -1739,7 +1789,16 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
     # is left completely untouched instead of guessing which parts are
     # safe to flatten.
     flat_fraction_threshold = 0.98
-    file_flat_fraction, file_reference_height, file_max_radius, file_max_horizontal_radius, node_flatness_stats = compute_file_flatness_and_reference(gltf, buffers, world_transforms)
+    # How close a material's own flat elevation must sit to the file's
+    # overall ground-level reference to qualify for the per-material
+    # near-ground-flat fallback below (see builder.is_near_ground_flat).
+    # Comfortably covers the confirmed real case (~1.5m, a baked authoring
+    # offset on an otherwise-ground-level tile material) while staying
+    # well under typical ceiling/roof/deck heights, so a genuinely
+    # elevated flat surface (a roof, a bridge top) still can't qualify
+    # just because it's flat.
+    _NEAR_GROUND_FLAT_TOLERANCE_M = 2.0
+    file_flat_fraction, file_reference_height, file_max_radius, file_max_horizontal_radius, node_flatness_stats, material_flatness_stats = compute_file_flatness_and_reference(gltf, buffers, world_transforms)
     file_is_flat_only = file_flat_fraction >= flat_fraction_threshold and file_reference_height is not None
 
     # TILTED rotates the WHOLE rigid object around its local origin to
@@ -2027,6 +2086,36 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                         builder.double_sided = bool(mat.get("doubleSided", False))
 
                         builder.is_decal = "decal" in raw_mat_name.lower() or "ASOBO_material_decal" in exts
+
+                        # Narrow fallback for materials the file-wide
+                        # verdict rejects (see material_stats in
+                        # compute_file_flatness_and_reference's own
+                        # docstring for the full real-world case this
+                        # covers -- ground-layer models with one non-flat
+                        # sibling material vetoing ATTR_draped for every
+                        # OTHER, individually-flat material in the same
+                        # file). Two conditions, both required:
+                        #   1. This material's OWN geometry passes the
+                        #      exact same strict per-triangle flatness test
+                        #      as the file-wide check (flat_fraction_threshold,
+                        #      0.98 -- not a looser bar).
+                        #   2. Its own flat elevation is close to the
+                        #      file's overall ground-level reference. Flatness
+                        #      alone isn't enough: a building's flat ROOF or a
+                        #      bridge's flat deck TOP would also pass condition
+                        #      1 despite sitting meters above the file's real
+                        #      ground level, and must stay rigid -- this is
+                        #      exactly the failure mode a more aggressive
+                        #      per-material attempt hit earlier this session
+                        #      (it had no ground-proximity check at all and
+                        #      wrongly flattened chairs/glass/rooftops).
+                        _mat_flat_fraction, _mat_ref_height = material_flatness_stats.get(mat_idx, (0.0, None))
+                        builder.is_near_ground_flat = (
+                            _mat_flat_fraction >= flat_fraction_threshold
+                            and _mat_ref_height is not None
+                            and file_reference_height is not None
+                            and abs(_mat_ref_height - file_reference_height) <= _NEAR_GROUND_FLAT_TOLERANCE_M
+                        )
 
                         # MSFS has shipped several glass extension names
                         # ("ASOBO_material_glass", "_glass_v2", "_kitty_glass")
@@ -2815,7 +2904,8 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
     builder_is_draped_map = {}
     for builder_key, builder in builders.items():
         num_verts = len(builder.vertices)
-        is_draped = (bool(num_verts) and builder.all_source_nodes_flat) or getattr(builder, 'is_decal', False)
+        is_draped = (bool(num_verts) and builder.all_source_nodes_flat) or getattr(builder, 'is_decal', False) or (
+            bool(num_verts) and getattr(builder, 'is_near_ground_flat', False))
         builder_is_draped_map[builder_key] = is_draped
         if is_draped and builder.block_footprint_areas:
             draped_areas[builder_key] = float(np.median(builder.block_footprint_areas))

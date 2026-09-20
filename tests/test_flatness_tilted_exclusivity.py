@@ -339,6 +339,134 @@ class TestFlatnessTiltedExclusivity(unittest.TestCase):
             text = result[0].read_text(encoding="utf-8")
             self.assertNotIn("ATTR_draped", text, "a genuine 3D building must never be draped/flattened")
 
+    def _build_ground_layer_glb(self):
+        """Mirrors the confirmed real-world EGLC case: one file mixing a
+        genuinely 3D building (non-flat walls, vetoes the file-wide 0.98
+        verdict) with THREE separate ground-level materials -- a large
+        dominant GroundMat at y=0 (sets the file's own reference height),
+        a non-"decal"-named PaverMat at y=1.5 (mirrors the real confirmed
+        SmallTiles/ConcreteTile case: individually ~100% flat, but a
+        small nonzero baked authoring offset), and a RoofMat at y=6.0
+        (individually just as flat as PaverMat, but at a real elevated
+        height -- must NOT be treated as ground-level just because it's
+        flat)."""
+        b = GltfBuilder()
+        tex = b.add_image_data_uri((160, 160, 160, 255))
+        texi = b.add_texture(tex)
+        building_mat = b.add_material("BuildingMat", base_color_texture_index=texi)
+        ground_mat = b.add_material("GroundMat", base_color_texture_index=texi)
+        paver_mat = b.add_material("PaverMat", base_color_texture_index=texi)
+        roof_mat = b.add_material("RoofMat", base_color_texture_index=texi)
+
+        wall_verts, wall_tris = _box_walls_and_roof(hw=4.0)
+        wall_indices = [i for tri in wall_tris for i in tri]
+        wall_mesh = b.add_mesh(
+            wall_verts, wall_indices,
+            normals=[(1.0, 0.0, 0.0)] * len(wall_verts), uvs=[(0.0, 0.0)] * len(wall_verts),
+            material_index=building_mat,
+        )
+        b.add_node(mesh_index=wall_mesh, name="Building")
+
+        # Large dominant ground fill at y=0 -- several quads so its vertex
+        # support clearly outweighs the two single-quad candidates below,
+        # keeping the file's own reference height anchored at ~0.
+        ground_verts, ground_tris = [], []
+        for i in range(4):
+            base = len(ground_verts)
+            x0 = -100.0 + i * 20.0
+            ground_verts += [(x0, 0.0, -50.0), (x0 + 15.0, 0.0, -50.0), (x0 + 15.0, 0.0, 50.0), (x0, 0.0, 50.0)]
+            ground_tris += [(base, base + 1, base + 2), (base, base + 2, base + 3)]
+        ground_indices = [i for tri in ground_tris for i in tri]
+        ground_mesh = b.add_mesh(
+            ground_verts, ground_indices,
+            normals=[(0.0, 1.0, 0.0)] * len(ground_verts), uvs=[(0.0, 0.0)] * len(ground_verts),
+            material_index=ground_mat,
+        )
+        b.add_node(mesh_index=ground_mesh, name="GroundFill")
+
+        paver_verts = [(10.0, 1.5, 10.0), (12.0, 1.5, 10.0), (12.0, 1.5, 12.0), (10.0, 1.5, 12.0)]
+        paver_indices = [0, 1, 2, 0, 2, 3]
+        paver_mesh = b.add_mesh(
+            paver_verts, paver_indices,
+            normals=[(0.0, 1.0, 0.0)] * 4, uvs=[(0.0, 0.0)] * 4, material_index=paver_mat,
+        )
+        b.add_node(mesh_index=paver_mesh, name="PaverPatch")
+
+        roof_verts = [(20.0, 6.0, 20.0), (22.0, 6.0, 20.0), (22.0, 6.0, 22.0), (20.0, 6.0, 22.0)]
+        roof_indices = [0, 1, 2, 0, 2, 3]
+        roof_mesh = b.add_mesh(
+            roof_verts, roof_indices,
+            normals=[(0.0, 1.0, 0.0)] * 4, uvs=[(0.0, 0.0)] * 4, material_index=roof_mat,
+        )
+        b.add_node(mesh_index=roof_mesh, name="RoofPatch")
+
+        return b.build()
+
+    def test_near_ground_flat_material_drapes_despite_file_wide_veto(self):
+        """The per-material near-ground-flat fallback (convert()'s
+        builder.is_near_ground_flat): a non-"decal"-named material that is
+        individually ~100% flat AND close to the file's own ground-level
+        reference must still drape, even though the file-wide verdict
+        fails because of the building's genuinely non-flat walls.
+        Confirmed real case this pins: EGLC's SmallTiles/ConcreteTile
+        materials, baked ~1.5m off true ground level, previously stayed
+        rigid (visibly floating) because only the "decal"-named sibling in
+        the same file got draped."""
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            glb_path = td / "ground_layer.glb"
+            glb_path.write_bytes(self._build_ground_layer_glb())
+            obj_dir = td / "objects"
+            tex_dir = td / "textures"
+            obj_dir.mkdir()
+            tex_dir.mkdir()
+
+            result = mesh_convert.convert(glb_path, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
+            self.assertTrue(result)
+
+            building_obj = next(p for p in result if "BuildingMat" in p.name)
+            paver_obj = next(p for p in result if "PaverMat" in p.name)
+
+            building_text = building_obj.read_text(encoding="utf-8")
+            paver_text = paver_obj.read_text(encoding="utf-8")
+
+            self.assertIn("TILTED", building_text.splitlines(), "the rigid building must still get TILTED")
+            self.assertNotIn("ATTR_draped", building_text, "the rigid building must not be draped")
+
+            self.assertIn("ATTR_draped", paver_text,
+                          "a non-decal material that's individually flat and near ground level must drape")
+            self.assertNotIn("TILTED", paver_text.splitlines(),
+                              "a draped material must never also get TILTED")
+
+    def test_elevated_flat_material_does_not_drape_just_because_its_flat(self):
+        """The near-ground-flat fallback must NOT fire for a flat material
+        that sits meters above the file's own ground level (a roof, a
+        bridge deck top) -- flatness alone isn't the signal, proximity to
+        ground level is what distinguishes "floating pavement" from "a
+        real elevated flat surface that must stay rigid". This is exactly
+        the failure mode an earlier, more aggressive per-material attempt
+        hit this session (no ground-proximity check at all, wrongly
+        flattened chairs/glass/rooftops) -- this test pins that it can't
+        happen again via this narrower mechanism."""
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            glb_path = td / "ground_layer.glb"
+            glb_path.write_bytes(self._build_ground_layer_glb())
+            obj_dir = td / "objects"
+            tex_dir = td / "textures"
+            obj_dir.mkdir()
+            tex_dir.mkdir()
+
+            result = mesh_convert.convert(glb_path, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
+            self.assertTrue(result)
+
+            roof_obj = next(p for p in result if "RoofMat" in p.name)
+            roof_text = roof_obj.read_text(encoding="utf-8")
+
+            self.assertNotIn("ATTR_draped", roof_text,
+                             "an individually-flat but elevated material must not drape just because it's flat")
+            self.assertIn("TILTED", roof_text.splitlines(), "it must stay rigid instead")
+
 
 if __name__ == "__main__":
     unittest.main()
