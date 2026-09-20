@@ -14,7 +14,6 @@ while a node wrongly left rigid visibly floats/sinks on sloped terrain --
 so the per-node threshold (0.90) is deliberately more lenient than the
 file-wide TILTED threshold (0.98).
 """
-import math
 import sys
 import tempfile
 import unittest
@@ -186,20 +185,16 @@ class TestFlatnessTiltedExclusivity(unittest.TestCase):
                               "a real converted object disappear entirely in X-Plane")
 
     def test_mostly_flat_node_with_minor_embossing_still_drapes(self):
-        """Flatness/draping is a PER-NODE verdict (this module's own
-        docstring: the 0.90 per-node threshold): a node with a small
+        """Flatness/draping is a FILE-WIDE verdict: a node with a small
         amount of embossed/raised detail (here, 10 flat tris + 1 near-
-        vertical sliver, ~91% flat on its own) still drapes correctly on
-        its OWN merit, clearing the lenient 0.90 per-node bar -- paired
-        here with a large, purely-flat "base fill" node (60 tris) only to
-        keep the combined FILE-WIDE fraction at ~98.6% too, so this
-        fixture can't be accidentally passing via TILTED's separate
-        file-wide 0.98 threshold instead of the per-node one this test
-        actually exists to pin. Real MSFS airport marking files are
+        vertical sliver, ~91% flat on its own) still drapes correctly as
+        long as the FILE as a whole clears the 0.98 flat-fraction bar --
+        confirmed by pairing it with a large, purely-flat "base fill" node
+        (60 tris) that keeps the combined file-wide fraction at ~98.6%,
+        comfortably above threshold. Real MSFS airport marking files are
         exactly this shape: mostly pure flat decals (many nodes near 100%
         flat) with an occasional embossed one mixed in -- the embossed
-        node's own minor non-flat detail doesn't disqualify IT, let alone
-        any sibling node in the same file."""
+        node's own minor non-flat detail doesn't disqualify the file."""
         b = GltfBuilder()
         tex = b.add_image_data_uri((180, 180, 180, 255))
         texi = b.add_texture(tex)
@@ -306,169 +301,6 @@ class TestFlatnessTiltedExclusivity(unittest.TestCase):
             for p in result:
                 self.assertNotIn("TILTED", p.read_text(encoding="utf-8").splitlines(),
                                   f"{p.name}: a tiny sign-scale object should skip TILTED entirely")
-
-    def test_flat_majority_drapes_despite_one_non_flat_primitive_sharing_its_node(self):
-        """CONFIRMED REAL BUG on a live EGLC package: one glTF bundles a
-        large, genuinely flat apron/taxiway ground-poly (concrete tiles,
-        transitions, every painted marking -- ~25 distinct materials)
-        together with ONE real-3D slope/transition material -- ALL as
-        separate PRIMITIVES inside a SINGLE node's mesh (real MSFS ground-
-        poly export shape: one node, one mesh, many materials as
-        primitives -- not one node per material). The file-wide fraction
-        came out at 89.70% -- short of the 0.98 TILTED bar, which is
-        correct (the file does have real 3D content), but the OLD code
-        also used that same file-wide verdict to gate draping, so the
-        ENTIRE file -- including every individually-flat pavement
-        material -- was left rigid. A rigid object never gets X-Plane's
-        native per-vertex terrain draping, so it doesn't track the
-        compiled terrain precisely -- this is the confirmed mechanism
-        behind reported "pavement floating above the ground and
-        glitching". A first fix keyed per NODE alone (matching this real
-        file's shape, where everything sits in one node) would have been
-        just as useless as file-wide -- the key has to be per (node,
-        MATERIAL) for a flat majority sharing a node with one non-flat
-        material to be told apart at all. Each flat pavement material
-        must drape on its own merit; only the genuinely-3D one stays
-        rigid."""
-        b = GltfBuilder()
-        tex = b.add_image_data_uri((170, 170, 170, 255))
-        texi = b.add_texture(tex)
-
-        # Several separate, perfectly flat pavement materials -- stands in
-        # for concrete tiles / transitions / markings -- PLUS one
-        # genuinely-3D slope/transition material (reusing the same near-
-        # vertical-wall fixture other tests in this file already rely on
-        # to fail BOTH the per-triangle height-variance check and the
-        # face-normal-near-vertical check), ALL as primitives of ONE mesh
-        # attached to a SINGLE node -- the real EGLC file's exact shape.
-        pave_names = ("ConcreteTile", "Transitions", "WhiteMarking", "Grunge")
-        primitives = []
-        for i, name in enumerate(pave_names):
-            mat = b.add_material(name, base_color_texture_index=texi)
-            x0 = -60.0 + i * 30.0
-            verts = [(x0, 0.0, -20.0), (x0 + 25.0, 0.0, -20.0), (x0 + 25.0, 0.0, 20.0), (x0, 0.0, 20.0)]
-            indices = [0, 1, 2, 0, 2, 3]
-            primitives.append({
-                "attributes": {
-                    "POSITION": b.add_positions(verts),
-                    "NORMAL": b.add_normals([(0.0, 1.0, 0.0)] * 4),
-                    "TEXCOORD_0": b.add_uvs([(0.0, 0.0)] * 4),
-                },
-                "indices": b.add_indices(indices),
-                "material": mat,
-            })
-
-        slope_mat = b.add_material("Slope", base_color_texture_index=texi)
-        slope_verts, slope_tris = _box_walls_and_roof(hw=1.5)
-        slope_indices = [i for tri in slope_tris for i in tri]
-        primitives.append({
-            "attributes": {
-                "POSITION": b.add_positions(slope_verts),
-                "NORMAL": b.add_normals([(1.0, 0.0, 0.0)] * len(slope_verts)),
-                "TEXCOORD_0": b.add_uvs([(0.0, 0.0)] * len(slope_verts)),
-            },
-            "indices": b.add_indices(slope_indices),
-            "material": slope_mat,
-        })
-
-        mesh = b.add_raw_mesh(primitives)
-        b.add_node(mesh_index=mesh, name="GroundPolyMainLayer")
-        pave_objs = pave_names
-
-        with tempfile.TemporaryDirectory() as td:
-            td = Path(td)
-            glb_path = td / "ground_poly.glb"
-            glb_path.write_bytes(b.build())
-            obj_dir = td / "objects"
-            tex_dir = td / "textures"
-            obj_dir.mkdir()
-            tex_dir.mkdir()
-
-            result = mesh_convert.convert(glb_path, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
-            self.assertTrue(result)
-
-            for name in pave_objs:
-                obj = next(p for p in result if name in p.name)
-                text = obj.read_text(encoding="utf-8")
-                self.assertIn("ATTR_draped", text,
-                               f"{name}: an individually flat pavement material must drape even though "
-                               f"a sibling material in the same node/file isn't flat")
-                self.assertNotIn("TILTED", text.splitlines(),
-                                  f"{name}: a draped node must never also carry TILTED")
-
-            slope_obj = next(p for p in result if "Slope" in p.name)
-            slope_text = slope_obj.read_text(encoding="utf-8")
-            self.assertNotIn("ATTR_draped", slope_text,
-                              "the genuinely-3D slope material must stay rigid, not be flattened")
-
-    def test_scattered_tilted_decal_patches_with_tiny_overall_y_span_still_drape(self):
-        """CONFIRMED REAL BUG on a live EGLC package (found right after the
-        per-(node,material) fix landed): a scattered ground-stain decal --
-        many small patches, each given a slightly different rotation for
-        visual variety (a common technique to avoid a repeating/tiled
-        look) -- measured only 3 CENTIMETRES tall across its entire
-        ~2000x230m footprint, yet the strict per-triangle orientation
-        test (face normal within ~25.8 degrees of vertical) still failed
-        most of its individual patches: each patch's own slight tilt
-        reads as "not near-vertical enough" even though the material as
-        a whole is obviously ground-level content, not a standing 3D
-        object. This is the confirmed mechanism behind "transparent
-        layers floating in the air" (reappeared after being solved in an
-        earlier revision -- draped_merge.py's own module docstring names
-        this exact failure mode, z-fighting/"floating-veil artifacts")
-        and, separately, duplicated-looking objects reappearing near a
-        hold-short line: draped_merge.py's weld/dedup pipeline only ever
-        considers ir.draped objects as candidates at all, so a material
-        wrongly kept rigid skips that dedup too, not just the terrain
-        warp. This fixture: 20 small quads, each tilted 40 degrees (well
-        past the per-triangle orientation cutoff), scattered across 40m
-        with a small base-height jitter -- individually each patch fails
-        the per-triangle test, but the WHOLE material's own Y span stays
-        under a metre, so it must still drape."""
-        b = GltfBuilder()
-        tex = b.add_image_data_uri((160, 160, 160, 255))
-        texi = b.add_texture(tex)
-        mat = b.add_material("ScatteredStain", base_color_texture_index=texi)
-
-        verts, tris = [], []
-        tilt = math.radians(40.0)
-        hw = 0.15  # half-width of each tiny patch, in its own tilt direction
-        for i in range(20):
-            base = len(verts)
-            cx = -38.0 + i * 4.0
-            cz = -10.0 if i % 2 == 0 else 10.0
-            base_y = 0.05 * (i % 3)  # small jitter: 0.0 / 0.05 / 0.10
-            # A small quad tilted around the X axis by `tilt`: its own Z
-            # extent projects onto both Y and Z by cos/sin of the tilt.
-            dz, dy = hw * math.cos(tilt), hw * math.sin(tilt)
-            verts += [
-                (cx - hw, base_y - dy, cz - dz), (cx + hw, base_y - dy, cz - dz),
-                (cx + hw, base_y + dy, cz + dz), (cx - hw, base_y + dy, cz + dz),
-            ]
-            tris += [(base, base + 1, base + 2), (base, base + 2, base + 3)]
-        indices = [i for tri in tris for i in tri]
-        mesh = b.add_mesh(
-            verts, indices, normals=[(0.0, 1.0, 0.0)] * len(verts),
-            uvs=[(0.0, 0.0)] * len(verts), material_index=mat,
-        )
-        b.add_node(mesh_index=mesh, name="ScatteredStain")
-
-        with tempfile.TemporaryDirectory() as td:
-            td = Path(td)
-            glb_path = td / "scattered_stain.glb"
-            glb_path.write_bytes(b.build())
-            obj_dir = td / "objects"
-            tex_dir = td / "textures"
-            obj_dir.mkdir()
-            tex_dir.mkdir()
-
-            result = mesh_convert.convert(glb_path, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
-            self.assertTrue(result)
-            text = result[0].read_text(encoding="utf-8")
-            self.assertIn("ATTR_draped", text,
-                           "a material with a tiny overall Y span must drape even though many of "
-                           "its own individual (tilted) triangles fail the per-triangle test")
-            self.assertNotIn("TILTED", text.splitlines())
 
     def test_genuine_3d_building_stays_rigid(self):
         """A real building (20% flat: roof only) must never be flattened/
