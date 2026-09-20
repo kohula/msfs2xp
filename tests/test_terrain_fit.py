@@ -283,6 +283,70 @@ class TestTerrainFit(unittest.TestCase):
                     self.assertAlmostEqual(d_before, d_after, places=5,
                                             msg=f"vertex pair ({i},{j}) distance changed -- geometry was sheared, not rotated")
 
+    def test_tall_building_with_excessive_implied_roof_displacement_gets_ground_skirt_only(self):
+        """CONFIRMED REAL BUG (part 1): the displacement guard only ever
+        tested the footprint's own GROUND-level (Y=0) corners against
+        _RIGID_TILT_MAX_DISPLACEMENT_M -- but displacement from a rotation
+        scales with distance from the pivot, so a TALL, narrow building's
+        roof moves far more than its base for the exact same angle. A
+        rotation whose ground-corner displacement comfortably passes (as
+        in test_large_tilted_building_gets_a_rigid_rotation_not_a_shear,
+        same terrain/footprint) can still swing a tower's roof many times
+        further than the guard is supposed to allow, since the guard never
+        looked at the object's own height at all -- confirmed real
+        symptom: large buildings visibly floating/leaning after
+        "correction". This building is identical to that passing test
+        except for height (150m instead of 6m) -- the ROTATION must now
+        be rejected.
+
+        CONFIRMED REAL BUG (part 2, found right after part 1 shipped):
+        rejecting the rotation used to mean NO correction at all (result
+        stem unchanged, reason "rigid_skip") -- reverting the whole
+        building to its dead-flat original left a visible gap under the
+        WHOLE base on this same sloped terrain, not just an excessive
+        roof tilt -- worse than before, and especially visible through a
+        glass facade (user: "the glass is worse now"). The base must
+        still get a ground-only "skirt" correction -- ROOF height
+        unchanged (no rotation), base nudged to real terrain."""
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            xplane_root = td / "XPlaneRoot"
+            self._write_sloped_terrain(xplane_root, 47, 8, slope_per_post=3000.0)
+            obj_dir = td / "objects"
+            tex_dir = td / "textures"
+            obj_dir.mkdir()
+            tex_dir.mkdir()
+
+            tower_glb = td / "tower.glb"
+            self._build_box_glb(tower_glb, "TallTower", "TowerTex", half_size=15.0, height=150.0)
+            result = mesh_convert.convert(tower_glb, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
+            stem = result[0].stem
+            original_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{stem}.obj"))
+
+            results = terrain_fit.get_or_create_fitted_group(obj_dir, [stem], 47.5, 8.5, 0.0, xplane_root)
+            result_stem, applied, reason = results[stem]
+            self.assertTrue(applied, "the ground band must still be corrected even though the roof-swinging rotation is rejected")
+            self.assertEqual(reason, "ground_skirt_only")
+            self.assertNotEqual(result_stem, stem, "a corrected copy should have been written")
+
+            corrected_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{result_stem}.obj"))
+
+            # Roof (top face, height 150) must be UNCHANGED -- no rotation
+            # means no roof swing at all, which is the whole point.
+            roof_mask = original_ir.positions[:, 1] > 100.0
+            self.assertTrue(roof_mask.any(), "test setup issue: expected some roof-height vertices")
+            self.assertTrue(np.allclose(
+                original_ir.positions[roof_mask], corrected_ir.positions[roof_mask], atol=1e-6),
+                "the roof must stay exactly at its original position -- no rotation should reach it")
+
+            # Base (ground-contact band) must actually have moved -- this
+            # is the whole point of the skirt, on real sloped terrain.
+            base_mask = original_ir.positions[:, 1] < 0.1
+            self.assertTrue(base_mask.any(), "test setup issue: expected some ground-level vertices")
+            self.assertFalse(np.allclose(
+                original_ir.positions[base_mask], corrected_ir.positions[base_mask], atol=1e-6),
+                "the ground-contact band should have been nudged to match real sampled terrain")
+
     def test_oversized_footprint_rejects_the_rotation_instead_of_tearing_it_apart(self):
         """Confirmed real bug: a single glTF that bundles one real building
         together with a swath of unrelated nearby ground/decal geometry

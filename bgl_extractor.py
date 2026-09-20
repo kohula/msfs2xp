@@ -1787,6 +1787,37 @@ def _parse_one_bgl_uncached(bgl, models_dir, scan_terrain_vectors=True):
     return result
 
 
+def _dedupe_placements(placements):
+    """CONFIRMED REAL BUG (a real EGLC package): a GUID identifies a
+    MODEL/TYPE, shared across every real-world instance of it -- never a
+    unique placement. Two entirely different extraction paths (a raw BGL
+    SceneryObject record, and the same object ALSO reachable via SPB
+    container-attach expansion) can independently produce a placement
+    for the exact same real-world instance: same GUID, same position,
+    same heading. Left in, this doubles the object in the output --
+    visually a duplicate, and z-fighting/glitching for anything draped.
+    Keys on (guid, lat, lon, hdg) rounded to a few decimal places (float
+    jitter from two different derivations of the same real-world point),
+    keeping the FIRST occurrence of each key and dropping the rest.
+    Returns (deduped_list, dropped_count)."""
+    seen = set()
+    out = []
+    dropped = 0
+    for p in placements:
+        guid = p.get("guid")
+        lat, lon, hdg = p.get("lat"), p.get("lon"), p.get("hdg")
+        if guid is None or lat is None or lon is None or hdg is None:
+            out.append(p)
+            continue
+        key = (guid, round(float(lat), 6), round(float(lon), 6), round(float(hdg), 1))
+        if key in seen:
+            dropped += 1
+            continue
+        seen.add(key)
+        out.append(p)
+    return out, dropped
+
+
 def extract(target_path: Path, out_dir: Path, log_callback=None, msfs_install_root=None, scan_terrain_vectors=True,
             propdefs_dir=None):
     def _log(msg, level="info"):
@@ -2216,6 +2247,11 @@ def extract(target_path: Path, out_dir: Path, log_callback=None, msfs_install_ro
                         name_map.setdefault(guid_hex, name)
                 except Exception as e:
                     _log(f"Failed searching MSFS install's SimObjects for stock objects: {e}", "warning")
+
+    placements, _dupes_dropped = _dedupe_placements(placements)
+    if _dupes_dropped:
+        _log(f"      Dropped {_dupes_dropped} duplicate placement(s) -- same model GUID at the same "
+             f"real-world position/heading, reached through more than one extraction path.", "warning")
 
     matched_placements = sum(1 for p in placements if p["guid"] in guid_map)
     title_placements = [p for p in placements if p.get("title")]

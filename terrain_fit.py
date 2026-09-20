@@ -400,6 +400,7 @@ def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_d
     x_max = max(float(loaded[s].positions[:, 0].max()) for s in geo_stems)
     z_min = min(float(loaded[s].positions[:, 2].min()) for s in geo_stems)
     z_max = max(float(loaded[s].positions[:, 2].max()) for s in geo_stems)
+    y_max = max(float(loaded[s].positions[:, 1].max()) for s in geo_stems)
     dx = x_max - x_min
     dz = z_max - z_min
     if dx < _MIN_SIDE_M or dz < _MIN_SIDE_M or dx * dz < _AREA_THRESHOLD_M2:
@@ -451,28 +452,64 @@ def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_d
     # the fitted plane would move a vertex further than plausible.
     if rigid_rotation is not None and oversized_footprint:
         rigid_rotation = None
+    height_rejected = False
     if rigid_rotation is not None:
+        # CONFIRMED REAL BUG: this only tested displacement at Y=0 (the
+        # footprint's own ground-level corners), never at the group's own
+        # height -- a rotation that moves the flat ground corners a
+        # plausible couple of metres can swing a TALL structure's roof far
+        # more than that for the exact same angle (displacement from a
+        # rotation scales with distance from the pivot, and a tower's roof
+        # sits much farther from the ground-level pivot than its own base
+        # does), so a genuinely excessive tilt could still pass this guard
+        # for anything tall and narrow -- confirmed real symptom: large
+        # buildings visibly floating/leaning after "correction". Testing
+        # each XZ corner at both Y=0 and the group's own tallest point
+        # closes that gap without needing a full per-vertex scan.
         max_disp = 0.0
         for sx, sz, _ in corner_samples:
-            v = np.array([sx, 0.0, sz], dtype=np.float64)
-            disp = float(np.linalg.norm(rigid_rotation @ v - v))
-            max_disp = max(max_disp, disp)
+            for sy in (0.0, y_max):
+                v = np.array([sx, sy, sz], dtype=np.float64)
+                disp = float(np.linalg.norm(rigid_rotation @ v - v))
+                max_disp = max(max_disp, disp)
         if max_disp > _RIGID_TILT_MAX_DISPLACEMENT_M:
             rigid_rotation = None
+            height_rejected = True
 
     # Same least-squares plane the rotation is derived from (delta = A*x +
-    # B*z through the anchor origin), kept in coefficient form so the
-    # foundation skirt can subtract the plane's prediction from the exact
-    # per-vertex terrain delta and apply only the residual near the base.
-    plane_ab = None
-    if rigid_rotation is not None and len(corner_samples) >= 3:
+    # B*z through the anchor origin) -- fit unconditionally whenever there
+    # are enough samples, independent of whether the rotation itself got
+    # vetoed, since the ground-skirt-only fallback right below needs a
+    # real terrain estimate even when there is no rotation to pair it
+    # with. Kept in coefficient form so the foundation skirt can subtract
+    # the plane's prediction from the exact per-vertex terrain delta and
+    # apply only the residual near the base.
+    fitted_ab = None
+    if len(corner_samples) >= 3:
         try:
             M = np.array([[sx, sz] for sx, sz, _ in corner_samples], dtype=np.float64)
             rhs = np.array([sd for _, _, sd in corner_samples], dtype=np.float64)
             (pa, pb), *_ = np.linalg.lstsq(M, rhs, rcond=None)
-            plane_ab = (float(pa), float(pb))
+            fitted_ab = (float(pa), float(pb))
         except Exception:
-            plane_ab = None
+            fitted_ab = None
+    plane_ab = fitted_ab if rigid_rotation is not None else None
+
+    # CONFIRMED REAL BUG (found right after the height-aware displacement
+    # guard above shipped): rejecting the rotation throws away the
+    # foundation skirt too, since the skirt only ever runs alongside a
+    # rotation -- reverting a tall building to its dead-flat ORIGINAL
+    # geometry, with zero ground-contact correction at all. For terrain
+    # sloped enough to fail the roof-height check, that leaves a visible
+    # gap under one whole side of the base (not just the roof) -- WORSE
+    # than the excessive tilt this guard was meant to fix, and especially
+    # visible through a glass facade. A group rejected specifically for
+    # height (not an oversized footprint or a degenerate/no fit) still
+    # gets its base conformed to real terrain -- identity rotation (no
+    # tilt) plus the skirt band using the FULL sampled delta (a zero
+    # plane, not the fitted one, since there's no rotation for the skirt
+    # to subtract a residual against) -- without ever swinging the roof.
+    ground_skirt = height_rejected and fitted_ab is not None
 
     # Cached regardless of whether rigid_rotation ended up None (an
     # explicit "this group has no rotation to offer" is as useful to a
@@ -519,8 +556,10 @@ def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_d
         # so moving it carries none of the shear/re-drape concerns above.
         warp_positions = bool(len(ir.positions)) and ir.draped and not skip_draped_positions
         rigid_tilt = bool(len(ir.positions)) and not ir.draped and rigid_rotation is not None
+        ground_skirt_only = (bool(len(ir.positions)) and not ir.draped
+                              and rigid_rotation is None and ground_skirt)
         warp_lights = bool(ir.lights)
-        if not warp_positions and not rigid_tilt and not warp_lights:
+        if not warp_positions and not rigid_tilt and not ground_skirt_only and not warp_lights:
             if ir.draped and skip_draped_positions and len(ir.positions):
                 result[stem] = (stem, False, "skipped_for_polygon_mode")
             else:
@@ -533,7 +572,7 @@ def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_d
             # than stacking with it. A sibling reaching here only for its
             # lights keeps its original tilted flag untouched.
             name=f"{stem}_tfit_{digest}", texture=ir.texture,
-            tilted=False if (warp_positions or rigid_tilt) else ir.tilted, draped=ir.draped,
+            tilted=False if (warp_positions or rigid_tilt or ground_skirt_only) else ir.tilted, draped=ir.draped,
             draped_layer_offset=ir.draped_layer_offset, double_sided=ir.double_sided,
             alpha_mode=ir.alpha_mode, alpha_cutoff=ir.alpha_cutoff,
             footprint_area_m2=ir.footprint_area_m2, proximity_dataref=ir.proximity_dataref,
@@ -559,6 +598,18 @@ def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_d
             # group's cross-group case -- see _apply_rigid_rotation.
             rotated, normals = _apply_rigid_rotation(
                 ir, rigid_rotation, plane_ab, base_lat, base_lon, heading_deg,
+                xplane_root, origin_elev, point_cache)
+            corrected.normals = normals
+            corrected.positions = rotated
+            corrected.uvs = ir.uvs
+            corrected.indices = ir.indices
+        elif ground_skirt_only:
+            # No rotation (identity) -- only the foundation skirt band
+            # runs, and with a ZERO plane (not the fitted one) so its
+            # residual IS the full sampled terrain delta rather than a
+            # residual on top of a rotation that isn't happening here.
+            rotated, normals = _apply_rigid_rotation(
+                ir, np.eye(3), (0.0, 0.0), base_lat, base_lon, heading_deg,
                 xplane_root, origin_elev, point_cache)
             corrected.normals = normals
             corrected.positions = rotated
@@ -590,7 +641,13 @@ def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_d
             # never the .obj text, so a corrected draped stem without one
             # silently falls back to passthrough (never welded/deduped).
             mesh_ir.save(corrected, mesh_ir.sidecar_path_for(fitted_path))
-        result[stem] = (corrected.name, True, "applied_rigid_tilt" if (rigid_tilt and not warp_positions) else "applied")
+        if ground_skirt_only and not warp_positions:
+            _reason = "ground_skirt_only"
+        elif rigid_tilt and not warp_positions:
+            _reason = "applied_rigid_tilt"
+        else:
+            _reason = "applied"
+        result[stem] = (corrected.name, True, _reason)
 
     _group_cache[group_key] = result
     return result

@@ -541,7 +541,23 @@ def _terrain_fit_group_worker(obj_stems, base_lat, base_lon, heading_deg,
     on the shared obj_dir; the small (all-str/bool) result dict returned
     here lets the parent's placement loop consume the fit without
     recomputing it. Returns (group_key, {stem: (result_stem, applied,
-    reason)}), or (group_key, None) if the fit raised."""
+    reason)}, transform), or (group_key, None, None) if the fit raised.
+
+    CONFIRMED REAL BUG: this used to return only the per-stem result dict.
+    terrain_fit._group_transform_cache -- what the parent's own anchor-
+    clustering pass (main.py, right after this pre-warm) reads via
+    get_cached_transform() to find a rotation one placement's terrain-fit
+    computed, and retroactively apply it to a DIFFERENT placement sharing
+    the same real-world anchor (e.g. a building's own shell vs. its
+    separately-placed glass/interior) -- lives in the terrain_fit MODULE
+    in THIS subprocess. A ProcessPoolExecutor worker's module state is
+    never shared back to the parent, so the parent's own cache stayed
+    permanently empty for every group pre-warmed here (i.e. essentially
+    all of them), silently no-opping the anchor-clustering pass entirely:
+    0 sub-objects ever actually got linked on a real conversion, despite
+    the log claiming candidates existed. Confirmed real symptom (user):
+    differently-sourced parts of one building (materials/glass vs. shell)
+    getting terrain-fitted independently instead of moving together."""
     import terrain_fit
     group_key = (tuple(sorted(obj_stems)), round(base_lat, 6), round(base_lon, 6),
                  round(heading_deg, 2), bool(skip_draped))
@@ -549,9 +565,10 @@ def _terrain_fit_group_worker(obj_stems, base_lat, base_lon, heading_deg,
         res = terrain_fit.get_or_create_fitted_group(
             Path(obj_dir_str), list(obj_stems), base_lat, base_lon, heading_deg,
             Path(xplane_root_str), skip_draped_positions=bool(skip_draped))
-        return group_key, res
+        transform = terrain_fit.get_cached_transform(group_key)
+        return group_key, res, transform
     except Exception:
-        return group_key, None
+        return group_key, None, None
 
 
 # Matches the TEXTURE/TEXTURE_NORMAL/TEXTURE_LIT lines mesh_convert.convert
@@ -1977,9 +1994,17 @@ class ModularPythonConverterApp:
                                 for (_st, _la, _lo, _hd) in _tf_jobs
                             ]
                             for _f in as_completed(_futs):
-                                _k, _r = _f.result()
+                                _k, _r, _t = _f.result()
                                 if _r is not None:
                                     precomputed_fits[_k] = _r
+                                    # Re-seed the PARENT process's own
+                                    # transform cache from the worker's
+                                    # result -- see _terrain_fit_group_
+                                    # worker's docstring for why this is
+                                    # required for the anchor-clustering
+                                    # pass below to find anything at all.
+                                    if _t is not None:
+                                        terrain_fit._group_transform_cache[_k] = _t
                         self.log(f"Terrain-fit pre-warm complete: {len(precomputed_fits)}/{len(_tf_jobs)} "
                                  f"group(s) computed -- placement loop will read these.", "info")
                     except Exception as e:

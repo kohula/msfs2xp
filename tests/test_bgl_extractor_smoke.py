@@ -851,5 +851,54 @@ class TestTerrainVectorDbScanning(unittest.TestCase):
             self.assertEqual(materials[guid_bytes], "test-asphalt")
 
 
+class TestDedupePlacements(unittest.TestCase):
+    """CONFIRMED REAL BUG (a real EGLC package): the same real-world
+    instance reachable through two different extraction paths (a raw BGL
+    SceneryObject record, and the same object also reachable via SPB
+    container-attach expansion) produced two placements sharing the
+    exact same (guid, lat, lon, hdg) -- a visible duplicate, and
+    z-fighting/glitching for anything draped."""
+
+    def _p(self, guid="g1", lat=47.5, lon=19.25, hdg=90.0, **extra):
+        d = {"guid": guid, "lat": lat, "lon": lon, "hdg": hdg}
+        d.update(extra)
+        return d
+
+    def test_same_guid_same_position_deduped_keeping_first(self):
+        a = self._p(title="First")
+        b = self._p(title="Second")
+        out, dropped = bgl_extractor._dedupe_placements([a, b])
+        self.assertEqual(dropped, 1)
+        self.assertEqual(out, [a])
+
+    def test_tiny_float_precision_differences_still_dedupe(self):
+        a = self._p(lat=47.500000, lon=19.250000, hdg=90.00)
+        b = self._p(lat=47.5000001, lon=19.2500001, hdg=90.001)
+        out, dropped = bgl_extractor._dedupe_placements([a, b])
+        self.assertEqual(dropped, 1)
+        self.assertEqual(len(out), 1)
+
+    def test_same_guid_different_position_not_deduped(self):
+        a = self._p(lat=47.5, lon=19.25)
+        b = self._p(lat=47.6, lon=19.25)
+        out, dropped = bgl_extractor._dedupe_placements([a, b])
+        self.assertEqual(dropped, 0)
+        self.assertEqual(len(out), 2)
+
+    def test_same_position_different_guid_not_deduped(self):
+        a = self._p(guid="g1")
+        b = self._p(guid="g2")
+        out, dropped = bgl_extractor._dedupe_placements([a, b])
+        self.assertEqual(dropped, 0)
+        self.assertEqual(len(out), 2)
+
+    def test_missing_guid_or_position_passes_through_unchanged(self):
+        a = {"guid": None, "lat": 47.5, "lon": 19.25, "hdg": 90.0}
+        b = {"guid": "g1", "lat": None, "lon": 19.25, "hdg": 90.0}
+        out, dropped = bgl_extractor._dedupe_placements([a, b])
+        self.assertEqual(dropped, 0)
+        self.assertEqual(out, [a, b])
+
+
 if __name__ == "__main__":
     unittest.main()
