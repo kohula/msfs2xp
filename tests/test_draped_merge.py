@@ -1587,6 +1587,38 @@ class TestDrapedMerge(unittest.TestCase):
             self.assertIn(f"ATTR_layer_group_draped {draped_merge._DRAPED_GROUP_GROUND} -5", btxt)
             self.assertIn("ATTR_no_cull", btxt)
 
+    def test_fill_runs_by_default_with_the_env_var_unset(self):
+        """CONFIRMED REAL BUG: every comment describing this pass (module
+        docstring, and the block comment above _fill_pavement_gaps) says
+        'toggle OFF with MSFS2XP_BRIDGE_SEAMS=0', i.e. it's meant to run
+        by default -- but the code checked the env var against a default
+        of "0" (off), so it needed an explicit =1 to ever run, and never
+        actually did on any real conversion this project has tested with
+        so far. It must now run with the env var completely unset, not
+        just when explicitly set to "1"."""
+        old = os.environ.get("MSFS2XP_BRIDGE_SEAMS")
+        os.environ.pop("MSFS2XP_BRIDGE_SEAMS", None)
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                obj_dir = Path(td)
+                for nm, x0, x1, tex in (("concrete", 0.0, 20.0, "../textures/concrete_apron.png"),
+                                        ("asphalt", 21.5, 45.0, "../textures/asphalt_taxi.png")):
+                    ir = self._grid_ir(nm, x0, x1, 0.0, 20.0, 6, 6, tex=tex)
+                    mesh_ir.save(ir, mesh_ir.sidecar_path_for(obj_dir / f"{nm}.obj"))
+                    mesh_ir.write_obj8(ir, obj_dir / f"{nm}.obj")
+                entries = [{"name": "concrete", "lat": 47.0, "lon": 8.0, "hdg": 0.0, "agl": 0.0},
+                           {"name": "asphalt", "lat": 47.0, "lon": 8.0, "hdg": 0.0, "agl": 0.0}]
+                result, _ = draped_merge.merge_draped_layers_in_tile(obj_dir, 47, 8, entries)
+        finally:
+            if old is None:
+                os.environ.pop("MSFS2XP_BRIDGE_SEAMS", None)
+            else:
+                os.environ["MSFS2XP_BRIDGE_SEAMS"] = old
+
+        fills = [e for e in result if e["name"].startswith("_seam_bridge_tile_")]
+        self.assertEqual(len(fills), 1,
+                          "the pavement gap-fill safety net must run with the env var unset (default on)")
+
     def test_markings_weld_is_hairline_and_does_not_fuse_separate_bars(self):
         """The crosswalk fix: many MASK stripe quads 0.15 m apart (a zebra
         crossing) merge into ONE pooled object but are NOT fused -- their

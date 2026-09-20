@@ -1488,13 +1488,22 @@ def merge_draped_layers_in_tile(obj_dir, tile_lat, tile_lon, entries, log_callba
                      f"boundary vertex(es) onto a shared position (<= {_PAVEMENT_CROSS_SNAP_EPS_M} m, "
                      f"no index merged, ranking frozen).", "info")
 
-    # --- Tile-wide pavement gap fill (_fill_pavement_gaps) -- OFF by default.
+    # --- Tile-wide pavement gap fill (_fill_pavement_gaps) -- ON by default.
     # The solid opaque UNDERLAY under the whole paved footprint -- the safety
     # net for whatever draped-render cracks the seam welds above don't close
     # (a crack over the underlay shows grey concrete, not green terrain). See
     # _fill_pavement_gaps. Toggle off with MSFS2XP_BRIDGE_SEAMS=0.
+    #
+    # CONFIRMED REAL BUG: this used to check the env var against a
+    # default of "0" (off), contradicting every comment describing this
+    # pass (this module's own docstring, and the block comment above
+    # _fill_pavement_gaps both say "toggle OFF with =0", i.e. the
+    # intended default was ON) -- so this dedicated safety net for the
+    # "green terrain showing through pavement cracks" / floating-pavement
+    # symptom had never actually run on any real conversion. Default now
+    # matches the documented intent.
     bridge_meshes = []
-    if not use_polygons and os.environ.get("MSFS2XP_BRIDGE_SEAMS", "0") == "1":
+    if not use_polygons and os.environ.get("MSFS2XP_BRIDGE_SEAMS", "1") == "1":
         # EVERY pavement-band layer, opaque AND blend -- the union of all of
         # them is the apron/taxiway/runway outline the underlay must cover.
         pave_pieces = []
