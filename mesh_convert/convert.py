@@ -452,17 +452,25 @@ def compute_file_flatness_and_reference(gltf, buffers, world_transforms, flat_ep
         under TILTED even though the object's overall placement was fine
         (see convert()).
 
-      - node_stats: {node_idx: (flat_fraction, reference_height)}, the
-        exact same two tallies as above but broken out PER NODE instead of
-        aggregated across the whole file. convert() uses this (not the
-        file-wide flat_fraction/reference_height) to decide flattening and
-        ATTR_draped per node/builder -- the file-wide, all-or-nothing
-        version used to mean one non-flat node anywhere in a file (e.g. a
-        single mis-authored triangle) silently disabled draping for every
-        OTHER, genuinely flat marking layer in the same file too, which
-        could bury them in/under the compiled terrain. TILTED's own
-        decision is untouched by this and still uses only the file-wide
-        aggregate above.
+      - node_stats: {(node_idx, material_idx): (flat_fraction,
+        reference_height)}, the exact same two tallies as above but
+        broken out per (node, MATERIAL) pair instead of aggregated across
+        the whole file. Keyed on material, not just node, because a real
+        MSFS export routinely packs an entire ground-poly system (two
+        dozen+ distinct pavement/marking materials, plus a genuinely-3D
+        transition piece) as separate PRIMITIVES inside ONE node's mesh --
+        a per-NODE-only key would measure the exact same file-wide mix
+        for every one of those materials, no finer than the file-wide
+        verdict. convert() uses this (not the file-wide flat_fraction/
+        reference_height) to decide flattening and ATTR_draped per
+        builder (mat_idx, animated_node_id) -- the file-wide, all-or-
+        nothing version used to mean one non-flat material anywhere in a
+        file silently disabled draping for every OTHER, genuinely flat
+        marking layer in the same file too, which could bury them in/
+        under the compiled terrain or leave them rigid enough to float/
+        glitch against the real compiled terrain. TILTED's own decision
+        is untouched by this and still uses only the file-wide aggregate
+        above.
     """
     total_tris = 0
     flat_tris = 0
@@ -495,6 +503,20 @@ def compute_file_flatness_and_reference(gltf, buffers, world_transforms, flat_ep
                 continue
             if _primitive_material_is_excluded(gltf, prim):
                 continue
+            # CONFIRMED REAL BUG: a real MSFS export routinely packs EVERY
+            # material for one whole ground-poly system (concrete tiles,
+            # transitions, every painted marking, a genuinely-3D slope
+            # piece -- two dozen+ materials) as separate PRIMITIVES inside
+            # ONE node's mesh, not as separate nodes. Aggregating by
+            # node_idx alone (the original per-node design) then measures
+            # the exact same file-wide mix for every material in that one
+            # node -- no finer than the file-wide verdict at all. The key
+            # must be per (node, MATERIAL) -- matching the granularity
+            # convert()'s own builder_key (mat_idx, animated_node_id)
+            # already uses -- for a flat majority sharing a node with one
+            # non-flat material to be told apart at all.
+            prim_mat_idx = prim.get("material")
+            prim_key = (node_idx, prim_mat_idx)
 
             if pos_acc not in pos_cache:
                 positions = read_accessor(gltf, buffers, pos_acc)
@@ -570,20 +592,20 @@ def compute_file_flatness_and_reference(gltf, buffers, world_transforms, flat_ep
             if is_flat.any():
                 flat_y_values.append(y[tri[is_flat]].reshape(-1))
 
-            node_total_tris[node_idx] = node_total_tris.get(node_idx, 0) + len(spread)
-            node_flat_tris[node_idx] = node_flat_tris.get(node_idx, 0) + int(is_flat.sum())
+            node_total_tris[prim_key] = node_total_tris.get(prim_key, 0) + len(spread)
+            node_flat_tris[prim_key] = node_flat_tris.get(prim_key, 0) + int(is_flat.sum())
             if is_flat.any():
-                node_flat_y_values.setdefault(node_idx, []).append(y[tri[is_flat]].reshape(-1))
+                node_flat_y_values.setdefault(prim_key, []).append(y[tri[is_flat]].reshape(-1))
 
     node_stats = {}
-    for node_idx, n_total in node_total_tris.items():
-        n_flat_fraction = (node_flat_tris.get(node_idx, 0) / n_total) if n_total else 0.0
+    for prim_key, n_total in node_total_tris.items():
+        n_flat_fraction = (node_flat_tris.get(prim_key, 0) / n_total) if n_total else 0.0
         n_reference_height = None
-        n_flat_ys = node_flat_y_values.get(node_idx)
+        n_flat_ys = node_flat_y_values.get(prim_key)
         if n_flat_ys:
             n_all_y = np.concatenate(n_flat_ys)
             _, _, n_reference_height, _ = _cluster_height_bands(n_all_y, merge_gap=merge_gap)
-        node_stats[node_idx] = (n_flat_fraction, n_reference_height)
+        node_stats[prim_key] = (n_flat_fraction, n_reference_height)
 
     flat_fraction = (flat_tris / total_tris) if total_tris else 0.0
 
@@ -1730,15 +1752,23 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
 
     # File-wide flatness check: does this .glb contain nothing but flat,
     # "almost one dimensional" content (ground markings/decals), with no
-    # genuine 3D structure anywhere in it? This is judged once for the
-    # WHOLE file, not per mesh -- a file that qualifies gets every vertex
-    # in every object compressed onto the exact same level: the file's own
-    # dominant/majority elevation (not forced to 0 -- if that real
-    # elevation is genuinely non-zero, e.g. a roof or bridge deck, it's
-    # preserved). A file that has even a little real 3D geometry mixed in
-    # is left completely untouched instead of guessing which parts are
-    # safe to flatten.
+    # genuine 3D structure anywhere in it? Used ONLY for TILTED's own
+    # decision below (file_apply_tilted) -- TILTED rotates the whole rigid
+    # object as one piece, so it has no per-node analogue.
     flat_fraction_threshold = 0.98
+    # Draping (ATTR_draped, see the per-node loop further down) uses this
+    # separate, more LENIENT per-node threshold instead -- asymmetric risk:
+    # a node wrongly classified flat/draped costs nothing (ATTR_draped
+    # re-projects onto terrain, discarding authored Y, per X-Plane's own
+    # spec), while a node wrongly left rigid visibly floats/sinks on
+    # sloped terrain (confirmed real symptom on a live EGLC package: an
+    # 89.70%-flat ground-poly file -- concrete tiles, transitions, every
+    # painted marking -- stayed entirely rigid because ONE genuinely-3D
+    # slope/transition node shared the file, short of even the file-wide
+    # 0.98 bar; that file's own flat majority needed a per-node, not
+    # file-wide, verdict to drape correctly at all). See
+    # tests/test_flatness_tilted_exclusivity.py's own module docstring.
+    _NODE_FLAT_FRACTION_THRESHOLD = 0.90
     file_flat_fraction, file_reference_height, file_max_radius, file_max_horizontal_radius, node_flatness_stats = compute_file_flatness_and_reference(gltf, buffers, world_transforms)
     file_is_flat_only = file_flat_fraction >= flat_fraction_threshold and file_reference_height is not None
 
@@ -1808,13 +1838,18 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
             f"contains real 3D geometry, leaving heights untouched"
         )
 
-    # Flatness/draping is classified per WHOLE FILE (file_is_flat_only/
-    # file_reference_height above), not per node: splitting one material
-    # by per-node flatness can cut what's really one continuous real-world
-    # surface into a draped half (weldable by draped_merge) and a rigid
-    # half that can never weld against it, leaving a seam that wouldn't
-    # otherwise exist. The whole-file verdict is coarser but keeps every
-    # node in one file on the same side of the flat/rigid line.
+    # Draping is classified per (node, MATERIAL) pair (node_flatness_stats,
+    # see the node loop below) -- file_is_flat_only/file_reference_height
+    # above are kept only for TILTED's own decision (file_apply_tilted),
+    # which has no per-node analogue since TILTED rotates the WHOLE rigid
+    # object as one piece. A per-material draped/rigid split CAN leave a
+    # seam where a genuinely-3D material (a slope/curb transition) meets a
+    # flat one that's now draped -- accepted as the smaller cost against
+    # the alternative (one non-flat material anywhere in the file silently
+    # un-draping every OTHER, genuinely flat layer in it too); draped_
+    # merge.py's own seam-closing passes (_snap_pavement_seams,
+    # _fill_pavement_gaps) are the mitigation for exactly this kind of
+    # residual seam.
 
     model_name = glb_path.stem
     builders = {}
@@ -2000,10 +2035,44 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                         if kind in ("business_hours", "proximity") and node_anim["path"] in ("translation", "rotation"):
                             animated_node_id = node_idx
 
-                # Reverted to the file-wide verdict (see the removed
-                # per-node classification's own replacement comment above)
-                # -- every node in this file agrees on flat-vs-rigid.
-                this_node_is_flat = file_is_flat_only
+                # CONFIRMED REAL BUG: this used to hard-pin every node in
+                # a file to the file-wide verdict, but node_flatness_stats
+                # (per (node, material) flat_fraction/reference_height,
+                # computed above by compute_file_flatness_and_reference)
+                # and _clamp_flat_reference_height (its own docstring:
+                # "Shared here so the same rule applies per-node, not just
+                # to the file-wide aggregate") were already built for
+                # exactly this and simply never wired in here -- _clamp_
+                # flat_reference_height had zero call sites anywhere in
+                # this module. Confirmed real symptom on a live EGLC
+                # package: one GLB bundles a large, genuinely flat
+                # apron/taxiway ground-poly (concrete tiles, transitions,
+                # every painted marking) together with ONE real-3D
+                # slope/transition piece -- 89.70% of the file's triangles
+                # are flat, comfortably short of the 98% file-wide bar, so
+                # the ENTIRE file (including the flat majority) was left
+                # rigid instead of draped. A rigid object never gets
+                # X-Plane's native per-vertex terrain draping, so it
+                # doesn't precisely track the compiled terrain the way
+                # flat ground content needs to -- exactly the reported
+                # "pavement floating above the ground and glitching". The
+                # key had to be per (node, MATERIAL), not just node: this
+                # real file packs all ~25 pavement/marking materials AND
+                # the slope as separate PRIMITIVES inside ONE single node
+                # (a node-only key would have measured the same file-wide
+                # mix for every one of them, no finer than file-wide at
+                # all). Keying on material too lets the flat majority
+                # (concrete/transitions/markings) drape correctly while
+                # the one genuinely-3D material (the slope) correctly
+                # stays rigid and keeps its real shape.
+                node_flat_fraction, node_dominant_height = node_flatness_stats.get((node_idx, mat_idx), (0.0, None))
+                this_node_is_flat = (
+                    node_flat_fraction >= _NODE_FLAT_FRACTION_THRESHOLD and node_dominant_height is not None
+                )
+                node_reference_height = (
+                    _clamp_flat_reference_height(node_dominant_height, f"node {node_idx}", glb_path.name)
+                    if this_node_is_flat else None
+                )
                 builder_key = (mat_idx, animated_node_id)
 
                 if builder_key not in builders:
@@ -2432,12 +2501,12 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                     positions_world = apply_global_rotation(positions_world)
 
                     if this_node_is_flat:
-                        # The whole FILE (not just this node) is confirmed
-                        # nothing-but-flat: compress every vertex onto the
-                        # same level -- the file's own dominant elevation,
-                        # preserved as-is (not forced to 0). No partial/
-                        # per-band logic.
-                        positions_world = flatten_to_reference(positions_world, file_reference_height)
+                        # THIS NODE (not necessarily the whole file) is
+                        # confirmed nothing-but-flat: compress every vertex
+                        # onto the same level -- this node's own dominant
+                        # elevation, preserved as-is (not forced to 0). No
+                        # partial/per-band logic.
+                        positions_world = flatten_to_reference(positions_world, node_reference_height)
                     else:
                         # Mixed/real-3D file: leave heights exactly as
                         # authored, including any vertex with Y<0 -- a
