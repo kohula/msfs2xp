@@ -401,5 +401,44 @@ class TestDecodeOrRepackageKtx2(unittest.TestCase):
             self.assertFalse((td / "roof_albd.dds").exists())
 
 
+class TestAtomicWrites(unittest.TestCase):
+    """decode_ktx2_to_png and repackage_ktx2_to_dds both write to a
+    per-call unique temp path and os.replace() into place, instead of
+    writing straight to the final output path -- CONFIRMED REAL CRASH
+    this fixes: this runs under a ProcessPoolExecutor, one worker per
+    .ktx2 file, and two different source .ktx2 files can legitimately
+    clean to the same stem (the same collision class already fixed once
+    for decode_or_repackage_ktx2's cross-format cleanup). Two workers
+    both writing straight to the SAME output path concurrently
+    interleaved their writes into a corrupted PNG (a real IDAT CRC
+    error), which is a hard X-Plane crash ("THREAD FATAL ASSERT"), not
+    just a bad-looking texture. These tests only confirm the ordinary,
+    non-racing case leaves no leftover temp file behind -- a true
+    concurrent race isn't practical to simulate directly in a unit
+    test."""
+
+    def test_decode_ktx2_to_png_leaves_no_temp_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            ktx2_path = td / "roof_albd.ktx2"
+            ktx2_path.write_bytes(_build_fake_ktx2(main.VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 4, 4, _fake_block_bytes(8)))
+            png_path = td / "roof_albd.png"
+            self.assertIs(main.decode_ktx2_to_png(ktx2_path, png_path), True)
+            self.assertTrue(png_path.read_bytes().startswith(b"\x89PNG"))
+            leftovers = [p.name for p in td.iterdir() if ".tmp_" in p.name]
+            self.assertEqual(leftovers, [], f"leftover temp file(s): {leftovers}")
+
+    def test_repackage_ktx2_to_dds_leaves_no_temp_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            ktx2_path = td / "roof_albd.ktx2"
+            ktx2_path.write_bytes(_build_fake_ktx2(main.VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 4, 4, _fake_block_bytes(8)))
+            dds_path = td / "roof_albd.dds"
+            self.assertIs(main.repackage_ktx2_to_dds(ktx2_path, dds_path), True)
+            self.assertTrue(dds_path.read_bytes().startswith(b"DDS "))
+            leftovers = [p.name for p in td.iterdir() if ".tmp_" in p.name]
+            self.assertEqual(leftovers, [], f"leftover temp file(s): {leftovers}")
+
+
 if __name__ == "__main__":
     unittest.main()

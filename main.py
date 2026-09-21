@@ -1210,7 +1210,22 @@ def decode_ktx2_to_png(input_path, output_path):
                 new_image[..., 2] = np.clip(z * 255.0, 0, 255).astype(np.uint8)
                 img = Image.fromarray(new_image)
 
-        img.save(output_path, "PNG")
+        # Atomic write, not a direct save to output_path: this runs under
+        # a ProcessPoolExecutor, one worker per .ktx2 file, and two
+        # different SOURCE .ktx2 files can legitimately clean to the
+        # SAME stem (the exact same collision class already fixed once
+        # for decode_or_repackage_ktx2's cross-format cleanup -- see its
+        # own docstring). CONFIRMED REAL CRASH: two workers both calling
+        # Image.save() straight to the SAME output_path concurrently
+        # interleaved their writes into a corrupted PNG (IDAT CRC
+        # error), which is a hard X-Plane crash ("THREAD FATAL ASSERT"),
+        # not just a bad-looking texture -- writing to a per-call unique
+        # temp path first and renaming into place only after the write
+        # is complete means whichever worker finishes last always leaves
+        # a fully-intact file, never a partial/interleaved one.
+        temp_path = output_path.with_name(f"{output_path.name}.tmp_{os.getpid()}_{id(output_path)}")
+        img.save(temp_path, "PNG")
+        os.replace(temp_path, output_path)
         return True
     except Exception as e:
         return str(e)
@@ -1281,7 +1296,13 @@ def repackage_ktx2_to_dds(input_path, output_path):
         return f"Unsupported VkFormat for repackaging (X-Plane 11's DDS loader has no confirmed DX10/BC4-7 support): {vk_fmt}"
 
     try:
-        output_path.write_bytes(dds_bytes)
+        # Atomic write -- same reasoning as decode_ktx2_to_png's own
+        # temp-then-rename (see its comment): two different source
+        # .ktx2 files can legitimately clean to the same stem and race
+        # on writing the SAME output_path concurrently.
+        temp_path = output_path.with_name(f"{output_path.name}.tmp_{os.getpid()}_{id(output_path)}")
+        temp_path.write_bytes(dds_bytes)
+        os.replace(temp_path, output_path)
     except OSError as e:
         return str(e)
     return True
