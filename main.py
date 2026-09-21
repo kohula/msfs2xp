@@ -647,15 +647,6 @@ _KTX2_SUPERCOMPRESSION_BASIS  = 1  # true ETC1S+BasisLZ -- needs the real Basis 
 _KTX2_SUPERCOMPRESSION_ZSTD   = 2
 _KTX2_SUPERCOMPRESSION_ZLIB   = 3
 
-# DXGI_FORMAT values used by the DDS_HEADER_DXT10 extension this module
-# writes in _build_dds_bytes -- same numeric values mesh_convert.convert's
-# own decode_dds_bytes_to_png already reads on the way back in, confirming
-# round-trip consistency within this project.
-_DXGI_FORMAT_BC4_UNORM = 80
-_DXGI_FORMAT_BC5_UNORM = 83
-_DXGI_FORMAT_BC5_SNORM = 84
-_DXGI_FORMAT_BC7_UNORM = 98
-
 
 def _build_dds_bytes(width, height, compressed_bytes, fourcc, dxgi_format=None, block_size=16):
     """Builds a minimal, single-mip-level DDS file (magic + DDS_HEADER,
@@ -1151,14 +1142,27 @@ def repackage_ktx2_to_dds(input_path, output_path):
     """Wraps a KTX2 file's own GPU-native block-compressed payload
     directly in a DDS container instead of fully decoding to raw pixels
     and re-encoding as PNG -- same bytes, different header, so X-Plane's
-    DDS loader (already relied on for mesh_convert.convert's own DDS
-    passthrough) reads the identical GPU data with zero quality loss and
-    none of the decode+encode cost or size/VRAM penalty (confirmed real
-    gap: one real texture was 699KB as .dds vs 5.1MB fully decoded to
-    .png). Returns True on success, or a message string explaining why
-    repackaging wasn't possible -- same calling convention as
-    decode_ktx2_to_png, and the caller (decode_or_repackage_ktx2) falls
-    back to that full decode in that case.
+    DDS loader reads the identical GPU data with zero quality loss and
+    none of the decode+encode cost or size/VRAM penalty. Returns True on
+    success, or a message string explaining why repackaging wasn't
+    possible -- same calling convention as decode_ktx2_to_png, and the
+    caller (decode_or_repackage_ktx2) falls back to that full decode in
+    that case.
+
+    ONLY BC1 and BC3 are repackaged (legacy "DXT1"/"DXT5" FourCC, no
+    DDS_HEADER_DXT10 extension) -- CONFIRMED REAL REGRESSION: an earlier
+    version of this also repackaged BC4/BC5/BC7 via a DX10-header DDS,
+    which round-tripped fine through this project's OWN reader but made
+    "almost everything" grey with "Some scenery textures could not be
+    loaded" in real X-Plane 11. X-Plane's own official DDSTool manual
+    (developer.x-plane.com/docs/scenery/ddstool-manual) documents ONLY
+    DXT1/DXT3/DXT5 support and never mentions BC4/BC5/BC7 or a DX10
+    header anywhere -- X-Plane 11's DDS loader appears to predate that
+    extension entirely. BC7 in particular is the common format for
+    modern MSFS albedo/PBR textures, so this cost most of the real-world
+    win the earlier version measured; still correctly skips ahead of the
+    "Unsupported VkFormat" fallback to the safe, proven full-decode path
+    for every format it can't safely handle, rather than guessing again.
 
     MUST NOT be used for a normal map: BC5-compressed normal maps only
     carry 2 channels (X/Y) -- decode_ktx2_to_png's own Z-channel
@@ -1188,15 +1192,8 @@ def repackage_ktx2_to_dds(input_path, output_path):
         dds_bytes = _build_dds_bytes(width, height, raw_data, b"DXT1", block_size=8)
     elif vk_fmt == VK_FORMAT_BC3_UNORM_BLOCK:
         dds_bytes = _build_dds_bytes(width, height, raw_data, b"DXT5", block_size=16)
-    elif vk_fmt == VK_FORMAT_BC4_UNORM_BLOCK:
-        dds_bytes = _build_dds_bytes(width, height, raw_data, b"DX10", dxgi_format=_DXGI_FORMAT_BC4_UNORM, block_size=8)
-    elif vk_fmt in (VK_FORMAT_BC5_UNORM_BLOCK, VK_FORMAT_BC5_SNORM_BLOCK):
-        dxgi = _DXGI_FORMAT_BC5_SNORM if vk_fmt == VK_FORMAT_BC5_SNORM_BLOCK else _DXGI_FORMAT_BC5_UNORM
-        dds_bytes = _build_dds_bytes(width, height, raw_data, b"DX10", dxgi_format=dxgi, block_size=16)
-    elif vk_fmt == VK_FORMAT_BC7_UNORM_BLOCK:
-        dds_bytes = _build_dds_bytes(width, height, raw_data, b"DX10", dxgi_format=_DXGI_FORMAT_BC7_UNORM, block_size=16)
     else:
-        return f"Unsupported VkFormat for repackaging: {vk_fmt}"
+        return f"Unsupported VkFormat for repackaging (X-Plane 11's DDS loader has no confirmed DX10/BC4-7 support): {vk_fmt}"
 
     try:
         output_path.write_bytes(dds_bytes)

@@ -1,16 +1,19 @@
 """
-main.repackage_ktx2_to_dds / decode_or_repackage_ktx2 -- the real fix for
-the confirmed texture-size gap (one real texture: 699KB as a passed-
-through .dds vs 5.1MB fully decoded to .png). The FIRST attempt at this
-(mesh_convert.convert's DDS-passthrough) turned out to never fire on real
-data: real MSFS packages reference textures externally as .ktx2, which
-Step 2's own bulk pass (this module) already fully decodes to PNG before
-any model conversion starts -- that's the actual dominant path (~90%+ of
-real textures), not the rare embedded-glTF-DDS case. This repackages a
+main.repackage_ktx2_to_dds / decode_or_repackage_ktx2 -- repackages a
 KTX2's own GPU-native block-compressed payload straight into a DDS
 container instead of decoding to raw pixels and re-encoding, for
 everything except normal maps (which still need decode_ktx2_to_png's real
 Z-channel reconstruction -- BC5 normal maps only carry X/Y).
+
+ONLY BC1/BC3 (legacy "DXT1"/"DXT5" FourCC) are repackaged -- CONFIRMED
+REAL REGRESSION: an earlier version also repackaged BC4/BC5/BC7 via a
+DDS_HEADER_DXT10 extension, which round-tripped fine through this
+project's OWN reader (decode_dds_bytes_to_png) but made "almost
+everything" grey with "Some scenery textures could not be loaded" in
+real X-Plane 11 -- its DDS loader has no confirmed DX10/BC4-7 support
+(X-Plane's own official DDSTool manual documents only DXT1/DXT3/DXT5).
+Every format that can't be safely repackaged falls back to the full
+decode-to-PNG path instead of guessing again.
 """
 import struct
 import tempfile
@@ -93,20 +96,22 @@ class TestRepackageKtx2ToDds(unittest.TestCase):
             actual = np.array(Image.open(redecoded_png).convert("RGBA"))
             np.testing.assert_array_equal(actual, expected)
 
-    def test_bc7_dx10_header_round_trips_through_the_projects_own_reader(self):
+    def test_bc3_repackages_and_decodes_identically_to_full_decode(self):
         import importlib
         convert_module = importlib.import_module("mesh_convert.convert")
 
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
-            compressed = _fake_block_bytes(16)  # one 4x4 BC7 block
-            ktx2_path = td / "some_roof.ktx2"
-            ktx2_path.write_bytes(_build_fake_ktx2(main.VK_FORMAT_BC7_UNORM_BLOCK, 4, 4, compressed))
+            compressed = _fake_block_bytes(16)  # one 4x4 BC3 block
+            ktx2_path = td / "some_wall.ktx2"
+            ktx2_path.write_bytes(_build_fake_ktx2(main.VK_FORMAT_BC3_UNORM_BLOCK, 4, 4, compressed))
 
-            dds_path = td / "some_roof.dds"
+            dds_path = td / "some_wall.dds"
             self.assertIs(main.repackage_ktx2_to_dds(ktx2_path, dds_path), True)
+            self.assertEqual(dds_path.read_bytes()[84:88], b"DXT5",
+                              "must use the legacy FourCC, never a DX10 header")
 
-            png_path = td / "some_roof_full.png"
+            png_path = td / "some_wall_full.png"
             self.assertIs(main.decode_ktx2_to_png(ktx2_path, png_path), True)
             expected = np.array(Image.open(png_path).convert("RGBA"))
 
@@ -114,6 +119,43 @@ class TestRepackageKtx2ToDds(unittest.TestCase):
             self.assertTrue(convert_module.decode_dds_bytes_to_png(dds_path.read_bytes(), redecoded_png))
             actual = np.array(Image.open(redecoded_png).convert("RGBA"))
             np.testing.assert_array_equal(actual, expected)
+
+    def test_bc7_is_never_repackaged(self):
+        """Regression: X-Plane 11's DDS loader has no confirmed DX10/BC7
+        support -- confirmed real breakage ("almost everything" grey,
+        "Some scenery textures could not be loaded") when an earlier
+        version repackaged BC7 via a DDS_HEADER_DXT10 extension. BC7 is
+        the common format for modern MSFS albedo/PBR textures, so this
+        one matters most."""
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            ktx2_path = td / "some_roof.ktx2"
+            ktx2_path.write_bytes(_build_fake_ktx2(main.VK_FORMAT_BC7_UNORM_BLOCK, 4, 4, _fake_block_bytes(16)))
+            result = main.repackage_ktx2_to_dds(ktx2_path, td / "out.dds")
+            self.assertNotEqual(result, True)
+            self.assertIn("Unsupported", str(result))
+
+    def test_bc4_is_never_repackaged(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            ktx2_path = td / "some_mask.ktx2"
+            ktx2_path.write_bytes(_build_fake_ktx2(main.VK_FORMAT_BC4_UNORM_BLOCK, 4, 4, _fake_block_bytes(8)))
+            result = main.repackage_ktx2_to_dds(ktx2_path, td / "out.dds")
+            self.assertNotEqual(result, True)
+            self.assertIn("Unsupported", str(result))
+
+    def test_bc5_is_never_repackaged(self):
+        """BC5 is excluded from repackaging entirely (not just via the
+        "_norm" filename routing in decode_or_repackage_ktx2) since it
+        also needs the unsupported DX10 header regardless of what it's
+        used for."""
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            ktx2_path = td / "some_data.ktx2"
+            ktx2_path.write_bytes(_build_fake_ktx2(main.VK_FORMAT_BC5_UNORM_BLOCK, 4, 4, _fake_block_bytes(16)))
+            result = main.repackage_ktx2_to_dds(ktx2_path, td / "out.dds")
+            self.assertNotEqual(result, True)
+            self.assertIn("Unsupported", str(result))
 
     def test_basis_supercompression_is_not_repackaged(self):
         with tempfile.TemporaryDirectory() as td:
@@ -174,6 +216,20 @@ class TestDecodeOrRepackageKtx2(unittest.TestCase):
             self.assertIs(result, True)
             self.assertTrue((td / "flat_comp.png").exists())
             self.assertFalse((td / "flat_comp.dds").exists())
+
+    def test_bc7_non_normal_texture_falls_back_to_png_not_dds(self):
+        """End-to-end regression for the real breakage: a non-"_norm"
+        BC7 texture (the common case -- most modern MSFS albedo textures)
+        must still become .png, not a DX10-header .dds X-Plane 11 can't
+        load."""
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            ktx2_path = td / "roof_albd.ktx2"
+            ktx2_path.write_bytes(_build_fake_ktx2(main.VK_FORMAT_BC7_UNORM_BLOCK, 4, 4, _fake_block_bytes(16)))
+            result = main.decode_or_repackage_ktx2(ktx2_path, td)
+            self.assertIs(result, True)
+            self.assertTrue((td / "roof_albd.png").exists())
+            self.assertFalse((td / "roof_albd.dds").exists())
 
 
 if __name__ == "__main__":
