@@ -94,6 +94,32 @@ class TestDdsPassthrough(unittest.TestCase):
             with open(textures_dir / out_name, "rb") as f:
                 self.assertTrue(f.read().startswith(b"\x89PNG"), "must still be a real decoded/re-saved PNG")
 
+    def test_dds_preferred_over_a_pre_existing_png_for_the_same_stem(self):
+        """Regression: a shared base texture can end up with BOTH a
+        decoded .png (from some OTHER material that needed real pixel
+        access -- BLEND alpha or a tint) and a compact .dds (Step 2's own
+        pre-decode, or an earlier passthrough-eligible call) on disk for
+        the SAME stem. The .png existing must NOT permanently poison
+        every later passthrough-eligible caller into reusing it instead
+        of the .dds it would actually prefer -- confirmed real bug: on a
+        real EGLC conversion, 1276 textures ended up with both files on
+        disk, and 0 of the 1276 .dds files ever ended up referenced by
+        any compiled .obj (every consumer fell back to the .png,
+        whichever material happened to trigger its creation first)."""
+        with tempfile.TemporaryDirectory() as td:
+            textures_dir = Path(td)
+            stem = "sometexture"
+            (textures_dir / f"{stem}.png").write_bytes(_FAKE_PNG_BYTES)
+            (textures_dir / f"{stem}.dds").write_bytes(_FAKE_DDS_BYTES)
+
+            gltf = {"images": [{"name": stem}]}
+            out_name = convert_module.extract_image(
+                gltf, [], 0, Path(td) / "model.glb", textures_dir, None, {}, (255, 255, 255, 255),
+                allow_dds_passthrough=True,
+            )
+            self.assertEqual(out_name, f"{stem}.dds",
+                              "a passthrough-eligible caller must prefer an existing .dds over an existing .png")
+
     def test_tinted_material_disables_passthrough_for_base_color(self):
         """Integration-level check on the real call site in convert():
         a non-white baseColorFactor needs apply_color_factor to bake the
