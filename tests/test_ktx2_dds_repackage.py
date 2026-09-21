@@ -222,6 +222,32 @@ class TestRepackageKtx2ToDds(unittest.TestCase):
             actual = np.array(Image.open(redecoded_png).convert("RGBA"))
             np.testing.assert_array_equal(actual, expected)
 
+    def test_non_power_of_2_size_is_not_repackaged(self):
+        """CONFIRMED REAL BUG: X-Plane 11's DDS loader rejects a DDS
+        whose width or height isn't a power of 2 outright ("the texture
+        ... is DDS but its size is not power of 2", TEX_obj.cpp:568),
+        even with a correct FourCC and a real mip chain -- confirmed on
+        a real 1048x1048 source texture (not a power of 2; 1024, the
+        nearest one, is)."""
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            ktx2_path = td / "some_background.ktx2"
+            # 1048x1048: same non-power-of-2 size as the real confirmed case.
+            ktx2_path.write_bytes(_build_fake_ktx2(
+                main.VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 1048, 1048, _fake_block_bytes(8)))
+            result = main.repackage_ktx2_to_dds(ktx2_path, td / "out.dds")
+            self.assertNotEqual(result, True)
+            self.assertIn("power-of-2", str(result))
+
+    def test_power_of_2_size_is_still_repackaged(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            ktx2_path = td / "some_background.ktx2"
+            ktx2_path.write_bytes(_build_fake_ktx2(
+                main.VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 1024, 1024, _fake_block_bytes(8)))
+            result = main.repackage_ktx2_to_dds(ktx2_path, td / "out.dds")
+            self.assertIs(result, True)
+
     def test_bc7_is_never_repackaged(self):
         """Regression: X-Plane 11's DDS loader has no confirmed DX10/BC7
         support -- confirmed real breakage ("almost everything" grey,

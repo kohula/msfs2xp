@@ -1280,6 +1280,18 @@ def repackage_ktx2_to_dds(input_path, output_path):
         return "Skipped: true ETC1S/BasisLZ supercompression requires the Basis Universal transcoder."
 
     width, height, vk_fmt = info["width"], info["height"], info["vk_format"]
+    # CONFIRMED REAL BUG: X-Plane 11's DDS loader rejects a DDS whose
+    # width or height isn't a power of 2 outright ("the texture ... is
+    # DDS but its size is not power of 2", TEX_obj.cpp:568), even with
+    # a correct FourCC and a real mip chain -- confirmed on a real
+    # 1048x1048 source texture (not a power of 2; the nearest one, 1024,
+    # is). KTX2/BC-compressed textures don't have this constraint
+    # themselves (block compression only needs 4x4 alignment, not
+    # power-of-2 dimensions), so a source can legitimately be this size
+    # -- PNG has no such restriction either, so falling back there is
+    # always safe.
+    if width & (width - 1) or height & (height - 1):
+        return f"Skipped: {width}x{height} is not power-of-2 (X-Plane 11's DDS loader requires it)"
     level_bytes_list = []
     for raw_level in info["levels"]:
         decompressed = _decompress_supercompressed(raw_level, scheme)
