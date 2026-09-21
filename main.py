@@ -429,13 +429,43 @@ def _polygon_interior_exclusion_rects(boundary_points, cell_m=100.0, max_rects=8
     return out
 
 
-def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=3.0):
-    """One tight exclusion rectangle PER converted object (not one shared
-    airport-wide set) -- user's explicit ask: default X-Plane scenery
-    should only be suppressed exactly where this run's own objects sit,
-    not the object's whole airport's combined extent (which, for an
-    airport with real gaps between buildings, wiped out default scenery
-    in areas nothing was ever placed). Only roads/rail (net/str, see
+def _convex_hull_2d(points):
+    """Andrew's monotone chain, from scratch (no external geometry
+    library, matching this project's own convention -- see
+    _points_in_polygon). points: Nx2 array of (x, z). Returns hull
+    vertices in CCW order as an (M, 2) array; M can be 1 or 2 for a
+    degenerate (single point / collinear) input."""
+    pts = np.unique(np.asarray(points, dtype=np.float64), axis=0)
+    if len(pts) < 3:
+        return pts
+    order = np.lexsort((pts[:, 1], pts[:, 0]))
+    pts = pts[order]
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper = []
+    for p in pts[::-1]:
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return np.array(lower[:-1] + upper[:-1])
+
+
+def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=2.0):
+    """Exclusion rectangles that hug each converted object's OWN footprint
+    OUTLINE, not one shared airport-wide set and not even one single
+    bounding box per object -- explicit user instruction, illustrated with
+    a reference image: take the object's own outer polygon and cover it
+    with a chain of small rectangles following each edge (a min-1m/max-3m
+    growth around the footprint is fine), rather than one axis-aligned box
+    that overshoots badly on an elongated, angled, or irregular footprint
+    (a diagonal wing, an L-shaped building). Only roads/rail (net/str, see
     _built_up_exclusion_rects) stay airport-wide -- those aren't tied to
     one object's own footprint.
 
@@ -445,13 +475,25 @@ def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=3.0):
     ALREADY mid_x/mid_z-recentering-compensated anchor, matching the
     local coordinate frame each generated stem's .meshir.pkl sidecar was
     written in). For each entry, every named stem's sidecar (if any) is
-    loaded for its real local X/Z vertex extent; the resulting bounding
-    box's 4 corners are rotated into real-world lat/lon by the placement's
-    own heading (geo_transform.local_offset_to_latlon, same convention
-    used everywhere else in this pipeline) and padded by `pad_m` on every
-    side. Terrain-fit's own corrected copies aren't needed here: rigid
-    rotation and draped Y-warps don't materially change an object's own
-    XZ footprint, and reading the pre-terrain-fit original avoids a
+    loaded for its real local X/Z vertices; ALL of them (not just the
+    bbox corners) feed a 2-D convex hull (_convex_hull_2d) of the
+    object's own footprint outline. For each hull EDGE (two consecutive
+    hull vertices), the local axis-aligned bbox of just that edge's two
+    endpoints is padded by pad_m on every side (in local metres -- this
+    project's local X/Z coordinates already ARE metric, so padding here
+    needs no unit conversion), then its 4 corners are rotated into
+    real-world lat/lon by the placement's own heading
+    (geo_transform.local_offset_to_latlon, same convention used
+    everywhere else in this pipeline) and reduced to their own
+    axis-aligned lat/lon bounding rectangle. A concave real footprint
+    still gets its CONVEX hull covered (a true concave-hull decomposition
+    is not attempted) -- comfortably tighter than one whole-object
+    bounding box for the angled/elongated cases this was built for, even
+    if not pixel-perfect on a deeply concave shape.
+
+    Terrain-fit's own corrected copies aren't needed here: rigid rotation
+    and draped Y-warps don't materially change an object's own XZ
+    footprint, and reading the pre-terrain-fit original avoids a
     dependency on terrain-fit having already run for this stem.
 
     Skips stems with no sidecar or no real geometry (lights-only/animated-
@@ -459,11 +501,10 @@ def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=3.0):
     produced a usable footprint at all, so the caller can fall back to
     the airport-wide shape.
     """
-    m_per_deg_lat = 111320.0
     rects = []
     sidecar_cache = {}
     for generated_stems, base_lat, base_lon, heading_deg in footprint_candidates:
-        x_min = x_max = z_min = z_max = None
+        xz_parts = []
         for stem in generated_stems:
             if stem in sidecar_cache:
                 positions = sidecar_cache[stem]
@@ -480,30 +521,35 @@ def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=3.0):
                 sidecar_cache[stem] = positions
             if positions is None:
                 continue
-            sx0, sx1 = float(positions[:, 0].min()), float(positions[:, 0].max())
-            sz0, sz1 = float(positions[:, 2].min()), float(positions[:, 2].max())
-            x_min = sx0 if x_min is None else min(x_min, sx0)
-            x_max = sx1 if x_max is None else max(x_max, sx1)
-            z_min = sz0 if z_min is None else min(z_min, sz0)
-            z_max = sz1 if z_max is None else max(z_max, sz1)
-        if x_min is None:
+            xz_parts.append(positions[:, [0, 2]])
+        if not xz_parts:
             continue
+        xz = np.concatenate(xz_parts, axis=0)
+        hull = _convex_hull_2d(xz)
+        if len(hull) < 2:
+            continue
+        if len(hull) == 2:
+            edges = [(hull[0], hull[1])]
+        else:
+            edges = [(hull[i], hull[(i + 1) % len(hull)]) for i in range(len(hull))]
 
-        corners = [(x_min, z_min), (x_max, z_min), (x_max, z_max), (x_min, z_max)]
-        lats, lons = [], []
-        for cx, cz in corners:
-            la, lo = geo_transform.local_offset_to_latlon(base_lat, base_lon, heading_deg, cx, cz)
-            lats.append(la)
-            lons.append(lo)
+        m_per_deg_lat = 111320.0
         m_per_deg_lon = 111320.0 * max(math.cos(math.radians(base_lat)), 1e-6)
-        pad_lat = pad_m / m_per_deg_lat
-        pad_lon = pad_m / m_per_deg_lon
-        rects.append({
-            "west": min(lons) - pad_lon,
-            "east": max(lons) + pad_lon,
-            "south": min(lats) - pad_lat,
-            "north": max(lats) + pad_lat,
-        })
+        for (ex0, ez0), (ex1, ez1) in edges:
+            lx_min, lx_max = min(ex0, ex1) - pad_m, max(ex0, ex1) + pad_m
+            lz_min, lz_max = min(ez0, ez1) - pad_m, max(ez0, ez1) + pad_m
+            corners = [(lx_min, lz_min), (lx_max, lz_min), (lx_max, lz_max), (lx_min, lz_max)]
+            lats, lons = [], []
+            for cx, cz in corners:
+                la, lo = geo_transform.local_offset_to_latlon(base_lat, base_lon, heading_deg, cx, cz)
+                lats.append(la)
+                lons.append(lo)
+            rects.append({
+                "west": min(lons),
+                "east": max(lons),
+                "south": min(lats),
+                "north": max(lats),
+            })
     return rects
 
 

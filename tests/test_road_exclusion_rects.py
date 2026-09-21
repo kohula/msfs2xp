@@ -154,13 +154,29 @@ class TestGreedyRectsFromMask(unittest.TestCase):
         self.assertTrue((covered == mask).all())
 
 
+class TestConvexHull2D(unittest.TestCase):
+    def test_square_hull_has_4_vertices(self):
+        pts = np.array([[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0], [2.0, 2.0]])
+        hull = main._convex_hull_2d(pts)
+        self.assertEqual(len(hull), 4)
+
+    def test_collinear_points_degenerate_gracefully(self):
+        pts = np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
+        hull = main._convex_hull_2d(pts)
+        self.assertLessEqual(len(hull), 2)
+
+    def test_single_point(self):
+        hull = main._convex_hull_2d(np.array([[5.0, 5.0]]))
+        self.assertEqual(len(hull), 1)
+
+
 class TestPerObjectExclusionRects(unittest.TestCase):
     """main._per_object_exclusion_rects -- explicit user instruction: default
-    scenery exclusion should be scoped to each converted object's OWN real
-    footprint (+3m), not one shared shape covering the whole airport's
-    combined extent (which swallowed genuine gaps between buildings --
-    grass, taxiways, empty apron -- that were never actually part of any
-    placed object)."""
+    scenery exclusion should follow each converted object's OWN footprint
+    OUTLINE (a chain of small rectangles hugging each edge, 1-3m growth),
+    not one shared shape covering the whole airport's combined extent, and
+    not even a single bounding box per object (which overshoots badly on
+    an elongated/angled/irregular footprint)."""
 
     def _make_sidecar(self, obj_dir, stem, x_range, z_range):
         ir = mesh_ir.MeshIR(
@@ -174,23 +190,25 @@ class TestPerObjectExclusionRects(unittest.TestCase):
         )
         mesh_ir.save(ir, mesh_ir.sidecar_path_for(obj_dir / f"{stem}.obj"))
 
-    def test_single_object_footprint_is_padded_by_3m(self):
+    def test_square_object_gets_4_edge_rects_padded_by_2m(self):
         with tempfile.TemporaryDirectory() as td:
             obj_dir = Path(td)
             self._make_sidecar(obj_dir, "Building_A", x_range=(-5.0, 5.0), z_range=(-5.0, 5.0))
             rects = main._per_object_exclusion_rects(
                 obj_dir, [(["Building_A"], 47.0, 19.0, 0.0)])
-            self.assertEqual(len(rects), 1)
-            r = rects[0]
+            # A square's convex hull is its own 4 corners -- 4 edges, 4 rects.
+            self.assertEqual(len(rects), 4)
             m_per_deg_lat = 111320.0
             m_per_deg_lon = 111320.0 * math.cos(math.radians(47.0))
-            # Unpadded half-extent is 5m; padded should be 8m (5 + 3).
-            expected_half_lat = 8.0 / m_per_deg_lat
-            expected_half_lon = 8.0 / m_per_deg_lon
-            self.assertAlmostEqual(47.0 - r["south"], expected_half_lat, places=6)
-            self.assertAlmostEqual(r["north"] - 47.0, expected_half_lat, places=6)
-            self.assertAlmostEqual(19.0 - r["west"], expected_half_lon, places=6)
-            self.assertAlmostEqual(r["east"] - 19.0, expected_half_lon, places=6)
+            # Every point on the square's own boundary must be covered.
+            self.assertTrue(_covers(rects, 47.0 + 5.0 / m_per_deg_lat, 19.0))
+            self.assertTrue(_covers(rects, 47.0, 19.0 + 5.0 / m_per_deg_lon))
+            # 2m padding: a point 6.5m outside one edge (beyond the 5+2=7m
+            # reach of that edge's own rect) but still within another
+            # edge's reach must still be covered by the corner overlap;
+            # a point outside ALL edges' reach (8m out on the diagonal,
+            # past both the top and right edge rects) must not be.
+            self.assertFalse(_covers(rects, 47.0 + 8.0 / m_per_deg_lat, 19.0 + 8.0 / m_per_deg_lon))
 
     def test_two_distant_objects_stay_strictly_their_own_area(self):
         """The whole point vs. the old airport-wide shape: the empty gap
@@ -204,7 +222,6 @@ class TestPerObjectExclusionRects(unittest.TestCase):
                 (["Building_A"], 47.0000, 19.0000, 0.0),
                 (["Building_B"], 47.0100, 19.0000, 0.0),  # ~1.1km north
             ])
-            self.assertEqual(len(rects), 2)
             self.assertTrue(_covers(rects, 47.0000, 19.0000))
             self.assertTrue(_covers(rects, 47.0100, 19.0000))
             # Roughly halfway between the two objects -- well outside either
@@ -222,26 +239,31 @@ class TestPerObjectExclusionRects(unittest.TestCase):
             self._make_sidecar(obj_dir, "LongBuilding", x_range=(-20.0, 20.0), z_range=(-2.0, 2.0))
             rects = main._per_object_exclusion_rects(
                 obj_dir, [(["LongBuilding"], 47.0, 19.0, 90.0)])
-            self.assertEqual(len(rects), 1)
-            r = rects[0]
+            self.assertTrue(rects)
             m_per_deg_lat = 111320.0
             m_per_deg_lon = 111320.0 * math.cos(math.radians(47.0))
-            lat_span_m = (r["north"] - r["south"]) * m_per_deg_lat
-            lon_span_m = (r["east"] - r["west"]) * m_per_deg_lon
+            lat_span_m = (max(r["north"] for r in rects) - min(r["south"] for r in rects)) * m_per_deg_lat
+            lon_span_m = (max(r["east"] for r in rects) - min(r["west"] for r in rects)) * m_per_deg_lon
             self.assertGreater(lat_span_m, lon_span_m,
                                 "a 40m-long object at heading 90 must span more north/south than east/west")
 
-    def test_multiple_stems_for_one_placement_combine_into_one_rect(self):
+    def test_multiple_stems_for_one_placement_combine_into_one_hull(self):
         """generated_stems (multiple .obj siblings from one original model,
-        e.g. per-material split) must combine into ONE rect covering their
-        union, not one rect per sibling."""
+        e.g. per-material split) must combine into ONE footprint outline
+        (one convex hull covering their union), not be treated as two
+        separate, independently-hulled objects."""
         with tempfile.TemporaryDirectory() as td:
             obj_dir = Path(td)
             self._make_sidecar(obj_dir, "Roof_Mat", x_range=(-5.0, 5.0), z_range=(-5.0, 5.0))
             self._make_sidecar(obj_dir, "Wall_Mat", x_range=(-3.0, 8.0), z_range=(-3.0, 3.0))
             rects = main._per_object_exclusion_rects(
                 obj_dir, [(["Roof_Mat", "Wall_Mat"], 47.0, 19.0, 0.0)])
-            self.assertEqual(len(rects), 1)
+            self.assertTrue(rects)
+            # The combined footprint's own far corner (8, 3, from Wall_Mat)
+            # must be covered -- proves both stems fed the SAME hull.
+            m_per_deg_lat = 111320.0
+            m_per_deg_lon = 111320.0 * math.cos(math.radians(47.0))
+            self.assertTrue(_covers(rects, 47.0 + 3.0 / m_per_deg_lat, 19.0 + 8.0 / m_per_deg_lon))
 
     def test_missing_sidecar_is_skipped_not_crashed(self):
         with tempfile.TemporaryDirectory() as td:
