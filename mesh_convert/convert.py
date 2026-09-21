@@ -1353,7 +1353,27 @@ def _find_in_external_texture_roots(external_textures_dir, stem):
     return None
 
 
-def extract_image(gltf, buffers, image_index, glb_path, textures_dir, external_textures_dir, cache, fallback_color):
+def extract_image(gltf, buffers, image_index, glb_path, textures_dir, external_textures_dir, cache, fallback_color,
+                   allow_dds_passthrough=False):
+    """allow_dds_passthrough: when True AND the source bytes are already a
+    real DDS file, write them straight through as a .dds instead of
+    decoding to PNG. X-Plane's OBJ8 TEXTURE line supports .dds natively,
+    so decoding is pure waste when nothing about the texture needs to
+    change afterward -- CONFIRMED REAL GAP found comparing this project's
+    output against a different MSFS->X-Plane converter's: every one of
+    OUR textures paid a full decode+re-encode cost even when unmodified,
+    a real (~7x observed on one texture) size/VRAM penalty for zero
+    quality gain, while the other tool passes DDS through unchanged in
+    the common case and only re-encodes when a real modification (a
+    baked color/alpha/emissive factor) needs to be applied.
+
+    The CALLER decides this, not this function: it's the caller (the
+    material-processing loop in convert()) that knows whether apply_
+    color_factor/apply_alpha_factor/apply_emissive_factor will run on
+    this specific texture slot afterward -- those functions edit pixel
+    data and need a real decoded PNG to work on, so passthrough must stay
+    False whenever any of them might still run. The normal-map slot never
+    gets any such post-processing, so it can always pass True."""
     if image_index in cache:
         return cache[image_index]
 
@@ -1374,11 +1394,32 @@ def extract_image(gltf, buffers, image_index, glb_path, textures_dir, external_t
     base_stem = sanitize_name(base_stem)
     out_name = f"{base_stem}.png"
     out_png_path = textures_dir / out_name
+    out_dds_path = textures_dir / f"{base_stem}.dds"
 
     with _TEXTURE_LOCK:
         if out_png_path.exists() and out_png_path.stat().st_size > 100 and _is_reusable_texture(out_png_path):
             cache[image_index] = out_name
             return out_name
+        # A passthrough .dds from an earlier run/call is just as reusable
+        # as a decoded .png -- only checked when passthrough is actually
+        # allowed here, so a caller that needs the decoded/modifiable
+        # form still forces a fresh PNG even if a stale .dds sits there
+        # from a previous, different-purpose call for the same image.
+        if allow_dds_passthrough and out_dds_path.exists() and out_dds_path.stat().st_size > 100:
+            cache[image_index] = out_dds_path.name
+            return out_dds_path.name
+
+    def _write_raw(raw_bytes, dest_path):
+        """Shared by the bufferView and data-uri branches below: DDS
+        passthrough when allowed and the bytes really are DDS, else the
+        existing decode-to-PNG path. Returns the output filename actually
+        written, or None on failure -- same contract save_as_png had."""
+        if allow_dds_passthrough and raw_bytes[:4] == b"DDS ":
+            temp_path = dest_path.with_name(f"{out_dds_path.name}.tmp_{_unique_suffix()}")
+            temp_path.write_bytes(raw_bytes)
+            _atomic_replace(temp_path, out_dds_path)
+            return out_dds_path.name
+        return out_name if save_as_png(raw_bytes, out_png_path, fallback_color) else None
 
     # Tracks WHY execution fell through to the final fallback-stub write
     # below, for the warning there -- several genuinely different failure
@@ -1398,17 +1439,19 @@ def extract_image(gltf, buffers, image_index, glb_path, textures_dir, external_t
         offset = bv.get("byteOffset", 0)
         length = bv["byteLength"]
         raw = buffers[buf_idx][offset : offset + length]
-        if save_as_png(raw, out_png_path, fallback_color):
-            cache[image_index] = out_name
-            return out_name
+        written = _write_raw(raw, out_png_path)
+        if written:
+            cache[image_index] = written
+            return written
         failure_reason = "embedded bufferView image data failed to decode"
 
     elif image.get("uri", "").startswith("data:"):
         _, b64 = image["uri"].split(",", 1)
         raw = base64.b64decode(b64)
-        if save_as_png(raw, out_png_path, fallback_color):
-            cache[image_index] = out_name
-            return out_name
+        written = _write_raw(raw, out_png_path)
+        if written:
+            cache[image_index] = written
+            return written
         failure_reason = "embedded data: URI image data failed to decode"
 
     elif image.get("uri"):
@@ -1448,11 +1491,22 @@ def extract_image(gltf, buffers, image_index, glb_path, textures_dir, external_t
                 temp_path = out_png_path.with_name(f"{out_png_path.name}.tmp_{_unique_suffix()}")
                 shutil.copyfile(match, temp_path)
                 _atomic_replace(temp_path, out_png_path)
+                cache[image_index] = out_name
+                return out_name
+            elif allow_dds_passthrough and match.suffix.lower() == ".dds" and match.resolve() != out_dds_path.resolve():
+                temp_path = out_dds_path.with_name(f"{out_dds_path.name}.tmp_{_unique_suffix()}")
+                shutil.copyfile(match, temp_path)
+                _atomic_replace(temp_path, out_dds_path)
+                cache[image_index] = out_dds_path.name
+                return out_dds_path.name
             elif match.resolve() != out_png_path.resolve():
-                save_as_png(match.read_bytes(), out_png_path, fallback_color)
-
-            cache[image_index] = out_name
-            return out_name
+                written = _write_raw(match.read_bytes(), out_png_path)
+                if written:
+                    cache[image_index] = written
+                    return written
+            else:
+                cache[image_index] = out_name
+                return out_name
         failure_reason = (
             f"uri '{uri}' not found alongside the model, its texture/TEXTURE "
             f"subfolders, or external_textures_dir"
@@ -2232,8 +2286,23 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
 
                             img_idx, _ = texture_image_index(gltf, base_tex["index"])
                             if img_idx is not None:
+                                # DDS passthrough only when NOTHING below is
+                                # going to read or modify the decoded pixel
+                                # data: apply_color_factor/apply_alpha_factor
+                                # edit it, and the BLEND-downgrade check
+                                # further down (_texture_has_real_
+                                # transparency) opens it with plain PIL,
+                                # which can't read a passed-through .dds --
+                                # any BLEND alpha_mode or a non-white tint
+                                # means at least one of those will run, so
+                                # both must be ruled out first.
+                                _allow_dds = (
+                                    builder.alpha_mode != "BLEND"
+                                    and builder.base_color_factor[:3] == (255, 255, 255)
+                                )
                                 builder.texture_name = extract_image(
-                                    gltf, buffers, img_idx, glb_path, textures_dir, external_textures_dir, image_cache, builder.base_color_factor
+                                    gltf, buffers, img_idx, glb_path, textures_dir, external_textures_dir, image_cache, builder.base_color_factor,
+                                    allow_dds_passthrough=_allow_dds,
                                 )
 
                                 if builder.base_color_factor[:3] != (255, 255, 255):
@@ -2272,8 +2341,13 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                         if normal_tex and "index" in normal_tex:
                             img_idx, _ = texture_image_index(gltf, normal_tex["index"])
                             if img_idx is not None:
+                                # No post-processing ever touches the normal
+                                # map slot -- safe to always pass through a
+                                # source .dds unmodified (see
+                                # allow_dds_passthrough's own docstring).
                                 builder.normal_texture_name = extract_image(
-                                    gltf, buffers, img_idx, glb_path, textures_dir, external_textures_dir, image_cache, (128, 128, 255, 255)
+                                    gltf, buffers, img_idx, glb_path, textures_dir, external_textures_dir, image_cache, (128, 128, 255, 255),
+                                    allow_dds_passthrough=True,
                                 )
 
                         if not builder.texture_name:
@@ -2344,8 +2418,10 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
 
                             img_idx, _ = texture_image_index(gltf, emissive_tex["index"])
                             if img_idx is not None:
+                                _emissive_factor_pending = mat.get("emissiveFactor")
                                 builder.emissive_texture_name = extract_image(
-                                    gltf, buffers, img_idx, glb_path, textures_dir, external_textures_dir, image_cache, (255, 240, 180, 255)
+                                    gltf, buffers, img_idx, glb_path, textures_dir, external_textures_dir, image_cache, (255, 240, 180, 255),
+                                    allow_dds_passthrough=not (_emissive_factor_pending and len(_emissive_factor_pending) >= 3),
                                 )
                                 emissive_factor = mat.get("emissiveFactor")
                                 if emissive_factor and len(emissive_factor) >= 3:
