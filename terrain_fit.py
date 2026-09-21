@@ -317,11 +317,17 @@ def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_d
     # Cached regardless of whether vertical_shift ended up None (an
     # explicit "this group has no correction to offer" is as useful to a
     # cross-group lookup as a real one) -- see get_cached_transform /
-    # apply_shared_shift_to_group.
+    # apply_shared_shift_to_group. footprint_area_m2 lets main.py's
+    # anchor-clustering pass pick the most reliable member of a same-
+    # anchor bucket (see its own comment) -- a wider footprint spreads
+    # the sampling grid over more real ground, so its robust mean is
+    # less exposed to a single DEM/DSF-triangulation noise spike than a
+    # small one's.
     _group_transform_cache[group_key] = {
         "vertical_shift": vertical_shift,
         "base_lat": base_lat, "base_lon": base_lon, "heading_deg": heading_deg,
         "origin_elev": origin_elev,
+        "footprint_area_m2": (x_max - x_min) * (z_max - z_min),
     }
 
     digest = hashlib.md5(f"{lat_r}_{lon_r}_{hdg_r}".encode("utf-8")).hexdigest()[:10]

@@ -2789,32 +2789,67 @@ class ModularPythonConverterApp:
                          f"2+ differently-named placements ({_with_ref} of them have at least one member with "
                          f"an applied terrain-fit shift to share with the others).", "info")
             for bucket in _anchor_buckets.values():
-                if len({c["group_key"] for c in bucket}) < 2:
+                distinct_gks = {c["group_key"] for c in bucket}
+                if len(distinct_gks) < 2:
                     continue
-                applied_cand = next((c for c in bucket if c["any_applied"]), None)
-                if applied_cand is None:
-                    continue
-                transform = terrain_fit.get_cached_transform(applied_cand["group_key"])
-                if transform is None or transform.get("vertical_shift") is None:
+                # CONFIRMED REAL REGRESSION: picking "whichever member
+                # happened to independently qualify first" as the
+                # reference, then only overwriting members that came back
+                # disqualified, was correct back when a small sibling part
+                # (glass shell, interior, attached canopy) could never
+                # independently qualify at all -- terrain_fit's own former
+                # footprint size gate guaranteed only the genuinely large
+                # part of a split building ever got its own shift, so
+                # every other part always fell through to share it. Now
+                # that gate is gone (see terrain_fit.py's own docstring),
+                # a small sibling routinely qualifies on its own too --
+                # from a much smaller, noisier sample grid than its
+                # sibling's -- and the old "already applied -> never
+                # touch it" rule let that noisy number stand uncontested,
+                # producing two parts of ONE real building moving by two
+                # different amounts (the reported "half the building
+                # underground, like it's tilted" symptom). Fix: always
+                # pick the member with the LARGEST sampled footprint as
+                # the anchor's one canonical shift (more ground sampled
+                # -> less exposed to a single DEM/DSF spike), and apply
+                # that same number to EVERY member at this anchor,
+                # overriding even ones that already applied their own --
+                # a shared real-world anchor is one physical object; it
+                # must move as one rigid body, not each decoded part
+                # trusting its own independent estimate.
+                best_gk, best_transform, best_area = None, None, -1.0
+                for gk in distinct_gks:
+                    t = terrain_fit.get_cached_transform(gk)
+                    if t is None or t.get("vertical_shift") is None:
+                        continue
+                    area = t.get("footprint_area_m2", 0.0)
+                    if area > best_area:
+                        best_gk, best_transform, best_area = gk, t, area
+                if best_transform is None:
                     continue
 
                 for cand in bucket:
-                    if cand["any_applied"] or cand["group_key"] == applied_cand["group_key"]:
+                    if cand["group_key"] == best_gk:
                         continue
-                    unresolved_stems = [
+                    linkable_stems = [
                         stem for stem, (entry, fit_applied, part_is_draped) in cand["stem_entries"].items()
-                        if not fit_applied and not part_is_draped
+                        if not part_is_draped
                     ]
-                    if not unresolved_stems:
+                    if not linkable_stems:
                         continue
                     # No anchor-delta bookkeeping needed here (unlike the
                     # rotation this replaced): the shift is a property of
                     # the shared real-world anchor point, not of either
                     # candidate's own local-frame convention -- see
-                    # apply_shared_shift_to_group's own docstring.
+                    # apply_shared_shift_to_group's own docstring. Always
+                    # starts from each stem's ORIGINAL unwarped geometry
+                    # (_load_ir there is keyed by the original obj_stem,
+                    # not any prior per-group correction), so overriding
+                    # an already-applied member replaces its shift rather
+                    # than stacking a second one on top.
                     linked_results = terrain_fit.apply_shared_shift_to_group(
-                        obj_dir, unresolved_stems, transform, xplane_root)
-                    for stem in unresolved_stems:
+                        obj_dir, linkable_stems, best_transform, xplane_root)
+                    for stem in linkable_stems:
                         new_name, linked_applied, _linked_reason = linked_results[stem]
                         if linked_applied:
                             entry, _, _ = cand["stem_entries"][stem]
