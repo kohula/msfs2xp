@@ -1572,8 +1572,18 @@ def apply_color_factor(png_path, factor_rgb_255):
     if factor_rgb_255 == (255, 255, 255):
         return png_path.name
 
+    # Always .png regardless of png_path's own suffix: this always
+    # decodes+modifies+re-saves as PNG below (Image.fromarray(...).save
+    # (temp_path, "PNG")), so a caller that passes a .dds path (a
+    # texture slot whose OWN allow_dds_passthrough was True for an
+    # unrelated reason, e.g. apply_emissive_factor's cross-slot reuse of
+    # the base-color texture's own extracted name) must not get a .dds-
+    # NAMED file back containing real PNG bytes -- CONFIRMED REAL BUG:
+    # X-Plane's Log.txt reported "we are missing the texture" for
+    # several files that turned out to be exactly this (a real PNG
+    # sitting under a stale/misleading .dds filename).
     tag = "_".join(str(c) for c in factor_rgb_255)
-    new_name = f"{png_path.stem}_cf{tag}{png_path.suffix}"
+    new_name = f"{png_path.stem}_cf{tag}.png"
     new_path = png_path.with_name(new_name)
 
     with _TEXTURE_LOCK:
@@ -1595,7 +1605,8 @@ def apply_color_factor(png_path, factor_rgb_255):
 
 
 def apply_alpha_factor(png_path, alpha_255):
-    new_name = f"{png_path.stem}_a{alpha_255}{png_path.suffix}"
+    # Always .png -- see apply_color_factor's own comment on why.
+    new_name = f"{png_path.stem}_a{alpha_255}.png"
     new_path = png_path.with_name(new_name)
 
     with _TEXTURE_LOCK:
@@ -1639,8 +1650,14 @@ def apply_emissive_factor(png_path, factor_rgb):
     if all(f < 1.5 for f in factor_rgb):
         return png_path.name
 
+    # Always .png -- see apply_color_factor's own comment on why. Matters
+    # even more here: this is sometimes called on builder.texture_name,
+    # the BASE COLOR texture's own already-extracted name (see convert()'s
+    # "no emissive texture, base colour emits" fallback) -- a texture
+    # slot whose OWN allow_dds_passthrough decision has nothing to do
+    # with whether THIS unrelated emissive synthesis needs to bake it.
     tag = "_".join(f"{f:.2f}" for f in factor_rgb).replace(".", "p")
-    new_name = f"{png_path.stem}_ef{tag}{png_path.suffix}"
+    new_name = f"{png_path.stem}_ef{tag}.png"
     new_path = png_path.with_name(new_name)
 
     with _TEXTURE_LOCK:
