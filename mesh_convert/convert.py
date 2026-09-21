@@ -1397,17 +1397,29 @@ def extract_image(gltf, buffers, image_index, glb_path, textures_dir, external_t
     out_dds_path = textures_dir / f"{base_stem}.dds"
 
     with _TEXTURE_LOCK:
-        if out_png_path.exists() and out_png_path.stat().st_size > 100 and _is_reusable_texture(out_png_path):
-            cache[image_index] = out_name
-            return out_name
-        # A passthrough .dds from an earlier run/call is just as reusable
-        # as a decoded .png -- only checked when passthrough is actually
-        # allowed here, so a caller that needs the decoded/modifiable
-        # form still forces a fresh PNG even if a stale .dds sits there
-        # from a previous, different-purpose call for the same image.
+        # Checked BEFORE the .png check, not after: a shared base texture
+        # (the common MSFS case -- one neutral texture reused across many
+        # differently-tinted/branded objects, or across a BLEND-alpha
+        # material next to an OPAQUE one) can have BOTH a compact .dds
+        # (either Step 2's own bulk KTX2 pre-decode, main.py's
+        # decode_or_repackage_ktx2, or an earlier passthrough-eligible
+        # call here) AND a fully-decoded .png (from some OTHER material
+        # needing real pixel access) on disk at once. If the .png check
+        # ran first, ANY single decode-needing consumer of a shared
+        # texture would permanently "poison" every later passthrough-
+        # eligible consumer into reusing that .png too, even though it
+        # would have been perfectly happy with the already-available
+        # .dds -- confirmed on a real EGLC conversion: 1276 textures got
+        # both a .dds and a .png, and NONE of the .dds files ended up
+        # referenced by any compiled .obj (0/1276), a pure ~2.7GB waste.
+        # This check makes the CURRENT caller's own allow_dds_passthrough
+        # decide first, independent of what any other caller needed.
         if allow_dds_passthrough and out_dds_path.exists() and out_dds_path.stat().st_size > 100:
             cache[image_index] = out_dds_path.name
             return out_dds_path.name
+        if out_png_path.exists() and out_png_path.stat().st_size > 100 and _is_reusable_texture(out_png_path):
+            cache[image_index] = out_name
+            return out_name
 
     def _write_raw(raw_bytes, dest_path):
         """Shared by the bufferView and data-uri branches below: DDS
