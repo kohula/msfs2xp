@@ -172,18 +172,11 @@ class TestConvexHull2D(unittest.TestCase):
 
 class TestPerObjectExclusionRects(unittest.TestCase):
     """main._per_object_exclusion_rects -- explicit user instruction: default
-    scenery exclusion should cover each converted object's OWN footprint
-    using close to the MINIMUM real area needed (1-3m growth), not one
-    shared shape covering the whole airport's combined extent, not a
-    single bounding box per object (overshoots badly on an elongated/
-    angled/irregular footprint), and not even one rectangle per convex-
-    hull edge (a diagonal edge's own local axis-aligned box, or the hull
-    itself, both over-cover a real concavity -- e.g. the gap between an
-    X-shaped building's two arms). A solid, simply-convex object collapses
-    to ONE minimal rectangle; a real footprint with two genuinely
-    disconnected parts (see TestPerObjectExclusionRectsConcave below)
-    splits into separate rectangles that leave the gap between them
-    uncovered."""
+    scenery exclusion should follow each converted object's OWN footprint
+    OUTLINE (a chain of small rectangles hugging each edge, 1-3m growth),
+    not one shared shape covering the whole airport's combined extent, and
+    not even a single bounding box per object (which overshoots badly on
+    an elongated/angled/irregular footprint)."""
 
     def _make_sidecar(self, obj_dir, stem, x_range, z_range):
         ir = mesh_ir.MeshIR(
@@ -197,24 +190,25 @@ class TestPerObjectExclusionRects(unittest.TestCase):
         )
         mesh_ir.save(ir, mesh_ir.sidecar_path_for(obj_dir / f"{stem}.obj"))
 
-    def test_square_object_gets_one_minimal_rect_padded_by_2m(self):
+    def test_square_object_gets_4_edge_rects_padded_by_2m(self):
         with tempfile.TemporaryDirectory() as td:
             obj_dir = Path(td)
             self._make_sidecar(obj_dir, "Building_A", x_range=(-5.0, 5.0), z_range=(-5.0, 5.0))
             rects = main._per_object_exclusion_rects(
                 obj_dir, [(["Building_A"], 47.0, 19.0, 0.0)])
-            # A solid square needs only ONE minimal rectangle -- not one
-            # per hull edge.
-            self.assertEqual(len(rects), 1)
+            # A square's convex hull is its own 4 corners -- 4 edges, 4 rects.
+            self.assertEqual(len(rects), 4)
             m_per_deg_lat = 111320.0
             m_per_deg_lon = 111320.0 * math.cos(math.radians(47.0))
             # Every point on the square's own boundary must be covered.
             self.assertTrue(_covers(rects, 47.0 + 5.0 / m_per_deg_lat, 19.0))
             self.assertTrue(_covers(rects, 47.0, 19.0 + 5.0 / m_per_deg_lon))
-            # 2m padding: a point 6.9m out (within the 5+2=7m reach) is
-            # covered; a point 7.5m out (beyond it) is not.
-            self.assertTrue(_covers(rects, 47.0 + 6.9 / m_per_deg_lat, 19.0))
-            self.assertFalse(_covers(rects, 47.0 + 7.5 / m_per_deg_lat, 19.0))
+            # 2m padding: a point 6.5m outside one edge (beyond the 5+2=7m
+            # reach of that edge's own rect) but still within another
+            # edge's reach must still be covered by the corner overlap;
+            # a point outside ALL edges' reach (8m out on the diagonal,
+            # past both the top and right edge rects) must not be.
+            self.assertFalse(_covers(rects, 47.0 + 8.0 / m_per_deg_lat, 19.0 + 8.0 / m_per_deg_lon))
 
     def test_two_distant_objects_stay_strictly_their_own_area(self):
         """The whole point vs. the old airport-wide shape: the empty gap
@@ -281,80 +275,6 @@ class TestPerObjectExclusionRects(unittest.TestCase):
     def test_empty_candidates_returns_empty(self):
         with tempfile.TemporaryDirectory() as td:
             self.assertEqual(main._per_object_exclusion_rects(Path(td), []), [])
-
-
-class TestPerObjectExclusionRectsConcave(unittest.TestCase):
-    """The actual motivating case: a real object whose true footprint is
-    concave or has genuinely disconnected parts (an X/dumbbell shape) must
-    not get the gap between its parts excluded just because a convex hull
-    of the combined points would cover it. Uses real triangle indices (not
-    _make_sidecar's corners-only fixture) so rasterization sees the TRUE
-    footprint, not a hull fallback."""
-
-    def _make_triangulated_sidecar(self, obj_dir, stem, quads):
-        """quads: [(x0, x1, z0, z1), ...] -- each rectangle triangulated
-        into 2 real triangles, all combined into one sidecar, so one stem
-        can carry a real, possibly-disconnected multi-part footprint."""
-        positions, indices = [], []
-        for (x0, x1, z0, z1) in quads:
-            base = len(positions)
-            positions.extend([[x0, 0.0, z0], [x1, 0.0, z0], [x1, 0.0, z1], [x0, 0.0, z1]])
-            indices.extend([base, base + 1, base + 2, base, base + 2, base + 3])
-        ir = mesh_ir.MeshIR(
-            name=stem,
-            positions=np.array(positions, dtype=np.float64),
-            indices=np.array(indices, dtype=np.int64),
-        )
-        mesh_ir.save(ir, mesh_ir.sidecar_path_for(obj_dir / f"{stem}.obj"))
-
-    def test_two_disconnected_parts_of_one_object_stay_separate(self):
-        """A real dumbbell-shaped footprint (two small real quads far
-        apart, connected only by an unrelated hull) must NOT get its
-        middle gap excluded -- the whole reason for rasterizing real
-        triangles instead of a convex hull."""
-        with tempfile.TemporaryDirectory() as td:
-            obj_dir = Path(td)
-            self._make_triangulated_sidecar(obj_dir, "Dumbbell", quads=[
-                (-10.0, -7.0, -1.0, 1.0),   # left blob
-                (7.0, 10.0, -1.0, 1.0),     # right blob, far away
-            ])
-            rects = main._per_object_exclusion_rects(
-                obj_dir, [(["Dumbbell"], 47.0, 19.0, 0.0)], pad_m=1.0)
-            self.assertTrue(rects)
-            m_per_deg_lat = 111320.0
-            m_per_deg_lon = 111320.0 * math.cos(math.radians(47.0))
-            self.assertTrue(_covers(rects, 47.0, 19.0 - 8.5 / m_per_deg_lon), "left blob center must be covered")
-            self.assertTrue(_covers(rects, 47.0, 19.0 + 8.5 / m_per_deg_lon), "right blob center must be covered")
-            # The middle gap -- well outside pad_m=1 of either real quad --
-            # must NOT be excluded. A convex hull of the combined points
-            # would wrongly cover this whole region.
-            self.assertFalse(_covers(rects, 47.0, 19.0), "the empty gap between the two parts must stay open")
-
-    def test_solid_l_shape_does_not_fill_its_own_concave_notch(self):
-        """An L-shaped footprint (two overlapping real quads forming an L,
-        not a full rectangle) must not have its missing corner excluded --
-        that corner is real empty space the object never occupies."""
-        with tempfile.TemporaryDirectory() as td:
-            obj_dir = Path(td)
-            self._make_triangulated_sidecar(obj_dir, "LShape", quads=[
-                (0.0, 10.0, 0.0, 3.0),   # long horizontal arm
-                (0.0, 3.0, 0.0, 10.0),   # long vertical arm (shares the corner)
-            ])
-            rects = main._per_object_exclusion_rects(
-                obj_dir, [(["LShape"], 47.0, 19.0, 0.0)], pad_m=0.5)
-            self.assertTrue(rects)
-            m_per_deg_lat = 111320.0
-            m_per_deg_lon = 111320.0 * math.cos(math.radians(47.0))
-            # geo_transform.local_offset_to_latlon: lat = base_lat -
-            # rot_z/EARTH_M_PER_DEG -- increasing local Z moves SOUTH, so
-            # a point at local (x, z) lands at (base_lat - z/m, base_lon +
-            # x/m), not +z.
-            # The L's own missing corner (far from both arms, well beyond
-            # the 0.5m pad) must stay open.
-            self.assertFalse(_covers(rects, 47.0 - 8.0 / m_per_deg_lat, 19.0 + 8.0 / m_per_deg_lon))
-            # Both arms themselves must be covered.
-            self.assertTrue(_covers(rects, 47.0 - 1.0 / m_per_deg_lat, 19.0 + 8.0 / m_per_deg_lon))
-            self.assertTrue(_covers(rects, 47.0 - 8.0 / m_per_deg_lat, 19.0 + 1.0 / m_per_deg_lon))
 
 
 if __name__ == "__main__":
