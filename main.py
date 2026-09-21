@@ -2490,7 +2490,7 @@ class ModularPythonConverterApp:
 
             if _linked_count:
                 self.log(f"{_linked_count} placement sub-object(s) linked to a sibling placement's terrain-fit "
-                         f"rotation at the same real-world anchor.", "info")
+                         f"shift at the same real-world anchor.", "info")
 
             if agl_placement_count:
                 self.log(f"{agl_placement_count} placement(s) use native DSF AGL height placement to fix floating/sunken SPB-attached or upper-floor objects.", "info")
