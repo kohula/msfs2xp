@@ -193,6 +193,35 @@ class TestDecodeOrRepackageKtx2(unittest.TestCase):
             self.assertTrue((td / "roof_albd.dds").exists())
             self.assertFalse((td / "roof_albd.png").exists())
 
+    def test_no_crash_when_the_stale_file_is_already_gone(self):
+        """CONFIRMED REAL CRASH this pins: decode_or_repackage_ktx2 runs
+        under a ProcessPoolExecutor, one worker per .ktx2 file, and two
+        different SOURCE .ktx2 files can legitimately clean to the SAME
+        stem (two differently-pathed copies of one shared texture) and
+        race on cleaning up the same stale cross-format file
+        concurrently. An exists()-then-unlink() TOCTOU window let a
+        second worker's unlink() raise FileNotFoundError after a first
+        worker already removed the same file -- an unhandled exception
+        that silently aborted the ENTIRE pipeline mid-Step-2, before
+        model conversion ever started, with no "[error]"-tagged log line
+        and exit code 0. Both directions (repackaging to .dds with no
+        stale .png to clean up, and falling back to .png with no stale
+        .dds to clean up) must be a clean no-op, not a crash."""
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            ktx2_path = td / "roof_albd.ktx2"
+            ktx2_path.write_bytes(_build_fake_ktx2(main.VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 4, 4, _fake_block_bytes(8)))
+            # No stale .png sitting here at all (already removed by
+            # another concurrent worker, or never existed).
+            result = main.decode_or_repackage_ktx2(ktx2_path, td)
+            self.assertIs(result, True)
+
+            ktx2_path2 = td / "roof2_albd.ktx2"
+            ktx2_path2.write_bytes(_build_fake_ktx2(main.VK_FORMAT_BC7_UNORM_BLOCK, 4, 4, _fake_block_bytes(16)))
+            # No stale .dds sitting here either.
+            result2 = main.decode_or_repackage_ktx2(ktx2_path2, td)
+            self.assertIs(result2, True)
+
     def test_stale_dds_from_an_older_run_is_removed_when_now_falling_back_to_png(self):
         """CONFIRMED REAL BUG: run_convert_resume.py's output textures
         folder isn't cleared between runs. A .dds written under an OLDER

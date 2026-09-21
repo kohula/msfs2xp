@@ -1227,17 +1227,27 @@ def decode_or_repackage_ktx2(input_path, out_dir):
     exact DX10-header breakage that was supposedly fixed. Real symptom
     confirmed in X-Plane's own Log.txt: "we are missing the texture"
     for several ini_gp_gen_*_albd.dds files that had both a stale bad
-    .dds AND a fresh, correct .png sitting side by side."""
+    .dds AND a fresh, correct .png sitting side by side.
+
+    unlink(missing_ok=True), not exists()-then-unlink(): this runs under
+    a ProcessPoolExecutor (one worker per .ktx2 file), and two different
+    SOURCE .ktx2 files can legitimately clean to the SAME stem (e.g. two
+    differently-pathed copies of one shared character texture) and race
+    on cleaning up the SAME stale file concurrently -- CONFIRMED REAL
+    CRASH: an exists()-then-unlink() TOCTOU window let a second worker's
+    unlink() raise FileNotFoundError after a first worker already removed
+    the same file, an unhandled exception that silently aborted the
+    ENTIRE pipeline mid-Step-2 (before model conversion ever started),
+    while run_convert_resume.py's own top-level try/except only printed
+    the traceback -- no "[error]"-tagged log line, exit code 0."""
     stem = _clean_texture_stem(input_path)
     dds_path = out_dir / f"{stem}.dds"
     png_path = out_dir / f"{stem}.png"
     if "_norm" not in stem:
         if repackage_ktx2_to_dds(input_path, dds_path) is True:
-            if png_path.exists():
-                png_path.unlink()
+            png_path.unlink(missing_ok=True)
             return True
-    if dds_path.exists():
-        dds_path.unlink()
+    dds_path.unlink(missing_ok=True)
     return decode_ktx2_to_png(input_path, png_path)
 
 
