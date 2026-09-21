@@ -121,7 +121,18 @@ class TestFlatnessTiltedExclusivity(unittest.TestCase):
         "roof_decal" material at genuine roof height was draped flat onto
         the ground, far below the roof it was meant to sit on. This
         fixture mirrors that: a decal-named quad sitting AT the building's
-        own roof height (not at its ground level) must stay rigid."""
+        own roof height (not at its ground level) must stay rigid.
+
+        Deliberately NO explicit ground-level floor geometry here -- the
+        building's only flat triangles are its roof (2 tris @ y=6), same
+        as the decal. This is what makes the fixture actually discriminate
+        the real fix (comparing against file_min_height, the lowest CLEAN
+        VERTEX in the file -- found here from the walls' own non-flat
+        bottom edge, still @ y=0) from the superseded, buggier approach
+        (comparing against file_reference_height, the most vertex-heavy
+        FLAT band -- which without a ground-level floor would itself
+        resolve to y=6, the roof, making the roof_decal wrongly look
+        "close to ground" and stay draped)."""
         b = GltfBuilder()
         tex = b.add_image_data_uri((150, 150, 150, 255))
         texi = b.add_texture(tex)
@@ -133,28 +144,10 @@ class TestFlatnessTiltedExclusivity(unittest.TestCase):
         for a, c, d, e in [(0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)]:
             wall_tris += [(a, c, d), (a, d, e)]
         roof_tris = [(4, 5, 6), (4, 6, 7)]
-        # A finely subdivided ground-level floor slab (4x4=32 tris @ y=0)
-        # so the file's own dominant flat reference level resolves to true
-        # ground (y=0), heavily outnumbering the roof's 2 flat tris @ y=6
-        # -- without this, the roof would itself be the only other flat
-        # geometry in the file and could wrongly become the "dominant"
-        # level, defeating the point of this fixture (the roof_decal must
-        # be judged against GROUND level, not against the roof it sits on).
-        floor_tris = []
-        floor_verts = []
-        n = 4
-        for iz in range(n):
-            for ix in range(n):
-                x0, x1 = -5 + ix * (10 / n), -5 + (ix + 1) * (10 / n)
-                z0, z1 = -5 + iz * (10 / n), -5 + (iz + 1) * (10 / n)
-                base = len(bx) + len(floor_verts)
-                floor_verts += [(x0, 0.0, z0), (x1, 0.0, z0), (x1, 0.0, z1), (x0, 0.0, z1)]
-                floor_tris += [(base, base + 1, base + 2), (base, base + 2, base + 3)]
-        building_indices = [i for tri in (wall_tris + roof_tris + floor_tris) for i in tri]
+        building_indices = [i for tri in (wall_tris + roof_tris) for i in tri]
         building_mesh = b.add_mesh(
-            bx + floor_verts, building_indices,
-            normals=[(0.0, 1.0, 0.0)] * (len(bx) + len(floor_verts)),
-            uvs=[(0.0, 0.0)] * (len(bx) + len(floor_verts)), material_index=building_mat,
+            bx, building_indices,
+            normals=[(0.0, 1.0, 0.0)] * len(bx), uvs=[(0.0, 0.0)] * len(bx), material_index=building_mat,
         )
         b.add_node(mesh_index=building_mesh, name="Building")
 

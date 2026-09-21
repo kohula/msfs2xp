@@ -435,6 +435,22 @@ def compute_file_flatness_and_reference(gltf, buffers, world_transforms, flat_ep
         the whole rigid object around) to any (non-stray, see
         flag_stray_vertices) vertex in the file.
 
+      - min_height: the lowest (non-stray) vertex Y anywhere in the file,
+        flat or not. CONFIRMED REAL BUG this exists to fix: convert() used
+        to gate the "decal" name-match (builder.is_decal) on proximity to
+        reference_height (the flat band with the MOST vertex support) --
+        but that band is easily dominated by a large flat ROOF, not
+        ground, for a building with little explicit ground-contact flat
+        geometry of its own. Confirmed against a real LHBP building: its
+        "roof_decal" material (alpha_mode BLEND, authored at genuine roof
+        height) sat close enough to that roof-biased reference_height to
+        still pass the proximity check and stay draped onto the ground.
+        min_height doesn't have that failure mode -- a building's own
+        foundation/wall base is, by construction, always its lowest
+        point, roof included, so it's a reliable ground reference no
+        matter how the file's flat-triangle count happens to be
+        distributed.
+
       - max_horizontal_radius: the same, but measured only in the
         horizontal (X/Z) plane, ignoring height. This is the one that
         actually matters for TILTED: rotating the whole object to match a
@@ -505,6 +521,14 @@ def compute_file_flatness_and_reference(gltf, buffers, world_transforms, flat_ep
     flat_y_values = []
     max_radius = 0.0
     max_horizontal_radius = 0.0
+    # Lowest clean (non-stray) vertex anywhere in the file, flat or not --
+    # a real building's foundation/wall base is always its lowest point,
+    # so this is a far more reliable "true ground level" reference than
+    # file_reference_height below (the MOST VERTEX-HEAVY flat band, which
+    # a large flat roof can easily dominate over whatever sparse ground-
+    # contact geometry the file actually has -- see min_height's own
+    # docstring entry for the confirmed real case this exists for).
+    min_height = None
 
     # Per-node breakdown of the exact same tallies as the file-wide ones
     # above -- used by convert() to decide flattening/draping PER NODE
@@ -559,6 +583,8 @@ def compute_file_flatness_and_reference(gltf, buffers, world_transforms, flat_ep
                 if len(clean):
                     max_radius = max(max_radius, float(np.linalg.norm(clean, axis=1).max()))
                     max_horizontal_radius = max(max_horizontal_radius, float(np.linalg.norm(clean[:, [0, 2]], axis=1).max()))
+                    clean_min_y = float(clean[:, 1].min())
+                    min_height = clean_min_y if min_height is None else min(min_height, clean_min_y)
 
             if idx_acc not in indices_cache:
                 indices_cache[idx_acc] = read_accessor(gltf, buffers, idx_acc).astype(np.int64).reshape(-1)
@@ -652,7 +678,7 @@ def compute_file_flatness_and_reference(gltf, buffers, world_transforms, flat_ep
         all_y = np.concatenate(flat_y_values)
         _, _, reference_height, _ = _cluster_height_bands(all_y, merge_gap=merge_gap)
 
-    return flat_fraction, reference_height, max_radius, max_horizontal_radius, node_stats, material_stats
+    return flat_fraction, reference_height, max_radius, max_horizontal_radius, node_stats, material_stats, min_height
 
 
 def _cluster_height_bands(y_values, merge_gap=0.05):
@@ -1913,7 +1939,7 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
     # long comment where this is consumed (builder.is_near_ground_flat)
     # for the real measured numbers this was picked from.
     _NEAR_GROUND_FLAT_FRACTION_THRESHOLD = 0.90
-    file_flat_fraction, file_reference_height, file_max_radius, file_max_horizontal_radius, node_flatness_stats, material_flatness_stats = compute_file_flatness_and_reference(gltf, buffers, world_transforms)
+    file_flat_fraction, file_reference_height, file_max_radius, file_max_horizontal_radius, node_flatness_stats, material_flatness_stats, file_min_height = compute_file_flatness_and_reference(gltf, buffers, world_transforms)
     file_is_flat_only = file_flat_fraction >= flat_fraction_threshold and file_reference_height is not None
 
     # TILTED rotates the WHOLE rigid object around its local origin to
@@ -2304,9 +2330,26 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                         # since the name/extension signal is already a
                         # much stronger positive indicator than mere
                         # flatness is.
+                        #
+                        # Deliberately compared against file_min_height
+                        # here, NOT file_reference_height (the near-ground-
+                        # flat check above still uses that one -- see its
+                        # own docstring, it degrades safely either way).
+                        # CONFIRMED REAL BUG comparing against
+                        # file_reference_height caused: that reference is
+                        # the flat band with the MOST vertex support, which
+                        # a large flat ROOF easily dominates for a building
+                        # with little explicit ground-contact flat geometry
+                        # of its own -- a real LHBP "roof_decal" material,
+                        # genuinely at roof height, sat close enough to
+                        # that roof-biased reference to still pass and stay
+                        # draped onto the ground. file_min_height (the
+                        # file's own lowest vertex, flat or not) doesn't
+                        # have that failure mode -- see its own docstring
+                        # entry on compute_file_flatness_and_reference.
                         builder.is_decal = _decal_name_matched and (
-                            _mat_ref_height is None or file_reference_height is None
-                            or abs(_mat_ref_height - file_reference_height) <= _NEAR_GROUND_FLAT_TOLERANCE_M
+                            _mat_ref_height is None or file_min_height is None
+                            or abs(_mat_ref_height - file_min_height) <= _NEAR_GROUND_FLAT_TOLERANCE_M
                         )
 
                         # MSFS has shipped several glass extension names
