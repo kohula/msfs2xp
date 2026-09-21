@@ -233,5 +233,75 @@ class TestExternalTextureResolution(unittest.TestCase):
             self.assertIn("tex", index2)
 
 
+def _build_fake_ktx2_bc1(width, height):
+    """A minimal, structurally-valid single-level BC1 KTX2 file --
+    enough for decode_ktx2_bytes_to_png to actually decode it (unlike
+    test_ktx2_dds_repackage.py's own _build_fake_ktx2, whose fixtures
+    only need to parse, not decode)."""
+    import struct
+    blocks_w, blocks_h = max(1, (width + 3) // 4), max(1, (height + 3) // 4)
+    compressed = b"\x00\xf8\xff\x07" + b"\x00" * 4  # one real, decodable BC1 block, repeated
+    compressed = compressed * (blocks_w * blocks_h)
+    magic = b"\xabKTX 20\xbb\r\n\x1a\n"
+    vk_format_bc1_rgba = 133
+    header = struct.pack("<17I", vk_format_bc1_rgba, 1, width, height, 0, 1, 1, 1, 0,
+                          0, 0, 0, 0, 0, 0, 0, 0)
+    offset = len(magic) + len(header) + 24
+    level_index = struct.pack("<3Q", offset, len(compressed), len(compressed))
+    return magic + header + level_index + compressed
+
+
+class TestGuessTextureByMaterialName(unittest.TestCase):
+    """convert()'s "no base color texture at all -- guess one from the
+    material's own name" fallback (mesh_convert/convert.py, right after
+    the normal-map extraction). CONFIRMED REAL CRASH this pins: the
+    matched file came from _find_in_external_texture_roots, which
+    indexes EVERY recognized extension (_EXTERNAL_TEXTURE_EXTENSIONS
+    includes .ktx2/.dds/.tga/...) by clean stem -- a raw shutil.copyfile
+    straight to a ".png"-named destination assumed the match was
+    already a real PNG just because the DESTINATION happened to be
+    named that. A real, undecoded .ktx2 file copied verbatim to a
+    ".png" path is not a valid PNG at all -- confirmed in real X-Plane
+    output: a hard crash ("THREAD FATAL ASSERT", a real IDAT CRC error)
+    trying to load one."""
+
+    def test_matched_ktx2_is_decoded_not_raw_copied(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            b = GltfBuilder()
+            # No base_color_texture_index at all -- forces the
+            # guess-by-material-name fallback.
+            mat = b.add_material("FloodlightEmis")
+            positions = [(-2, 0, -2), (2, 0, -2), (2, 0, 2), (-2, 0, 2)]
+            normals = [(0.0, 1.0, 0.0)] * 4
+            uvs = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+            indices = [0, 1, 2, 0, 2, 3]
+            mesh = b.add_mesh(positions, indices, normals=normals, uvs=uvs, material_index=mat)
+            b.add_node(mesh_index=mesh, name="Light")
+
+            glb_path = td / "model.glb"
+            glb_path.write_bytes(b.build())
+
+            external_root = td / "package"
+            tex_src_dir = external_root / "texture"
+            tex_src_dir.mkdir(parents=True)
+            (tex_src_dir / "FloodlightEmis.ktx2").write_bytes(_build_fake_ktx2_bc1(4, 4))
+
+            obj_dir = td / "objects"
+            tex_dir = td / "textures"
+            obj_dir.mkdir()
+            tex_dir.mkdir()
+
+            result = mesh_convert.convert(glb_path, obj_dir, tex_dir, external_root, "0.0", "0.0", "0.0")
+            self.assertTrue(result)
+
+            out_path = tex_dir / "floodlightemis.png"
+            self.assertTrue(out_path.exists(), "expected the guessed texture to be written")
+            self.assertTrue(out_path.read_bytes().startswith(b"\x89PNG"),
+                             "must be a real decoded PNG, not the raw KTX2 bytes copied verbatim")
+            with Image.open(out_path) as img:
+                img.load()  # raises if the PNG is actually corrupt
+
+
 if __name__ == "__main__":
     unittest.main()

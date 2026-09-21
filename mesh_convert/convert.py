@@ -2408,9 +2408,27 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                                 if match:
                                     with _TEXTURE_LOCK:
                                         if match.resolve() != (textures_dir / expected_tex).resolve():
-                                            temp_path = (textures_dir / expected_tex).with_name(f"{expected_tex}.tmp_{_unique_suffix()}")
-                                            shutil.copyfile(match, temp_path)
-                                            _atomic_replace(temp_path, textures_dir / expected_tex)
+                                            # save_as_png, not a raw
+                                            # shutil.copyfile: match came
+                                            # from _find_in_external_texture_
+                                            # roots, which indexes EVERY
+                                            # recognized extension
+                                            # (_EXTERNAL_TEXTURE_EXTENSIONS
+                                            # includes .ktx2/.dds/.tga/...)
+                                            # by clean stem -- a raw copy
+                                            # assumed it was already a real
+                                            # PNG just because the
+                                            # DESTINATION is named
+                                            # expected_tex (a ".png" path).
+                                            # CONFIRMED REAL CRASH: a raw,
+                                            # undecoded .ktx2 file copied
+                                            # verbatim to a ".png"-named
+                                            # path is not a valid PNG at
+                                            # all -- X-Plane hard-crashed
+                                            # ("THREAD FATAL ASSERT", a
+                                            # real IDAT CRC error) trying
+                                            # to load one.
+                                            save_as_png(match.read_bytes(), textures_dir / expected_tex, builder.base_color_factor)
                                     builder.texture_name = expected_tex
 
                         # Same downgrade as above, for a material that still
