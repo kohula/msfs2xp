@@ -258,20 +258,16 @@ class TestTerrainFit(unittest.TestCase):
             self._build_box_glb(building_glb, "BigBuilding", "BuildingTex", half_size=15.0)
             result = mesh_convert.convert(building_glb, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
             stem = result[0].stem
-            self.assertIn("TILTED", result[0].read_text(encoding="utf-8").splitlines(),
-                          "test setup issue: expected this box fixture to convert as TILTED")
+            self.assertNotIn("ATTR_draped", result[0].read_text(encoding="utf-8"),
+                              "test setup issue: expected this box fixture to convert as rigid")
 
             original_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{stem}.obj"))
 
             results = terrain_fit.get_or_create_fitted_group(obj_dir, [stem], 47.5, 8.5, 0.0, xplane_root)
             result_stem, applied, reason = results[stem]
-            self.assertTrue(applied, f"a large TILTED building on meaningfully sloped terrain must be corrected (reason={reason})")
+            self.assertTrue(applied, f"a large rigid building on meaningfully sloped terrain must be corrected (reason={reason})")
             self.assertEqual(reason, "applied_vertical_shift")
             self.assertNotEqual(result_stem, stem, "a corrected copy should have been written")
-
-            corrected_text = (obj_dir / f"{result_stem}.obj").read_text(encoding="utf-8")
-            self.assertNotIn("TILTED", corrected_text.splitlines(),
-                              "the vertical shift must REPLACE TILTED, not stack with it")
 
             corrected_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{result_stem}.obj"))
             self.assertFalse(
@@ -353,8 +349,8 @@ class TestTerrainFit(unittest.TestCase):
             self._build_box_glb(building_glb, "HugeBuilding", "HugeBuildingTex", half_size=300.0)
             result = mesh_convert.convert(building_glb, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
             stem = result[0].stem
-            self.assertIn("TILTED", result[0].read_text(encoding="utf-8").splitlines(),
-                          "test setup issue: expected this box fixture to convert as TILTED")
+            self.assertNotIn("ATTR_draped", result[0].read_text(encoding="utf-8"),
+                              "test setup issue: expected this box fixture to convert as rigid")
             original_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{stem}.obj"))
 
             results = terrain_fit.get_or_create_fitted_group(obj_dir, [stem], 47.5, 8.5, 0.0, xplane_root)
@@ -362,9 +358,6 @@ class TestTerrainFit(unittest.TestCase):
             self.assertTrue(applied, "an oversized footprint must still be corrected, not left floating")
             self.assertEqual(reason, "applied_vertical_shift")
             self.assertNotEqual(result_stem, stem, "a corrected copy should have been written")
-
-            corrected_text = (obj_dir / f"{result_stem}.obj").read_text(encoding="utf-8")
-            self.assertNotIn("TILTED", corrected_text.splitlines())
 
             corrected_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{result_stem}.obj"))
             roof_mask = original_ir.positions[:, 1] > 3.0
@@ -375,19 +368,24 @@ class TestTerrainFit(unittest.TestCase):
             self.assertAlmostEqual(float(roof_dy.mean()), float(base_dy.mean()), places=5,
                                     msg="an oversized footprint still gets ONE uniform shift, not a partial/rejected correction")
 
-    def test_small_tilted_object_stays_disqualified_and_unmodified(self):
-        """A TILTED object too small for terrain_fit's own size gate (but
-        still above convert()'s separate tiny-object TILT-exemption
-        threshold, so it's genuinely TILTED to begin with -- half_size=4
-        gives an 8m-wide box: over the 3m radius that skips TILTED
-        entirely, under terrain_fit's own 10m-side qualification) must be
-        left completely untouched, TILTED directive included -- confirms
-        the fix only widens eligibility for objects that ALSO pass the
-        existing size qualification, not TILTED objects in general."""
+    def test_small_object_gets_the_shift_too_no_size_gate(self):
+        """CONFIRMED REAL BUG this pins: terrain_fit's own shift used to
+        be gated to objects with a footprint >=300m2/10m-per-side, with
+        X-Plane's own TILTED rotation left as the ONLY correction for
+        anything smaller -- but TILTED can only ever fix a genuine local
+        SLOPE, never a flat-out wrong anchor elevation (a rotation can't
+        move its own origin). That left small/medium objects silently
+        uncorrected for exactly the more common real problem. There is no
+        size gate any more: this 8m-wide box (small enough to have failed
+        the old 10m-per-side gate) on genuinely uneven terrain must now
+        get the exact same ordinary uniform shift as a large building.
+        Bumpy, not linearly-sloped, terrain: a symmetric footprint on a
+        pure linear slope averages to zero by construction (that's a
+        tilt, not an offset -- see _write_bumpy_terrain's own docstring)."""
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             xplane_root = td / "XPlaneRoot"
-            self._write_sloped_terrain(xplane_root, 47, 8, slope_per_post=3000.0)
+            self._write_bumpy_terrain(xplane_root, 47, 8, bump_scale=1500.0)
             obj_dir = td / "objects"
             tex_dir = td / "textures"
             obj_dir.mkdir()
@@ -397,34 +395,42 @@ class TestTerrainFit(unittest.TestCase):
             self._build_box_glb(small_glb, "SmallBox", "SmallBoxTex", half_size=4.0, height=3.0)
             result = mesh_convert.convert(small_glb, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
             stem = result[0].stem
-            self.assertIn("TILTED", result[0].read_text(encoding="utf-8").splitlines(),
-                          "test setup issue: expected this small box fixture to convert as TILTED")
+            self.assertNotIn("ATTR_draped", result[0].read_text(encoding="utf-8"),
+                              "test setup issue: expected this small box fixture to convert as rigid")
+            original_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{stem}.obj"))
 
             results = terrain_fit.get_or_create_fitted_group(obj_dir, [stem], 47.5, 8.5, 0.0, xplane_root)
             result_stem, applied, reason = results[stem]
-            self.assertFalse(applied)
-            self.assertEqual(result_stem, stem, "a disqualified object's original file must be left alone")
+            self.assertTrue(applied, f"a small object on meaningfully sloped terrain must now be corrected too (reason={reason})")
+            self.assertEqual(reason, "applied_vertical_shift")
+            self.assertNotEqual(result_stem, stem, "a corrected copy should have been written")
+
+            corrected_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{result_stem}.obj"))
+            self.assertFalse(np.allclose(original_ir.positions, corrected_ir.positions, atol=1e-6),
+                              "expected the shift to actually move the geometry, not be a no-op")
 
     def test_shared_shift_links_a_disqualified_sibling_at_the_same_anchor(self):
         """Universal fix for: one real-world building instance split into
         two placements from different source paths (confirmed real case:
         LHBP's ATC tower -- an SPB-attached exterior shell + a plain-BGL-
         placed interior, at the same real-world anchor, that never share a
-        model stem so never reach the same terrain_fit group_key). The
-        large shell here qualifies for and gets a real vertical shift; a
-        small companion object at the SAME anchor is, on its own,
-        disqualified (matches test_small_tilted_object_stays_disqualified_
-        and_unmodified). apply_shared_shift_to_group, fed the shell's
-        cached transform via get_cached_transform, must shift the small
-        object by the IDENTICAL amount -- no anchor-delta bookkeeping
-        needed (unlike the rotation this replaced): the shift is a
-        property of the shared real-world anchor, not of either object's
-        own local-frame convention, so it applies directly regardless of
-        the interior's own (different) recenter offset or AGL height."""
+        model stem so never reach the same terrain_fit group_key). Both
+        the shell and the (now, with no size gate) small interior qualify
+        independently, but each samples its OWN (differently-sized)
+        footprint, so on genuinely uneven (not just linearly sloped --
+        see _write_bumpy_terrain) terrain their independently-computed
+        shifts can legitimately differ. apply_shared_shift_to_group, fed
+        the shell's cached transform via get_cached_transform, must
+        override the interior with the shell's EXACT shift value instead
+        -- no anchor-delta bookkeeping needed (unlike the rotation this
+        replaced): the shift is a property of the shared real-world
+        anchor, not of either object's own local-frame convention or its
+        own footprint, so it applies directly regardless of the
+        interior's own (different) recenter offset or AGL height."""
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             xplane_root = td / "XPlaneRoot"
-            self._write_sloped_terrain(xplane_root, 47, 8, slope_per_post=3000.0)
+            self._write_bumpy_terrain(xplane_root, 47, 8, bump_scale=1500.0)
             obj_dir = td / "objects"
             tex_dir = td / "textures"
             obj_dir.mkdir()
@@ -452,11 +458,14 @@ class TestTerrainFit(unittest.TestCase):
             _, shell_applied, shell_reason = shell_results[shell_stem]
             self.assertTrue(shell_applied, f"test setup issue: expected the shell to qualify (reason={shell_reason})")
 
-            # The interior, evaluated on its own, is still disqualified --
-            # confirms the "problem" side of this scenario still holds.
+            # The interior, evaluated on its own, ALSO qualifies now (no
+            # size gate) -- but its own independently-sampled footprint
+            # gives it a genuinely different shift value than the shell's,
+            # setting up the real point of this test: explicit linking
+            # below must override that with the shell's exact value.
             interior_results_alone = terrain_fit.get_or_create_fitted_group(
                 obj_dir, [interior_stem], anchor_lat, anchor_lon, anchor_hdg, xplane_root)
-            self.assertFalse(interior_results_alone[interior_stem][1])
+            self.assertTrue(interior_results_alone[interior_stem][1], "test setup issue: expected the interior to also qualify alone")
 
             transform = terrain_fit.get_cached_transform(shell_group_key)
             self.assertIsNotNone(transform)
@@ -470,9 +479,9 @@ class TestTerrainFit(unittest.TestCase):
 
             linked_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{linked_stem}.obj"))
             # X/Z entirely unchanged, every vertex's Y moved by the exact
-            # shift value the shell got -- proves it was linked, not
-            # independently re-derived (which would fail: its own
-            # footprint doesn't qualify).
+            # shift value the shell got -- proves it was linked to the
+            # shell's own value, overriding whatever the interior's own
+            # independent computation (checked above) would have used.
             np.testing.assert_allclose(linked_ir.positions[:, [0, 2]], original_interior_positions[:, [0, 2]], atol=1e-9)
             dy = linked_ir.positions[:, 1] - original_interior_positions[:, 1]
             np.testing.assert_allclose(dy, transform["vertical_shift"], atol=1e-6,
@@ -496,34 +505,6 @@ class TestTerrainFit(unittest.TestCase):
 
     def test_get_cached_transform_returns_none_for_an_unprocessed_group(self):
         self.assertIsNone(terrain_fit.get_cached_transform((("nonexistent_stem",), 1.0, 2.0, 3.0, False)))
-
-    def test_get_cached_transform_returns_none_for_a_too_small_to_qualify_group(self):
-        """The too-small-footprint gate (dx/dz/area under threshold)
-        returns before any terrain sampling happens at all -- there's no
-        rigid_rotation decision to cache either way, so the group_key
-        simply never appears in the transform cache (as opposed to the
-        oversized-footprint case, which DOES reach the cache write with
-        rigid_rotation=None -- see test_shared_rotation_is_a_noop_when_
-        the_source_group_never_tilted)."""
-        with tempfile.TemporaryDirectory() as td:
-            td = Path(td)
-            xplane_root = td / "XPlaneRoot"
-            self._write_sloped_terrain(xplane_root, 47, 8, slope_per_post=3000.0)
-            obj_dir = td / "objects"
-            tex_dir = td / "textures"
-            obj_dir.mkdir()
-            tex_dir.mkdir()
-
-            small_glb = td / "small_box.glb"
-            self._build_box_glb(small_glb, "SmallBox2", "SmallBox2Tex", half_size=4.0, height=3.0)
-            result = mesh_convert.convert(small_glb, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
-            stem = result[0].stem
-
-            anchor_lat, anchor_lon, anchor_hdg = 47.5, 8.5, 0.0
-            group_key = (tuple(sorted([stem])), round(anchor_lat, 6), round(anchor_lon, 6), round(anchor_hdg, 2), False)
-            terrain_fit.get_or_create_fitted_group(obj_dir, [stem], anchor_lat, anchor_lon, anchor_hdg, xplane_root)
-
-            self.assertIsNone(terrain_fit.get_cached_transform(group_key))
 
     def test_qualifying_group_on_gentle_real_slope_gets_the_ordinary_shift(self):
         """A plain integration check that a qualifying group on genuinely
@@ -661,24 +642,6 @@ class TestTerrainFit(unittest.TestCase):
             self.assertNotAlmostEqual(near_corner_y, far_corner_y, places=1,
                                        msg="two far-apart clusters on genuinely different real terrain must not "
                                            "come out with the same (grid-blended) correction")
-
-    def test_too_small_group_is_disqualified(self):
-        with tempfile.TemporaryDirectory() as td:
-            td = Path(td)
-            xplane_root = td / "XPlaneRoot"
-            self._write_sloped_terrain(xplane_root, 47, 8, slope_per_post=3000.0)
-            obj_dir = td / "objects"
-            tex_dir = td / "textures"
-            obj_dir.mkdir()
-            tex_dir.mkdir()
-
-            small_glb = td / "small.glb"
-            self._build_glb(small_glb, "Small", "SmallTex", -1, 1, -1, 1)
-            result = mesh_convert.convert(small_glb, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
-            stem = result[0].stem
-
-            results = terrain_fit.get_or_create_fitted_group(obj_dir, [stem], 47.5, 8.5, 0.0, xplane_root)
-            self.assertEqual(results[stem], (stem, False, "disqualified"))
 
     def test_no_xplane_root_skips_gracefully(self):
         with tempfile.TemporaryDirectory() as td:

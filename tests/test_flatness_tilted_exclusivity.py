@@ -1,13 +1,16 @@
 """
-Pins the empirically-discovered invariant: TILTED and per-node ATTR_draped
-must never coexist in one file. Confirmed against real converted taxi
-signs -- mixing them (a TILTED file, correctly TILTED since the file's
-post/frame geometry makes it well under the file-wide flat threshold,
-that ALSO had one of its own nodes independently qualify as flat/draped
-per-node) made the object disappear entirely in X-Plane, not just
-partially misrender.
+mesh_convert.convert() no longer emits TILTED at all (terrain_fit.py's
+uniform vertical shift replaces it for every rigid object regardless of
+size -- see terrain_fit.py's own module docstring for why a rotation
+could never fix the more common anchor-elevation-offset case). This file
+used to pin an empirically-discovered invariant -- TILTED and per-node
+ATTR_draped must never coexist in one file, confirmed against real
+converted taxi signs where mixing them made the object disappear
+entirely in X-Plane -- which is now trivially true by construction (no
+code path writes TILTED at all), so that specific test was removed.
 
-Also pins the node-level flatness threshold's asymmetric-risk rationale:
+What's still pinned here is the node-level flatness threshold's
+asymmetric-risk rationale:
 a node wrongly classified flat/draped costs nothing (ATTR_draped
 re-projects onto terrain, discarding authored Y, per X-Plane's own spec),
 while a node wrongly left rigid visibly floats/sinks on sloped terrain --
@@ -40,94 +43,17 @@ def _box_walls_and_roof(hw=0.05):
 
 
 class TestFlatnessTiltedExclusivity(unittest.TestCase):
-    def _build_sign_glb(self):
-        """A realistic gantry-style taxi sign: a large, near-perfectly-flat
-        PANEL (one material/node) + a genuinely 3-D post/frame (a separate
-        material/node) -- the file-wide fraction stays well under 0.98
-        (correctly TILTED), while the panel node ALONE would clear even a
-        strict per-node threshold on its own.
-
-        Deliberately sized with a horizontal radius ABOVE
-        convert()'s own tiny-object TILT exemption threshold (3m) --
-        below that, a real small taxi sign now legitimately skips TILTED
-        entirely (see convert.py's own comment), which would make this
-        fixture no longer exercise the TILTED+draped exclusivity path
-        this test exists to pin at all."""
-        b = GltfBuilder()
-        tex = b.add_image_data_uri((200, 200, 200, 255))
-        texi = b.add_texture(tex)
-        panel_mat = b.add_material("PanelMat", base_color_texture_index=texi)
-        post_mat = b.add_material("PostMat", base_color_texture_index=texi)
-
-        panel_verts, panel_tris = [], []
-        for i in range(3):
-            base = len(panel_verts)
-            x0 = -3.6 + i * 2.4
-            panel_verts += [(x0, 2.0, 0.0), (x0 + 2.1, 2.0, 0.0), (x0 + 2.1, 2.6, 0.0), (x0, 2.6, 0.0)]
-            panel_tris += [(base, base + 1, base + 2), (base, base + 2, base + 3)]
-        panel_indices = [i for tri in panel_tris for i in tri]
-        panel_mesh = b.add_mesh(
-            panel_verts, panel_indices,
-            normals=[(0.0, 0.0, -1.0)] * len(panel_verts),
-            uvs=[(0.0, 0.0)] * len(panel_verts),
-            material_index=panel_mat,
-        )
-
-        post_verts, post_tris = _box_walls_and_roof()
-        post_indices = [i for tri in post_tris for i in tri]
-        post_mesh = b.add_mesh(
-            post_verts, post_indices,
-            normals=[(1.0, 0.0, 0.0)] * len(post_verts),
-            uvs=[(0.0, 0.0)] * len(post_verts),
-            material_index=post_mat,
-        )
-
-        b.add_node(mesh_index=panel_mesh, name="SignPanel")
-        b.add_node(mesh_index=post_mesh, name="SignPost")
-        return b.build()
-
-    def test_tilted_and_draped_never_coexist_in_one_file(self):
-        with tempfile.TemporaryDirectory() as td:
-            td = Path(td)
-            glb_path = td / "taxi_sign.glb"
-            glb_path.write_bytes(self._build_sign_glb())
-            obj_dir = td / "objects"
-            tex_dir = td / "textures"
-            obj_dir.mkdir()
-            tex_dir.mkdir()
-
-            result = mesh_convert.convert(glb_path, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
-            self.assertTrue(result)
-
-            any_tilted = False
-            for p in result:
-                text = p.read_text(encoding="utf-8")
-                is_tilted = "TILTED" in text.splitlines()
-                has_draped = "ATTR_draped" in text
-                any_tilted = any_tilted or is_tilted
-                self.assertFalse(
-                    is_tilted and has_draped,
-                    f"{p.name} has BOTH TILTED and ATTR_draped -- the exact combination "
-                    f"that made real converted taxi signs disappear in X-Plane"
-                )
-            self.assertTrue(any_tilted, "test setup issue: expected this fixture's file-wide fraction to trigger TILTED")
-
-    def test_flat_node_inside_an_otherwise_tilted_file_still_drapes(self):
+    def test_flat_node_inside_an_otherwise_rigid_file_still_drapes(self):
         """Flatness/draping classification is FILE-WIDE (see MatBuilder's
         own is_draped formula) -- a material literally named "decal" is
         the one deliberate exception, via the separate is_decal check
         (`"decal" in raw_mat_name.lower()`), always draped regardless of
         the file-wide verdict. This building+decal fixture exercises
         exactly that combination: the decal-named material must come out
-        as its own separate, draped (ATTR_draped, no TILTED) object, while
-        the building's own rigid geometry still correctly gets TILTED --
-        and, critically, NEITHER ends up with both markers on the same
-        file (the exact combination that made a real converted object
-        disappear entirely, see the test above). This is the one
-        real-world case where a single file can still carry both a TILTED
-        and a draped builder side by side; the write site's own
-        "file_apply_tilted and not builder_is_draped" guard (not just
-        "file_apply_tilted") is what keeps it safe."""
+        as its own separate, draped (ATTR_draped) object, while the
+        building's own rigid geometry stays rigid (not draped) -- the one
+        real-world case where a single glTF file's own nodes can still
+        split into both a rigid and a draped output file side by side."""
         b = GltfBuilder()
         tex = b.add_image_data_uri((150, 150, 150, 255))
         texi = b.add_texture(tex)
@@ -176,7 +102,6 @@ class TestFlatnessTiltedExclusivity(unittest.TestCase):
             building_text = building_obj.read_text(encoding="utf-8")
             decal_text = decal_obj.read_text(encoding="utf-8")
 
-            self.assertIn("TILTED", building_text.splitlines(), "the rigid building must still get TILTED")
             self.assertNotIn("ATTR_draped", building_text, "the rigid building must not be draped")
 
             self.assertIn("ATTR_draped", decal_text, "the individually-flat decal node must now drape")
@@ -453,7 +378,6 @@ class TestFlatnessTiltedExclusivity(unittest.TestCase):
 
             building_obj = next(p for p in result if "BuildingMat" in p.name)
             building_text = building_obj.read_text(encoding="utf-8")
-            self.assertIn("TILTED", building_text.splitlines(), "the rigid building must still get TILTED")
             self.assertNotIn("ATTR_draped", building_text, "the rigid building must not be draped")
 
             paver_matches = [p for p in result if "PaverMat" in p.name]
@@ -491,7 +415,7 @@ class TestFlatnessTiltedExclusivity(unittest.TestCase):
 
             self.assertNotIn("ATTR_draped", roof_text,
                              "an individually-flat but elevated material must not drape just because it's flat")
-            self.assertIn("TILTED", roof_text.splitlines(), "it must stay rigid instead, and stay present in the output")
+            self.assertTrue(roof_text.strip(), "it must stay rigid instead, and stay present in the output")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 """
-Large-object terrain-fit workaround.
+Rigid-object terrain-fit workaround.
 
 A rigid MSFS building mesh is authored assuming flat ground under its
 whole footprint (X-Plane's OBJECT placement only gives it one drape
@@ -35,10 +35,10 @@ CORRECTED PER MODEL, NOT PER SUB-OBJECT: mesh_convert's convert() splits
 one glTF model into several .obj files (one per material/animated node,
 plus a "_lights" one). get_or_create_fitted_group() takes every sibling
 stem from one placement and computes ONE shared footprint bbox to decide
-whether the group as a whole qualifies (large enough, terrain data
-available, not AGL-mounted -- AGL placements already carry an explicit
-runtime elevation via DSF's AGL pool, so warping local Y on top would
-double up rather than correct anything).
+whether the group as a whole qualifies (terrain data available, not
+AGL-mounted -- AGL placements already carry an explicit runtime
+elevation via DSF's AGL pool, so warping local Y on top would double up
+rather than correct anything).
 
 Consumes each sibling's .meshir.pkl sidecar (mesh_convert.mesh_ir) --
 real float64 numpy arrays from convert()'s own in-memory data, not a
@@ -59,11 +59,20 @@ whole rigid object to match it): rotation only corrects a genuine TILT,
 never a uniform height-offset error -- a rotation around the object's
 own origin can't move that origin itself, so if the anchor's own real
 elevation differs from what the object assumes, every part of it stays
-wrong by that same amount no matter how well the tilt is fit. TILTING is
-left to X-Plane's own runtime TILTED directive, reserved (by mesh_convert
-convert()'s own tiny-object exemption) for objects small enough that a
-single sampled point is representative -- everything that reaches this
-module (past the size-qualifying gate below) gets the shift instead.
+wrong by that same amount no matter how well the tilt is fit.
+
+No size gate: mesh_convert.convert() used to leave small/medium objects
+to X-Plane's own runtime TILTED directive instead of this module's
+shift, on the theory that a small footprint's single sampled point is
+"representative enough" for a rotation to work with. CONFIRMED REAL
+REGRESSION: TILTED is a rotation, so it inherits the same "can't fix an
+anchor-offset" blind spot regardless of object size -- an object whose
+own anchor elevation just doesn't match X-Plane's real terrain sat
+wrong at ANY size, and TILTED being the only correction for anything
+under the old ~300m2 gate meant that case silently never got fixed for
+most objects. mesh_convert.convert() no longer emits TILTED at all;
+every rigid group that reaches this module gets the shift instead,
+regardless of footprint size.
 
 The shift itself is a ROBUST estimate, not a single point: several real
 terrain samples are taken across the group's shared footprint (the same
@@ -90,8 +99,6 @@ import terrain_dem
 from geo_transform import local_offset_to_latlon
 from mesh_convert import mesh_ir
 
-_AREA_THRESHOLD_M2 = 300.0
-_MIN_SIDE_M = 10.0
 _NOISE_FLOOR_M = 0.10  # skip a group whose sampled corners all correct by less than this
 _SHIFT_OUTLIER_MAD_K = 3.0  # modified-z-score cutoff (see _robust_vertical_shift) for rejecting a spiky sample
 
@@ -278,12 +285,6 @@ def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_d
     x_max = max(float(loaded[s].positions[:, 0].max()) for s in geo_stems)
     z_min = min(float(loaded[s].positions[:, 2].min()) for s in geo_stems)
     z_max = max(float(loaded[s].positions[:, 2].max()) for s in geo_stems)
-    dx = x_max - x_min
-    dz = z_max - z_min
-    if dx < _MIN_SIDE_M or dz < _MIN_SIDE_M or dx * dz < _AREA_THRESHOLD_M2:
-        result = {stem: (stem, False, "disqualified") for stem in obj_stems}
-        _group_cache[group_key] = result
-        return result
 
     origin_elev = terrain_dem.get_elevation(xplane_root, base_lat, base_lon)
     if origin_elev is None:

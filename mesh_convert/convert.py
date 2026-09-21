@@ -1895,31 +1895,28 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
     file_is_flat_only = file_flat_fraction >= flat_fraction_threshold and file_reference_height is not None
 
     # TILTED rotates the WHOLE rigid object around its local origin to
-    # match the terrain normal X-Plane samples at the placement point.
-    # There's no way to sample the real compiled DSF terrain mesh at
-    # conversion time for a genuinely better multi-point tilt, so X-Plane's
-    # own single-point TILTED is applied uniformly to every non-flat file.
-    file_apply_tilted = not file_is_flat_only
-
-    # Gated off only for genuinely TINY objects (a taxi sign: a flat panel
-    # a meter or so wide plus a thin post) -- a footprint this small can't
-    # have meaningfully different real terrain slope across it, so there's
-    # nothing for TILTED to correctly compensate for, while a small/thin
-    # object is far more visually sensitive to a wrong single-point-
-    # sampled rotation than a large one (edge-on to the camera reads as
-    # "gone"). Kept conservative (3m) to stay out of the medium/large
-    # range, where gating TILTED off entirely (no replacement correction)
-    # was tried and reverted -- wide buildings floated on one edge and
-    # sank on the other.
-    _TINY_OBJECT_NO_TILT_RADIUS_M = 3.0
-    if file_apply_tilted and file_max_horizontal_radius < _TINY_OBJECT_NO_TILT_RADIUS_M:
-        logger.debug(
-            f"{glb_path.name}: max horizontal radius {file_max_horizontal_radius:.2f}m is below the "
-            f"tiny-object threshold -- skipping TILTED (real terrain slope can't meaningfully vary "
-            f"across a footprint this small, and a wrong single-point-sampled rotation is more "
-            f"visually damaging to a small/thin object than leaving it unrotated)"
-        )
-        file_apply_tilted = False
+    # match the terrain normal X-Plane samples at ITS SINGLE placement
+    # point -- it can only ever correct a genuine local SLOPE, never an
+    # anchor-elevation offset (a rotation can't move its own origin, so
+    # if the anchor's own authored elevation just doesn't match X-Plane's
+    # real terrain there, every part of the object stays wrong by that
+    # same amount no matter how well the single-point-sampled tilt is
+    # fit). That's exactly the more common real problem (confirmed: an
+    # un-rotated object sitting at a flat-out wrong height, not a tilted
+    # one) and terrain_fit.py's own uniform vertical SHIFT already exists
+    # to fix it correctly, with real multi-point sampling + outlier
+    # rejection -- CONFIRMED bug this replaces: the shift used to be
+    # gated to only large objects (>=300m2), leaving TILTED as the ONLY
+    # correction for anything smaller, silently failing on exactly the
+    # anchor-offset case it can't fix. TILTED is never written anywhere
+    # now; terrain_fit.py's shift applies to every qualifying rigid group
+    # regardless of size instead (see its own module docstring).
+    #
+    # file_is_rigid is still needed on its own: it also gates horizontal
+    # re-centering (a rigid/non-draped-only step -- draped multi-layer
+    # stacks must NOT be independently re-centered or previously-
+    # coincident layers visibly separate), unrelated to TILTED itself.
+    file_is_rigid = not file_is_flat_only
 
     if file_is_flat_only:
         implausible_elevation_limit = 100.0
@@ -2888,10 +2885,11 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
 
     # Re-center the WHOLE model (every builder + light) around its own XZ
     # footprint center, and lift it so its lowest point sits at Y=0 if any
-    # vertex is below that. Centering the pivot TILTED rotates the whole
-    # rigid object around also minimizes the max lever arm (and therefore
-    # worst-case error) across the object, instead of leaving the pivot
-    # wherever the source export's arbitrary local origin was.
+    # vertex is below that -- a sensible, predictable local origin instead
+    # of leaving the pivot wherever the source export's arbitrary local
+    # origin was, independent of whatever terrain_fit.py's uniform shift
+    # later does with the whole rigid object (a pure translation, so it
+    # doesn't care where the local origin sits).
     #
     # Must NOT double-move rotation-animated sub-objects: their vertices
     # are already stored PIVOT-relative (see anim_pivot handling above),
@@ -3000,16 +2998,14 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
         y_lift = -min_y if abs(min_y) >= 0.01 else 0.0
         recenter_agl_delta = -y_lift
 
-        # Horizontal (XZ) re-centering only for genuinely rigid/TILTED-
-        # eligible files -- draped/flat files are very often several
-        # separate MSFS objects (base fill + paint-stripe overlay + stain
-        # decal) meant to sit exactly coincident, originally sharing one
-        # BGL placement lat/lon. Re-centering each independently around
-        # its OWN bbox would shift each one's anchor by a different
-        # amount and visibly separate previously-aligned layers; draped
-        # geometry is never TILTED-rotated anyway, so skipping this for
-        # draped/flat files trades away no upside.
-        if file_apply_tilted:
+        # Horizontal (XZ) re-centering only for genuinely rigid files --
+        # draped/flat files are very often several separate MSFS objects
+        # (base fill + paint-stripe overlay + stain decal) meant to sit
+        # exactly coincident, originally sharing one BGL placement
+        # lat/lon. Re-centering each independently around its OWN bbox
+        # would shift each one's anchor by a different amount and
+        # visibly separate previously-aligned layers.
+        if file_is_rigid:
             recenter_x = float(np.median(np.concatenate(_median_x_parts)))
             recenter_z = float(np.median(np.concatenate(_median_z_parts)))
 
@@ -3158,28 +3154,6 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
 
         with obj_path.open("w", encoding="utf-8") as f:
             f.write("I\n800\nOBJ\n\n")
-
-            if file_apply_tilted and not builder_is_draped:
-                # Tilts the whole placed object so its local Y axis follows
-                # the terrain normal X-Plane samples at its placement point,
-                # instead of always pointing straight up against gravity --
-                # keeps it flush with sloped runway/apron terrain instead of
-                # floating above it or clipping into it. Applied uniformly to
-                # every non-flat, non-draped builder regardless of size,
-                # INCLUDING large objects (buildings, the terminal, a
-                # control tower) -- see the file_apply_tilted decision above
-                # for why size-based gating was tried and reverted.
-                #
-                # "and not builder_is_draped" (not just file_apply_tilted
-                # alone, as this used to read): a builder can now be draped
-                # even inside an otherwise file_apply_tilted file (see
-                # node_is_flat_only's own docstring for why) -- builder_key
-                # already guarantees a draped builder's own file never
-                # shares a builder with any non-flat sibling, but writing
-                # TILTED onto ITS file too here would still recreate the
-                # exact TILTED+ATTR_draped-in-one-file combination confirmed
-                # to make objects disappear entirely in X-Plane.
-                f.write("TILTED\n")
 
             f.write(f"TEXTURE ../textures/{builder.texture_name}\n")
             if builder.normal_texture_name:
@@ -3339,15 +3313,13 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                 uvs=np.array(builder.uvs, dtype=np.float64) if builder.uvs else np.zeros((0, 2)),
                 indices=np.array(flat_indices, dtype=np.int64),
                 texture=(f"../textures/{builder.texture_name}" if builder.texture_name else None),
-                # Matches the OBJ8-write site's own scoping just above (see
-                # its comment for why "and not builder_is_draped" is
-                # required now that a builder can be draped even inside an
-                # otherwise file_apply_tilted file): the MeshIR sidecar's
-                # own tilted flag has to agree with what actually got
-                # written to the .obj, since terrain_fit.py reads THIS
-                # field (not file_apply_tilted) to decide whether a sibling
-                # gets the rigid rotation or per-vertex warp treatment.
-                tilted=(file_apply_tilted and not builder_is_draped),
+                # TILTED is never written (see file_is_rigid's own
+                # comment above) -- terrain_fit.py's uniform vertical
+                # shift replaces it for every qualifying rigid group
+                # regardless of size, draped siblings get the per-vertex
+                # warp, and this field just has to agree with what
+                # actually got written to the .obj (nothing).
+                tilted=False,
                 draped=builder_is_draped,
                 draped_layer_offset=(draped_layer_offsets.get(builder_key) if builder_is_draped else None),
                 double_sided=builder.double_sided,
@@ -3392,8 +3364,6 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
         lights_obj_path = objects_dir / f"{model_name}_lights.obj"
         with lights_obj_path.open("w", encoding="utf-8") as f:
             f.write("I\n800\nOBJ\n\n")
-            if file_apply_tilted:
-                f.write("TILTED\n")
             f.write("TEXTURE \n\n")
             f.write("POINT_COUNTS 0 0 0 0\n\n")
             light_ir_entries = []
@@ -3572,7 +3542,7 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
         # LIGHT_SPILL_CUSTOM positions consistently with the rest of the
         # group) -- draped_merge.py never touches this file at all (it has
         # no ATTR_draped, so _parse_draped_candidate already excludes it).
-        lights_ir = mesh_ir_module.MeshIR(name=lights_obj_path.stem, tilted=file_apply_tilted, lights=light_ir_entries)
+        lights_ir = mesh_ir_module.MeshIR(name=lights_obj_path.stem, tilted=False, lights=light_ir_entries)
         mesh_ir_module.save(lights_ir, mesh_ir_module.sidecar_path_for(lights_obj_path))
 
     with _EXPORT_LOCK:

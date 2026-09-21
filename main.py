@@ -2475,7 +2475,7 @@ class ModularPythonConverterApp:
                     generated_stems = converted_stems_map[original_stem]
                     _footprint_exclusion_candidates.append((generated_stems, abs_lat, abs_lon, p["hdg"]))
 
-                    # Large-building terrain fit: a rigid mesh assumes flat
+                    # Rigid-object terrain fit: a rigid mesh assumes flat
                     # ground under its whole footprint, but real X-Plane
                     # terrain often isn't (see terrain_fit.py). Computed ONCE
                     # for the whole group of sibling .obj files one model+
@@ -2519,7 +2519,7 @@ class ModularPythonConverterApp:
                                 warned_unavailable_this_group = True
                                 terrain_fit_unavailable_warned = True
                                 self.log(
-                                    "Large-building terrain fit: real X-Plane terrain data isn't "
+                                    "Rigid-object terrain fit: real X-Plane terrain data isn't "
                                     "available for this airport (no X-Plane install found, no default "
                                     "elevation tile for this area, or py7zr isn't installed -- "
                                     "'pip install py7zr' to enable it). Large buildings will keep their "
@@ -2575,7 +2575,7 @@ class ModularPythonConverterApp:
                     if len(generated_stems) >= _COMPLEX_MODEL_STEM_THRESHOLD and not group_any_applied and complex_model_log_count < _COMPLEX_MODEL_LOG_LIMIT:
                         complex_model_log_count += 1
                         self.log(
-                            f"Large-building terrain fit: '{original_stem}' ({len(generated_stems)} "
+                            f"Rigid-object terrain fit: '{original_stem}' ({len(generated_stems)} "
                             f"sub-objects) was NOT corrected -- {sorted(group_reasons)}", "info")
                 else:
                     lib_path = resolve_library_substitution(
@@ -2681,9 +2681,9 @@ class ModularPythonConverterApp:
             if agl_placement_count:
                 self.log(f"{agl_placement_count} placement(s) use native DSF AGL height placement to fix floating/sunken SPB-attached or upper-floor objects.", "info")
             if terrain_fit_applied_count:
-                self.log(f"{terrain_fit_applied_count} large-building placement(s) warped against real sampled X-Plane terrain to fix floating/sunken corners.", "info")
+                self.log(f"{terrain_fit_applied_count} rigid placement(s) warped against real sampled X-Plane terrain to fix floating/sunken corners.", "info")
             if terrain_fit_reason_counts:
-                self.log(f"Large-building terrain fit outcomes (by sub-object): {dict(sorted(terrain_fit_reason_counts.items()))}", "info")
+                self.log(f"Rigid-object terrain fit outcomes (by sub-object): {dict(sorted(terrain_fit_reason_counts.items()))}", "info")
             if complex_model_log_count >= _COMPLEX_MODEL_LOG_LIMIT:
                 self.log(f"(complex-model terrain-fit logging capped at {_COMPLEX_MODEL_LOG_LIMIT} -- more were skipped)", "info")
 
