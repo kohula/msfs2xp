@@ -427,5 +427,101 @@ class TestReplaceTaxiNetworkAndStarts(unittest.TestCase):
         self.assertIn("Start 2", out_text, "the second, unmatched native start must fall back to the placeholder")
 
 
+class TestReplacePavementWithNative(unittest.TestCase):
+    """apt_dat.replace_pavement_with_native -- CONFIRMED REAL BUG this
+    fixes: reposition_runways only shifts the runway CENTERLINE (row 100)
+    to the native MSFS position; the pavement boundary (110-116) was left
+    at the stock block's own real-world position, so X-Plane's runtime
+    terrain-flattening (driven by the pavement boundary, not the runway
+    centerline alone) didn't match where this package's own converted
+    draped-mesh pavement actually sits -- reported in-sim as "the runway
+    is floating"."""
+
+    def test_no_aprons_leaves_block_untouched(self):
+        block = ["100 45.00 1 0 0.15 0 0 0 09 47.5 8.5 0 0 3 0 0 0 27 47.51 8.51 0 0 3 0 0 0", "99"]
+        layout = airport_layout.AirportLayout()
+        self.assertEqual(apt_dat.replace_pavement_with_native(block, layout), block)
+
+    def test_strips_stock_pavement_and_appends_native_polygon(self):
+        block = [
+            "100 45.00 1 0 0.15 0 0 0 09 47.5 8.5 0 0 3 0 0 0 27 47.51 8.51 0 0 3 0 0 0",
+            "110 1 0.25 182.0",
+            "111 47.500 8.500",
+            "111 47.501 8.500",
+            "111 47.501 8.501",
+            "113 47.500 8.501",
+            "99",
+        ]
+        layout = airport_layout.AirportLayout(aprons=[
+            airport_layout.Polygon(vertices=[(47.600, 8.600), (47.601, 8.600), (47.601, 8.601), (47.600, 8.601)]),
+        ])
+        out = apt_dat.replace_pavement_with_native(block, layout)
+        out_text = "\n".join(out)
+
+        # The runway row is untouched (native pavement rows are appended
+        # after the full pass-through, same as replace_taxi_network_and_
+        # starts' own convention -- write_apt_dat adds the real "99" file
+        # trailer separately afterward, so position here doesn't matter).
+        self.assertTrue(out[0].startswith("100 "))
+        self.assertIn("99", out)
+        # The stock boundary's own coordinates are gone.
+        self.assertNotIn("47.500 8.500", out_text)
+        # The native polygon's own coordinates are present instead.
+        self.assertIn("111 47.60000000 8.60000000", out_text)
+        self.assertIn("111 47.60100000 8.60000000", out_text)
+        self.assertIn("111 47.60100000 8.60100000", out_text)
+        # Last vertex closes the loop as row 113, not another 111.
+        self.assertIn("113 47.60000000 8.60100000", out_text)
+
+    def test_surface_is_forced_transparent(self):
+        layout = airport_layout.AirportLayout(aprons=[
+            airport_layout.Polygon(vertices=[(47.6, 8.6), (47.601, 8.6), (47.601, 8.601)]),
+        ])
+        out = apt_dat.replace_pavement_with_native(["99"], layout)
+        pavement_row = next(line for line in out if line.startswith("110 "))
+        self.assertEqual(pavement_row.split()[1], "15", "must use surface type 15 (Transparent)")
+
+    def test_one_row_110_per_apron_polygon(self):
+        layout = airport_layout.AirportLayout(aprons=[
+            airport_layout.Polygon(vertices=[(47.6, 8.6), (47.601, 8.6), (47.601, 8.601)]),
+            airport_layout.Polygon(vertices=[(47.7, 8.7), (47.701, 8.7), (47.701, 8.701)]),
+        ])
+        out = apt_dat.replace_pavement_with_native(["99"], layout)
+        self.assertEqual(sum(1 for line in out if line.startswith("110 ")), 2)
+
+    def test_degenerate_polygon_under_3_vertices_is_skipped(self):
+        layout = airport_layout.AirportLayout(aprons=[
+            airport_layout.Polygon(vertices=[(47.6, 8.6), (47.601, 8.6)]),
+        ])
+        out = apt_dat.replace_pavement_with_native(["99"], layout)
+        self.assertEqual(out, ["99"])
+
+    def test_non_pavement_rows_between_stock_boundary_blocks_are_preserved(self):
+        """Multiple stock pavement blocks (separate 110+node groups) can
+        be interleaved with unrelated rows (taxiway signs, lights) in a
+        real apt.dat -- every 110-116 block must be stripped, everything
+        else must survive untouched, regardless of how many there are or
+        what's between them."""
+        block = [
+            "110 1 0.25 0.0",
+            "111 47.500 8.500",
+            "111 47.501 8.500",
+            "113 47.501 8.501",
+            "20 47.501 8.500 0 0 5 0 A1",
+            "110 2 0.25 90.0",
+            "111 47.600 8.600",
+            "111 47.601 8.600",
+            "113 47.601 8.601",
+            "99",
+        ]
+        layout = airport_layout.AirportLayout(aprons=[
+            airport_layout.Polygon(vertices=[(48.0, 9.0), (48.001, 9.0), (48.001, 9.001)]),
+        ])
+        out = apt_dat.replace_pavement_with_native(block, layout)
+        self.assertIn("20 47.501 8.500 0 0 5 0 A1", out, "an unrelated row between two stock pavement blocks must survive")
+        self.assertEqual(sum(1 for line in out if line.startswith("110 ")), 1, "both stock pavement blocks must be stripped")
+        self.assertIn("99", out)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -11,14 +11,20 @@ Base layer: the real-world airport's block from the user's installed
 X-Plane "Global Airports" pack, found by nearest-reference-point match
 (more robust than decoding an ICAO string out of the BGL).
 
-On top of that, `reposition_runways` and `replace_taxi_network_and_starts`
-overlay a NATIVE layout decoded from the MSFS package's own BGL Airport
-record (see airport_layout.py) where available: runway positions shifted
-onto this package's coordinates, and the ATC taxi-route network + ramp
-starts replaced with ones built from this airport's own taxiways/aprons.
-Pavement/painted-line/lighting rows stay on the stock block -- this
-project's draped-mesh pipeline already renders the real baked pavement
-art, and there's no native replacement yet for the stock lighting fields.
+On top of that, `reposition_runways`, `replace_pavement_with_native` and
+`replace_taxi_network_and_starts` overlay a NATIVE layout decoded from
+the MSFS package's own BGL Airport record (see airport_layout.py) where
+available: runway positions shifted onto this package's coordinates,
+pavement/apron boundary rows replaced outright (so X-Plane's runtime
+terrain-flattening matches where the native layout actually is, not the
+stock real-world survey position -- a custom-rebuilt payware airport can
+legitimately differ from that by more than a trivial amount), and the
+ATC taxi-route network + ramp starts replaced with ones built from this
+airport's own taxiways/aprons.
+Painted-line/lighting rows stay on the stock block -- this project's
+draped-mesh pipeline already renders the real baked pavement art and
+painted markings, and there's no native replacement yet for the stock
+lighting fields.
 """
 
 import math
@@ -511,6 +517,72 @@ def reposition_runways(block_lines, native_runway_centers):
     return out
 
 
+def replace_pavement_with_native(block_lines, layout):
+    """Strips the stock block's own pavement/apron boundary rows (110 +
+    its 111-116 node rows) and replaces them with ones built from this
+    package's own MSFS apron layout (airport_layout.py's native BGL
+    decode), so X-Plane's runtime terrain-flattening -- driven by these
+    boundary rows, not by the runway centerline alone -- matches where
+    this package's own converted draped-mesh pavement actually sits.
+
+    CONFIRMED REAL BUG this fixes: reposition_runways only shifts the
+    runway CENTERLINE (row 100) to the native position; the surrounding
+    pavement boundary was left at the stock block's own real-world
+    position. A custom-rebuilt payware airport's own layout can
+    legitimately differ from the real-world survey data by more than a
+    trivial amount, so X-Plane was flattening terrain around the OLD
+    (stock) boundary while this package's own MSFS-derived visual
+    pavement sits at the NEW (native) one -- reported in-sim as "the
+    runway is floating" (and per the user, "I don't want the native
+    X-Plane [pavement] ... however the MSFS texturized ones [should be
+    what's] exported").
+
+    Each native apron polygon becomes one row 110 (surface forced
+    transparent, matching anonymize_visual_pavement's own convention --
+    this package's own draped mesh is what should actually be visible,
+    same as the stock block's own pavement already gets anonymized to)
+    followed by one row 111 per vertex except the last, which closes the
+    loop as row 113. No curve/bezier data is available from the native
+    decode, so every edge is a straight segment (111/113 only, never
+    112/114). Runway (100), taxi network (1200s), ramp starts (1300s)
+    and painted-line (120) rows are untouched -- see reposition_runways/
+    replace_taxi_network_and_starts for those."""
+    if not layout.aprons:
+        return block_lines
+
+    out = []
+    i = 0
+    n = len(block_lines)
+    while i < n:
+        line = block_lines[i]
+        parts = line.split()
+        code = parts[0] if parts else ""
+        if code == "110":
+            j = i + 1
+            while j < n:
+                nxt_parts = block_lines[j].split()
+                if nxt_parts and nxt_parts[0] in _BOUNDARY_NODE_ROW_CODES:
+                    j += 1
+                    continue
+                break
+            i = j
+            continue
+        out.append(line)
+        i += 1
+
+    for poly in layout.aprons:
+        verts = poly.vertices
+        if len(verts) < 3:
+            continue
+        out.append(f"110 {_TRANSPARENT_SURFACE_CODE} 0.25 0.0")
+        for lat, lon in verts[:-1]:
+            out.append(f"111 {lat:.8f} {lon:.8f}")
+        last_lat, last_lon = verts[-1]
+        out.append(f"113 {last_lat:.8f} {last_lon:.8f}")
+
+    return out
+
+
 _TAXI_NETWORK_ROW_CODES = {"1200", "1201", "1202", "1204", "1206"}
 """1206 ("<node1> <node2> <direction>", a truck/ground-vehicle-only taxi
 edge -- X-Plane's ground-service-vehicle AI routes over these separately
@@ -659,8 +731,9 @@ def replace_taxi_network_and_starts(block_lines, layout, airport_name=""):
     """Strip the stock block's ATC taxi-route network and ramp-start rows
     and replace them with ones built from this package's own MSFS layout,
     so ATC/AI ground routing and startup positions match this specific
-    airport rather than the real-world stock layout. Runway (100) and
-    pavement (110-116/120) rows are untouched -- see reposition_runways.
+    airport rather than the real-world stock layout. Runway (100),
+    pavement (110-116, see replace_pavement_with_native) and painted-line
+    (120) rows are untouched here.
 
     Heading/name on native ramp starts have no confirmed BGL decode, so
     each borrows the closest stock stand's (see _match_ramp_start_
@@ -709,6 +782,7 @@ def replace_taxi_network_and_starts(block_lines, layout, airport_name=""):
 def write_apt_dat(out_path: Path, block_lines, source_note: str, keep_lighting=True, native_layout=None, airport_name=""):
     if native_layout is not None and not native_layout.is_empty():
         block_lines = reposition_runways(block_lines, native_layout.runway_centers)
+        block_lines = replace_pavement_with_native(block_lines, native_layout)
         block_lines = replace_taxi_network_and_starts(block_lines, native_layout, airport_name=airport_name)
     block_lines = anonymize_visual_pavement(block_lines, keep_lighting=keep_lighting)
     out_path.parent.mkdir(parents=True, exist_ok=True)
