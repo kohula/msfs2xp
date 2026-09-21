@@ -489,11 +489,16 @@ def compute_file_flatness_and_reference(gltf, buffers, world_transforms, flat_ep
         level, and must stay rigid (this is exactly the failure mode an
         earlier, more aggressive per-material attempt hit this session:
         it had no ground-proximity check at all). A material detected this
-        way is DROPPED from the output entirely, not draped with a
-        guessed layer rank -- MSFS's own intended stacking order for this
-        kind of small patch/paver detail can't be recovered from the
-        source data, per explicit instruction, so omitting it is
-        preferred over risking another wrong-looking render.
+        way stays RIGID (is_near_ground_flat is informational only, not a
+        drape/drop decision) instead of being draped with a guessed layer
+        rank -- MSFS's own intended stacking order for this kind of small
+        patch/paver detail can't be recovered from the source data, so
+        it's left at its own authored position rather than guessing where
+        in the draw order it belongs. Used to be DROPPED from the output
+        entirely instead; reverted per a real-world comparison against
+        another converter's output for the same content (see convert()'s
+        own is_near_ground_flat comment), which showed dropping it was
+        worse than leaving it rigid.
     """
     total_tris = 0
     flat_tris = 0
