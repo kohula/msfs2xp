@@ -1478,6 +1478,17 @@ def extract_image(gltf, buffers, image_index, glb_path, textures_dir, external_t
             glb_parent / "TEXTURE" / uri_path.name,
             glb_parent.parent / "texture" / uri_path.name,
             glb_parent.parent / "TEXTURE" / uri_path.name,
+            # Step 2's own bulk KTX2 pass (main.py) pre-decodes every
+            # package texture into textures_dir BEFORE any model gets
+            # converted, writing whichever of these two extensions it
+            # actually produced (repackaged .dds when possible, decoded
+            # .png otherwise -- see decode_or_repackage_ktx2) -- both need
+            # to be checked here, not just the .png one, or a pre-decoded
+            # .dds sitting right next to this exact texture never gets
+            # found at all and a redundant, wasted full re-decode gets
+            # substituted (or worse, the flat-color fallback stub if that
+            # re-decode also fails).
+            textures_dir / out_dds_path.name,
             textures_dir / out_name,
         ]
 
@@ -1505,10 +1516,17 @@ def extract_image(gltf, buffers, image_index, glb_path, textures_dir, external_t
                 _atomic_replace(temp_path, out_png_path)
                 cache[image_index] = out_name
                 return out_name
-            elif allow_dds_passthrough and match.suffix.lower() == ".dds" and match.resolve() != out_dds_path.resolve():
-                temp_path = out_dds_path.with_name(f"{out_dds_path.name}.tmp_{_unique_suffix()}")
-                shutil.copyfile(match, temp_path)
-                _atomic_replace(temp_path, out_dds_path)
+            elif allow_dds_passthrough and match.suffix.lower() == ".dds":
+                # Usually a self-match: Step 2's own bulk KTX2 pass
+                # (main.py) already wrote exactly this file at exactly
+                # out_dds_path before any model conversion started, so
+                # this is normally just a reference, not a copy -- only
+                # copy when the match was found somewhere else (e.g. an
+                # external texture root).
+                if match.resolve() != out_dds_path.resolve():
+                    temp_path = out_dds_path.with_name(f"{out_dds_path.name}.tmp_{_unique_suffix()}")
+                    shutil.copyfile(match, temp_path)
+                    _atomic_replace(temp_path, out_dds_path)
                 cache[image_index] = out_dds_path.name
                 return out_dds_path.name
             elif match.resolve() != out_png_path.resolve():

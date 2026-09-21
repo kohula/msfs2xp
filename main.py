@@ -18,7 +18,7 @@ from tkinter.scrolledtext import ScrolledText
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
 import numpy as np
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw
 import texture2ddecoder
 
 import bgl_extractor
@@ -457,44 +457,101 @@ def _convex_hull_2d(points):
     return np.array(lower[:-1] + upper[:-1])
 
 
-def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=2.0):
-    """Exclusion rectangles that hug each converted object's OWN footprint
-    OUTLINE, not one shared airport-wide set and not even one single
-    bounding box per object -- explicit user instruction, illustrated with
-    a reference image: take the object's own outer polygon and cover it
-    with a chain of small rectangles following each edge (a min-1m/max-3m
-    growth around the footprint is fine), rather than one axis-aligned box
-    that overshoots badly on an elongated, angled, or irregular footprint
-    (a diagonal wing, an L-shaped building). Only roads/rail (net/str, see
-    _built_up_exclusion_rects) stay airport-wide -- those aren't tied to
-    one object's own footprint.
+def _rasterize_footprint_mask(xz, tris, cell_m, max_cells=2_000_000):
+    """Rasterizes a 2-D footprint onto a cell_m-resolution boolean grid.
+    xz: (N, 2) local X/Z vertex positions. tris: (M, 3) int array of
+    triangle indices into xz, or None/empty. Fills every real triangle via
+    Pillow's polygon fill (measured ~3us/triangle -- even a combined
+    multi-part placement with a few hundred thousand triangles rasterizes
+    in well under a second, so this is cheap enough to run per placement).
+    Falls back to filling just the convex hull as one solid polygon when
+    tris is empty (a lights-only/point-cloud sidecar with no faces, or a
+    test fixture that only supplies corner positions) -- still a real
+    filled area, not per-edge boxes.
+
+    Escalates cell_m (doubling, same retry pattern as
+    _built_up_exclusion_rects/_polygon_interior_exclusion_rects) if the
+    grid would exceed max_cells. Returns (mask, x_min, z_min, actual_cell)
+    or (None, None, None, None) if nothing usable was rasterized."""
+    x_min, z_min = float(xz[:, 0].min()), float(xz[:, 1].min())
+    x_max, z_max = float(xz[:, 0].max()), float(xz[:, 1].max())
+    span_x, span_z = max(x_max - x_min, 1e-6), max(z_max - z_min, 1e-6)
+
+    _cell = cell_m
+    for _cell in (cell_m, cell_m * 2, cell_m * 4, cell_m * 8, cell_m * 16):
+        nx = max(1, int(math.ceil(span_x / _cell)) + 1)
+        nz = max(1, int(math.ceil(span_z / _cell)) + 1)
+        if nx * nz <= max_cells:
+            break
+    else:
+        return None, None, None, None
+
+    img = Image.new("L", (nx, nz), 0)
+    draw = ImageDraw.Draw(img)
+    if tris is not None and len(tris):
+        px = (xz[:, 0] - x_min) / _cell
+        pz = (xz[:, 1] - z_min) / _cell
+        for a, b, c in tris:
+            draw.polygon([(px[a], pz[a]), (px[b], pz[b]), (px[c], pz[c])], fill=255)
+    else:
+        hull = _convex_hull_2d(xz)
+        if len(hull) >= 3:
+            poly = [((hx - x_min) / _cell, (hz - z_min) / _cell) for hx, hz in hull]
+            draw.polygon(poly, fill=255)
+        elif len(hull) == 2:
+            (hx0, hz0), (hx1, hz1) = hull
+            draw.line([((hx0 - x_min) / _cell, (hz0 - z_min) / _cell),
+                       ((hx1 - x_min) / _cell, (hz1 - z_min) / _cell)], fill=255, width=1)
+        else:
+            return None, None, None, None
+
+    mask = np.asarray(img, dtype=bool)
+    if not mask.any():
+        return None, None, None, None
+    return mask, x_min, z_min, _cell
+
+
+def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=2.0, cell_m=1.0):
+    """Exclusion rectangles that cover each converted object's OWN
+    footprint using close to the MINIMUM real area needed -- not one
+    shared airport-wide set, not one bounding box per object, and not even
+    one rectangle per convex-hull edge (that still over-covers a concave
+    or multi-armed footprint: the local axis-aligned box around one
+    diagonal hull edge, or the hull itself, both cover ground a concave
+    notch -- e.g. the gap between an X-shaped building's two arms -- never
+    actually occupies. A solid, simply-convex object like a plain square
+    building doesn't need 4 separate edge-hugging rects either; one
+    minimal rectangle already covers it exactly).
+
+    Rasterizes the object's REAL triangles (not just its hull) onto a
+    cell_m-resolution local grid (_rasterize_footprint_mask), then greedy-
+    rectangles the occupied mask -- the SAME scanline-run-then-extend-
+    while-identical decomposition already used for the road/rail and
+    airport-boundary-interior exclusions (_greedy_rects_from_mask): a run
+    of occupied cells on one grid line only grows into a taller rectangle
+    while the WHOLE run stays identically occupied on the next line, so
+    two parts that diverge (an X's arms) split into separate rectangles
+    right where they stop lining up, while a uniform strip merges into one
+    rectangle instead of fragmenting. Each resulting rectangle is padded by
+    pad_m on every side (in local metres, within the requested 1-3m growth
+    range) before being rotated into real-world lat/lon by the placement's
+    own heading (geo_transform.local_offset_to_latlon, same convention
+    used everywhere else in this pipeline).
 
     footprint_candidates: [(generated_stems, base_lat, base_lon,
-    heading_deg), ...] -- one entry per real placement, collected during
-    the main placement loop (base_lat/base_lon are that placement's own
-    ALREADY mid_x/mid_z-recentering-compensated anchor, matching the
-    local coordinate frame each generated stem's .meshir.pkl sidecar was
-    written in). For each entry, every named stem's sidecar (if any) is
-    loaded for its real local X/Z vertices; ALL of them (not just the
-    bbox corners) feed a 2-D convex hull (_convex_hull_2d) of the
-    object's own footprint outline. For each hull EDGE (two consecutive
-    hull vertices), the local axis-aligned bbox of just that edge's two
-    endpoints is padded by pad_m on every side (in local metres -- this
-    project's local X/Z coordinates already ARE metric, so padding here
-    needs no unit conversion), then its 4 corners are rotated into
-    real-world lat/lon by the placement's own heading
-    (geo_transform.local_offset_to_latlon, same convention used
-    everywhere else in this pipeline) and reduced to their own
-    axis-aligned lat/lon bounding rectangle. A concave real footprint
-    still gets its CONVEX hull covered (a true concave-hull decomposition
-    is not attempted) -- comfortably tighter than one whole-object
-    bounding box for the angled/elongated cases this was built for, even
-    if not pixel-perfect on a deeply concave shape.
+    heading_deg), ...] -- one entry per real placement (base_lat/base_lon
+    are that placement's own already mid_x/mid_z-recentering-compensated
+    anchor, matching the local coordinate frame each generated stem's
+    .meshir.pkl sidecar was written in). Every named stem's sidecar (if
+    any) contributes its real local triangles to ONE shared raster per
+    placement -- objectwise, not per material sub-object, so a multi-part
+    building's footprint is the union of all its parts, not several
+    independently-hulled pieces.
 
-    Terrain-fit's own corrected copies aren't needed here: rigid rotation
-    and draped Y-warps don't materially change an object's own XZ
-    footprint, and reading the pre-terrain-fit original avoids a
-    dependency on terrain-fit having already run for this stem.
+    Terrain-fit's own corrected copies aren't needed here: rigid shift and
+    draped Y-warps don't materially change an object's own XZ footprint,
+    and reading the pre-terrain-fit original avoids a dependency on
+    terrain-fit having already run for this stem.
 
     Skips stems with no sidecar or no real geometry (lights-only/animated-
     only objects have no footprint to exclude). Returns [] if nothing
@@ -505,39 +562,46 @@ def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=2.0):
     sidecar_cache = {}
     for generated_stems, base_lat, base_lon, heading_deg in footprint_candidates:
         xz_parts = []
+        tri_parts = []
+        offset = 0
         for stem in generated_stems:
             if stem in sidecar_cache:
-                positions = sidecar_cache[stem]
+                positions, indices = sidecar_cache[stem]
             else:
                 sidecar = mesh_ir.sidecar_path_for(obj_dir / f"{stem}.obj")
-                positions = None
+                positions, indices = None, None
                 if sidecar.exists():
                     try:
                         ir = mesh_ir.load(sidecar)
                         if len(ir.positions):
-                            positions = ir.positions
+                            positions = ir.positions[:, [0, 2]]
+                            indices = ir.indices
                     except (OSError, EOFError, pickle.UnpicklingError):
-                        positions = None
-                sidecar_cache[stem] = positions
+                        positions, indices = None, None
+                sidecar_cache[stem] = (positions, indices)
             if positions is None:
                 continue
-            xz_parts.append(positions[:, [0, 2]])
+            xz_parts.append(positions)
+            if indices is not None and len(indices) >= 3:
+                tri_parts.append(np.asarray(indices, dtype=np.int64).reshape(-1, 3) + offset)
+            offset += len(positions)
         if not xz_parts:
             continue
         xz = np.concatenate(xz_parts, axis=0)
-        hull = _convex_hull_2d(xz)
-        if len(hull) < 2:
-            continue
-        if len(hull) == 2:
-            edges = [(hull[0], hull[1])]
-        else:
-            edges = [(hull[i], hull[(i + 1) % len(hull)]) for i in range(len(hull))]
+        tris = np.concatenate(tri_parts, axis=0) if tri_parts else None
 
-        m_per_deg_lat = 111320.0
-        m_per_deg_lon = 111320.0 * max(math.cos(math.radians(base_lat)), 1e-6)
-        for (ex0, ez0), (ex1, ez1) in edges:
-            lx_min, lx_max = min(ex0, ex1) - pad_m, max(ex0, ex1) + pad_m
-            lz_min, lz_max = min(ez0, ez1) - pad_m, max(ez0, ez1) + pad_m
+        mask, x_min, z_min, cell = _rasterize_footprint_mask(xz, tris, cell_m)
+        if mask is None:
+            continue
+        grid_rects = _greedy_rects_from_mask(mask)
+        if not grid_rects:
+            continue
+
+        for (gy0, gx0, gy1, gx1) in grid_rects:
+            lx_min = x_min + gx0 * cell - pad_m
+            lx_max = x_min + (gx1 + 1) * cell + pad_m
+            lz_min = z_min + gy0 * cell - pad_m
+            lz_max = z_min + (gy1 + 1) * cell + pad_m
             corners = [(lx_min, lz_min), (lx_max, lz_min), (lx_max, lz_max), (lx_min, lz_max)]
             lats, lons = [], []
             for cx, cz in corners:
@@ -582,6 +646,46 @@ _KTX2_SUPERCOMPRESSION_NONE   = 0
 _KTX2_SUPERCOMPRESSION_BASIS  = 1  # true ETC1S+BasisLZ -- needs the real Basis transcoder, not decodable here
 _KTX2_SUPERCOMPRESSION_ZSTD   = 2
 _KTX2_SUPERCOMPRESSION_ZLIB   = 3
+
+# DXGI_FORMAT values used by the DDS_HEADER_DXT10 extension this module
+# writes in _build_dds_bytes -- same numeric values mesh_convert.convert's
+# own decode_dds_bytes_to_png already reads on the way back in, confirming
+# round-trip consistency within this project.
+_DXGI_FORMAT_BC4_UNORM = 80
+_DXGI_FORMAT_BC5_UNORM = 83
+_DXGI_FORMAT_BC5_SNORM = 84
+_DXGI_FORMAT_BC7_UNORM = 98
+
+
+def _build_dds_bytes(width, height, compressed_bytes, fourcc, dxgi_format=None, block_size=16):
+    """Builds a minimal, single-mip-level DDS file (magic + DDS_HEADER,
+    with a DDS_HEADER_DXT10 extension when dxgi_format is given) wrapping
+    compressed_bytes UNCHANGED -- a pure container rewrap, not a
+    recompress: the GPU-native block data X-Plane's own DDS loader reads
+    is bit-for-bit identical to what the source KTX2 already had. Byte
+    offsets (fourCC at 84, compressed data at 128, or 148 with a DX10
+    header) match mesh_convert.convert.decode_dds_bytes_to_png's own
+    reader exactly, so a file this writes decodes correctly there too."""
+    DDSD_CAPS = 0x1
+    DDSD_HEIGHT = 0x2
+    DDSD_WIDTH = 0x4
+    DDSD_PIXELFORMAT = 0x1000
+    DDSD_LINEARSIZE = 0x80000
+    DDSCAPS_TEXTURE = 0x1000
+    DDPF_FOURCC = 0x4
+
+    blocks_w = max(1, (width + 3) // 4)
+    blocks_h = max(1, (height + 3) // 4)
+    linear_size = blocks_w * blocks_h * block_size
+    flags = DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PIXELFORMAT | DDSD_LINEARSIZE
+
+    header_pre_pf = struct.pack("<7I11I", 124, flags, height, width, linear_size, 0, 0, *([0] * 11))
+    pixelformat = struct.pack("<2I4s5I", 32, DDPF_FOURCC, fourcc, 0, 0, 0, 0, 0)
+    caps = struct.pack("<5I", DDSCAPS_TEXTURE, 0, 0, 0, 0)
+    out = b"DDS " + header_pre_pf + pixelformat + caps
+    if dxgi_format is not None:
+        out += struct.pack("<5I", dxgi_format, 3, 0, 1, 0)  # resourceDimension=3 (TEXTURE2D)
+    return out + compressed_bytes
 
 
 def _bc5_snorm_to_unorm_bytes(data):
@@ -684,20 +788,27 @@ def set_app_icon_and_taskbar(root, icon_filename="iconfin.ico"):
     force_taskbar_icon(root)
 
 
-def clean_texture_name(file_path):
-    """Strips MSFS compound extensions to return a clean .png filename for
-    X-Plane. Must stay in sync with mesh_convert.convert.clean_texture_stem
-    (the compound-extension list is duplicated, not shared, since this one
-    runs standalone during Step 2's bulk pre-decode pass before
-    mesh_convert is even involved). Includes .tif/.tif.ktx2/.tif.dds since
-    some packages (e.g. iniBuilds' EGLC) ship source textures as .TIF."""
+def _clean_texture_stem(file_path):
+    """Shared by clean_texture_name and decode_or_repackage_ktx2: the
+    stem (no extension) after stripping MSFS's compound source
+    extensions. Must stay in sync with
+    mesh_convert.convert.clean_texture_stem (the compound-extension list
+    is duplicated, not shared, since this one runs standalone during
+    Step 2's bulk pre-decode pass before mesh_convert is even involved).
+    Includes .tif/.tif.ktx2/.tif.dds since some packages (e.g. iniBuilds'
+    EGLC) ship source textures as .TIF."""
     name = Path(file_path).name.lower()
     for ext in ['.png.ktx2', '.png.dds', '.tif.ktx2', '.tif.dds',
                 '.ktx2', '.dds', '.tga', '.tiff', '.tif', '.jpg', '.jpeg', '.png']:
         if name.endswith(ext):
-            name = name[:-len(ext)]
-            break
-    return name + ".png"
+            return name[:-len(ext)]
+    return name
+
+
+def clean_texture_name(file_path):
+    """Strips MSFS compound extensions to return a clean .png filename for
+    X-Plane. See _clean_texture_stem for the actual stripping logic."""
+    return _clean_texture_stem(file_path) + ".png"
 
 
 def _available_memory_gb():
@@ -1034,6 +1145,84 @@ def decode_ktx2_to_png(input_path, output_path):
         return True
     except Exception as e:
         return str(e)
+
+
+def repackage_ktx2_to_dds(input_path, output_path):
+    """Wraps a KTX2 file's own GPU-native block-compressed payload
+    directly in a DDS container instead of fully decoding to raw pixels
+    and re-encoding as PNG -- same bytes, different header, so X-Plane's
+    DDS loader (already relied on for mesh_convert.convert's own DDS
+    passthrough) reads the identical GPU data with zero quality loss and
+    none of the decode+encode cost or size/VRAM penalty (confirmed real
+    gap: one real texture was 699KB as .dds vs 5.1MB fully decoded to
+    .png). Returns True on success, or a message string explaining why
+    repackaging wasn't possible -- same calling convention as
+    decode_ktx2_to_png, and the caller (decode_or_repackage_ktx2) falls
+    back to that full decode in that case.
+
+    MUST NOT be used for a normal map: BC5-compressed normal maps only
+    carry 2 channels (X/Y) -- decode_ktx2_to_png's own Z-channel
+    reconstruction (sqrt(1 - x^2 - y^2), a few lines above) has to
+    actually run and bake a real 3rd channel in. A raw block-data
+    passthrough would skip that entirely and silently produce broken
+    lighting in-sim. The caller is responsible for routing "_norm"
+    textures to decode_ktx2_to_png instead, using the same filename
+    convention decode_ktx2_to_png itself already keys its own
+    reconstruction on."""
+    try:
+        info = parse_ktx2_header(input_path)
+    except Exception as e:
+        return str(e)
+
+    scheme = info["supercompression"]
+    if scheme == _KTX2_SUPERCOMPRESSION_BASIS:
+        return "Skipped: true ETC1S/BasisLZ supercompression requires the Basis Universal transcoder."
+
+    width, height, vk_fmt = info["width"], info["height"], info["vk_format"]
+    raw_data = _decompress_supercompressed(info["compressed_bytes"], scheme)
+    if raw_data is None:
+        name = {2: "Zstd", 3: "ZLIB"}.get(scheme, str(scheme))
+        return f"Skipped: {name}-supercompressed KTX2 but the '{name.lower()}' module isn't installed."
+
+    if vk_fmt in (VK_FORMAT_BC1_RGB_UNORM_BLOCK, VK_FORMAT_BC1_RGBA_UNORM_BLOCK):
+        dds_bytes = _build_dds_bytes(width, height, raw_data, b"DXT1", block_size=8)
+    elif vk_fmt == VK_FORMAT_BC3_UNORM_BLOCK:
+        dds_bytes = _build_dds_bytes(width, height, raw_data, b"DXT5", block_size=16)
+    elif vk_fmt == VK_FORMAT_BC4_UNORM_BLOCK:
+        dds_bytes = _build_dds_bytes(width, height, raw_data, b"DX10", dxgi_format=_DXGI_FORMAT_BC4_UNORM, block_size=8)
+    elif vk_fmt in (VK_FORMAT_BC5_UNORM_BLOCK, VK_FORMAT_BC5_SNORM_BLOCK):
+        dxgi = _DXGI_FORMAT_BC5_SNORM if vk_fmt == VK_FORMAT_BC5_SNORM_BLOCK else _DXGI_FORMAT_BC5_UNORM
+        dds_bytes = _build_dds_bytes(width, height, raw_data, b"DX10", dxgi_format=dxgi, block_size=16)
+    elif vk_fmt == VK_FORMAT_BC7_UNORM_BLOCK:
+        dds_bytes = _build_dds_bytes(width, height, raw_data, b"DX10", dxgi_format=_DXGI_FORMAT_BC7_UNORM, block_size=16)
+    else:
+        return f"Unsupported VkFormat for repackaging: {vk_fmt}"
+
+    try:
+        output_path.write_bytes(dds_bytes)
+    except OSError as e:
+        return str(e)
+    return True
+
+
+def decode_or_repackage_ktx2(input_path, out_dir):
+    """Picklable ProcessPoolExecutor entry point for Step 2's bulk KTX2
+    pass. Repackages to .dds (near-zero cost, zero quality loss) for
+    every texture EXCEPT a normal map ("_norm" in the name, the same
+    convention decode_ktx2_to_png itself already keys its Z-channel
+    reconstruction on), which still needs the real decode+reconstruct+
+    re-encode -- a raw passthrough would silently break its lighting.
+    Falls back to the full decode-to-PNG path for anything
+    repackage_ktx2_to_dds can't handle (true Basis/ETC1S
+    supercompression, an unsupported VkFormat, or a missing
+    decompression module)."""
+    stem = _clean_texture_stem(input_path)
+    if "_norm" not in stem:
+        dds_path = out_dir / f"{stem}.dds"
+        if repackage_ktx2_to_dds(input_path, dds_path) is True:
+            return True
+    png_path = out_dir / f"{stem}.png"
+    return decode_ktx2_to_png(input_path, png_path)
 
 
 # --- CANVAS ROUNDED GRAPHICS HELPERS ---
@@ -1932,7 +2121,7 @@ class ModularPythonConverterApp:
                 # since KTX2 decode/decompress is heavy Python+C-extension work.
                 with ProcessPoolExecutor(max_workers=pool_worker_count()) as pool:
                     futures = {
-                        pool.submit(decode_ktx2_to_png, ktx, tex_dir / clean_texture_name(ktx)): ktx
+                        pool.submit(decode_or_repackage_ktx2, ktx, tex_dir): ktx
                         for ktx in ktx2_files
                     }
                     for i, future in enumerate(as_completed(futures), 1):
