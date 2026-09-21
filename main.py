@@ -511,7 +511,7 @@ def _rasterize_footprint_mask(xz, tris, cell_m, max_cells=2_000_000):
     return mask, x_min, z_min, _cell
 
 
-def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=2.0, cell_m=1.0):
+def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=0.5, cell_m=1.0):
     """Exclusion rectangles that cover each converted object's OWN
     footprint using close to the MINIMUM real area needed -- not one
     shared airport-wide set, not one bounding box per object, and not even
@@ -532,11 +532,21 @@ def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=2.0, cell_m
     while the WHOLE run stays identically occupied on the next line, so
     two parts that diverge (an X's arms) split into separate rectangles
     right where they stop lining up, while a uniform strip merges into one
-    rectangle instead of fragmenting. Each resulting rectangle is padded by
-    pad_m on every side (in local metres, within the requested 1-3m growth
-    range) before being rotated into real-world lat/lon by the placement's
-    own heading (geo_transform.local_offset_to_latlon, same convention
-    used everywhere else in this pipeline).
+    rectangle instead of fragmenting. Each grid rectangle's own corners are
+    rotated into real-world lat/lon FIRST (geo_transform.local_offset_to_
+    latlon, same convention used everywhere else in this pipeline), and
+    only THEN is the resulting real-world west/east/south/north box padded
+    by pad_m -- CONFIRMED REAL BUG this order fixes: X-Plane's exclusion-
+    zone format is itself always an axis-aligned lat/lon box (there's no
+    rotated-rectangle exclusion primitive to emit), so for any placement
+    heading that isn't a multiple of 90 degrees, the box has to grow
+    somewhat just to cover a rotated footprint's corners at all -- but
+    padding the LOCAL rectangle before that rotation let the pad amount
+    get diagonally amplified by the same rotation (up to ~1.4x at 45
+    degrees) on top of that unavoidable growth, silently covering more
+    real ground than pad_m the more an object was rotated. Padding the
+    already-rotated real-world box instead adds exactly pad_m of margin
+    in every cardinal direction regardless of heading.
 
     footprint_candidates: [(generated_stems, base_lat, base_lon,
     heading_deg), ...] -- one entry per real placement (base_lat/base_lon
@@ -597,11 +607,14 @@ def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=2.0, cell_m
         if not grid_rects:
             continue
 
+        m_lat, m_lon = geo_transform.metres_per_degree(base_lat)
+        pad_lat_deg = pad_m / m_lat
+        pad_lon_deg = pad_m / m_lon
         for (gy0, gx0, gy1, gx1) in grid_rects:
-            lx_min = x_min + gx0 * cell - pad_m
-            lx_max = x_min + (gx1 + 1) * cell + pad_m
-            lz_min = z_min + gy0 * cell - pad_m
-            lz_max = z_min + (gy1 + 1) * cell + pad_m
+            lx_min = x_min + gx0 * cell
+            lx_max = x_min + (gx1 + 1) * cell
+            lz_min = z_min + gy0 * cell
+            lz_max = z_min + (gy1 + 1) * cell
             corners = [(lx_min, lz_min), (lx_max, lz_min), (lx_max, lz_max), (lx_min, lz_max)]
             lats, lons = [], []
             for cx, cz in corners:
@@ -609,10 +622,10 @@ def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=2.0, cell_m
                 lats.append(la)
                 lons.append(lo)
             rects.append({
-                "west": min(lons),
-                "east": max(lons),
-                "south": min(lats),
-                "north": max(lats),
+                "west": min(lons) - pad_lon_deg,
+                "east": max(lons) + pad_lon_deg,
+                "south": min(lats) - pad_lat_deg,
+                "north": max(lats) + pad_lat_deg,
             })
     return rects
 

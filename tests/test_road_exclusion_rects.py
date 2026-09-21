@@ -173,7 +173,10 @@ class TestConvexHull2D(unittest.TestCase):
 class TestPerObjectExclusionRects(unittest.TestCase):
     """main._per_object_exclusion_rects -- explicit user instruction: default
     scenery exclusion should cover each converted object's OWN footprint
-    using close to the MINIMUM real area needed (1-3m growth), not one
+    using close to the MINIMUM real area needed (at most 0.5m growth
+    beyond the real, heading-rotated footprint -- not the local pre-
+    rotation rectangle, see test_padding_is_not_amplified_by_a_diagonal_
+    heading), not one
     shared shape covering the whole airport's combined extent, not a
     single bounding box per object (overshoots badly on an elongated/
     angled/irregular footprint), and not even one rectangle per convex-
@@ -197,7 +200,7 @@ class TestPerObjectExclusionRects(unittest.TestCase):
         )
         mesh_ir.save(ir, mesh_ir.sidecar_path_for(obj_dir / f"{stem}.obj"))
 
-    def test_square_object_gets_one_minimal_rect_padded_by_2m(self):
+    def test_square_object_gets_one_minimal_rect_padded_by_half_a_metre(self):
         with tempfile.TemporaryDirectory() as td:
             obj_dir = Path(td)
             self._make_sidecar(obj_dir, "Building_A", x_range=(-5.0, 5.0), z_range=(-5.0, 5.0))
@@ -211,10 +214,41 @@ class TestPerObjectExclusionRects(unittest.TestCase):
             # Every point on the square's own boundary must be covered.
             self.assertTrue(_covers(rects, 47.0 + 5.0 / m_per_deg_lat, 19.0))
             self.assertTrue(_covers(rects, 47.0, 19.0 + 5.0 / m_per_deg_lon))
-            # 2m padding: a point 6.9m out (within the 5+2=7m reach) is
-            # covered; a point 7.5m out (beyond it) is not.
-            self.assertTrue(_covers(rects, 47.0 + 6.9 / m_per_deg_lat, 19.0))
-            self.assertFalse(_covers(rects, 47.0 + 7.5 / m_per_deg_lat, 19.0))
+            # Default pad_m=0.5: a point 5.4m out (within the 5+0.5=5.5m
+            # reach) is covered; a point 5.9m out (beyond it) is not --
+            # explicit user instruction: exclusion should be at most 0.5m
+            # larger than the object's own real footprint.
+            self.assertTrue(_covers(rects, 47.0 + 5.4 / m_per_deg_lat, 19.0))
+            self.assertFalse(_covers(rects, 47.0 + 5.9 / m_per_deg_lat, 19.0))
+
+    def test_padding_is_not_amplified_by_a_diagonal_heading(self):
+        """CONFIRMED REAL BUG this pins: padding used to be added to the
+        LOCAL rectangle before rotating its corners into real-world lat/
+        lon, so at a non-cardinal heading the pad amount itself got
+        diagonally stretched by the rotation (up to ~1.4x at 45 degrees)
+        on top of the unavoidable axis-aligned-box growth a rotated
+        footprint needs. Padding the already-rotated real-world box
+        instead must add exactly pad_m of margin in every cardinal
+        direction regardless of heading."""
+        with tempfile.TemporaryDirectory() as td:
+            obj_dir = Path(td)
+            self._make_sidecar(obj_dir, "Diagonal_Building", x_range=(-5.0, 5.0), z_range=(-5.0, 5.0))
+            rects = main._per_object_exclusion_rects(
+                obj_dir, [(["Diagonal_Building"], 47.0, 19.0, 45.0)], pad_m=0.5)
+            self.assertTrue(rects)
+            m_per_deg_lat = 111320.0
+            # The rotated square's own real-world half-diagonal reach is
+            # 5*sqrt(2) =~ 7.071m -- an UNAVOIDABLE consequence of an
+            # axis-aligned box covering a 45-degree-rotated square, not
+            # padding. Only pad_m=0.5 beyond THAT is allowed (plus a small
+            # allowance for the cell_m=1.0 rasterization grid's own
+            # quantization, unrelated to this bug); the old bug added
+            # closer to pad_m*sqrt(2) =~ 0.707m of extra margin instead --
+            # i.e. a reach near 7.778m, which the assertion below rules
+            # out with room to spare.
+            max_reach_m = max(abs(r["north"] - 47.0) * m_per_deg_lat for r in rects)
+            self.assertLess(max_reach_m, 5.0 * math.sqrt(2) + 0.5 + 0.2)
+            self.assertGreater(max_reach_m, 5.0 * math.sqrt(2))
 
     def test_two_distant_objects_stay_strictly_their_own_area(self):
         """The whole point vs. the old airport-wide shape: the empty gap
