@@ -900,5 +900,65 @@ class TestDedupePlacements(unittest.TestCase):
         self.assertEqual(out, [a, b])
 
 
+class TestDedupeNearIdenticalAnchors(unittest.TestCase):
+    """CONFIRMED REAL BUG (a real EGLC conversion): the same real-world
+    SimPropContainer instance landed in existing_placements TWICE, at the
+    identical position but with a tiny (sub-degree) heading difference
+    between two resolution paths for the same underlying record --
+    confirmed real case: EGLC_Terminal_seadOne, same lat/lon, headings
+    273.229 vs 272.795 (0.43 degrees apart). extract_spb_placements
+    expands its container's furniture/interior .spb against EVERY
+    matching anchor (correct and necessary for a genuinely repeated real
+    fixture, e.g. 50+ apron lights, or the confirmed real stacked-
+    container-yard case with clean 90-degree heading increments), so two
+    near-identical anchors for what's really ONE instance produced a
+    visible duplicate chair. _dedupe_near_identical_anchors runs just
+    before that expansion to collapse the former while leaving the
+    latter untouched."""
+
+    def _a(self, lat=51.5, lon=0.05, hdg=273.229, **extra):
+        d = {"lat": lat, "lon": lon, "hdg": hdg}
+        d.update(extra)
+        return d
+
+    def test_same_position_tiny_heading_difference_collapses_to_one(self):
+        a = self._a(hdg=273.229, title="First")
+        b = self._a(hdg=272.795, title="Second")  # 0.434 degrees apart -- the confirmed real case
+        out = bgl_extractor._dedupe_near_identical_anchors([a, b])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["title"], "First", "keeps the first-seen representative")
+
+    def test_same_position_90_degree_apart_headings_stay_distinct(self):
+        """The confirmed-legitimate stacked-container-yard case: same
+        position, real distinct instances rotated in clean 90-degree
+        increments -- must NOT be collapsed."""
+        anchors = [self._a(hdg=92.7), self._a(hdg=182.7), self._a(hdg=272.8)]
+        out = bgl_extractor._dedupe_near_identical_anchors(anchors)
+        self.assertEqual(len(out), 3)
+
+    def test_different_position_same_heading_stays_distinct(self):
+        """The confirmed-legitimate repeated-fixture case (a light pole
+        50+ times): same heading, genuinely different real positions."""
+        anchors = [self._a(lat=51.50000, hdg=90.0), self._a(lat=51.50100, hdg=90.0)]
+        out = bgl_extractor._dedupe_near_identical_anchors(anchors)
+        self.assertEqual(len(out), 2)
+
+    def test_tiny_position_float_noise_at_the_same_heading_still_collapses(self):
+        a = self._a(lat=51.500000, lon=0.050000, hdg=90.0)
+        b = self._a(lat=51.5000001, lon=0.0500001, hdg=90.05)
+        out = bgl_extractor._dedupe_near_identical_anchors([a, b])
+        self.assertEqual(len(out), 1)
+
+    def test_fewer_than_two_anchors_returned_unchanged(self):
+        self.assertEqual(bgl_extractor._dedupe_near_identical_anchors([]), [])
+        one = [self._a()]
+        self.assertEqual(bgl_extractor._dedupe_near_identical_anchors(one), one)
+
+    def test_missing_lat_lon_passes_through_without_crashing(self):
+        a = {"hdg": 90.0}
+        out = bgl_extractor._dedupe_near_identical_anchors([a, self._a()])
+        self.assertEqual(len(out), 2, "an anchor with no position can't be grouped -- kept as-is, not dropped")
+
+
 if __name__ == "__main__":
     unittest.main()

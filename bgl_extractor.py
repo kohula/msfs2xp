@@ -1050,6 +1050,68 @@ def _resolve_propdefs_dir(explicit, spb2xml_dir, _log):
     return None
 
 
+_ANCHOR_DEDUPE_POS_DECIMALS = 6  # ~0.11m at the equator
+_ANCHOR_DEDUPE_HEADING_DEG = 3.0  # collapse anchors within this heading spread; a real repeated fixture (light poles, stacked containers) differs by far more (often a clean 90 degree increment)
+
+
+def _dedupe_near_identical_anchors(anchors):
+    """CONFIRMED REAL BUG: a SimPropContainer's GUID legitimately repeats
+    once per real-world instance (a light fixture 50+ times, a stacked
+    container yard in clean 90-degree increments -- both real, both must
+    each get their own expansion, see extract_spb_placements' own
+    docstring above). But the SAME real instance can also land in
+    existing_placements TWICE, at the identical position with only a
+    tiny (sub-degree) heading difference -- two different resolution
+    paths for the same underlying record producing a small floating-
+    point discrepancy, not two real instances. Expanding the SAME
+    furniture/interior .spb against BOTH produced a confirmed real
+    symptom on a live EGLC conversion: e.g. one chair
+    (EGLC_Terminal_seadOne) placed twice at the exact same lat/lon,
+    headings 273.229 vs 272.795 (0.43 degrees apart) -- far too close to
+    be a real second instance, far too small a difference for the
+    existing exact-match _dedupe_placements (which rounds heading to 1
+    decimal) to catch, since 273.229 and 272.795 round to DIFFERENT
+    1-decimal values (273.2 vs 272.8) despite being the same real point.
+
+    Groups anchors by position (rounded to _ANCHOR_DEDUPE_POS_DECIMALS),
+    then within each position keeps only one representative per cluster
+    of headings within _ANCHOR_DEDUPE_HEADING_DEG of each other (greedy,
+    first occurrence wins, matching _dedupe_placements' own convention)
+    -- collapses the near-duplicate case while leaving genuinely distinct
+    same-position-different-heading real instances (the stacked-container
+    case, confirmed via 90-degree-increment headings on a real EGLC
+    conversion) untouched."""
+    if len(anchors) < 2:
+        return anchors
+
+    by_pos = defaultdict(list)
+    order = []
+    for a in anchors:
+        lat, lon = a.get("lat"), a.get("lon")
+        if lat is None or lon is None:
+            order.append(a)
+            continue
+        key = (round(lat, _ANCHOR_DEDUPE_POS_DECIMALS), round(lon, _ANCHOR_DEDUPE_POS_DECIMALS))
+        by_pos[key].append(a)
+
+    kept = list(order)
+    for group in by_pos.values():
+        # Original input order preserved (not sorted by heading) so
+        # "first occurrence wins" matches _dedupe_placements' own
+        # convention -- compares against EVERY already-kept heading in
+        # this position group, not just the most recent, so cluster
+        # membership doesn't depend on arrival order among 3+ distinct
+        # real headings either.
+        kept_headings = []
+        for a in group:
+            hdg = a.get("hdg", 0.0) or 0.0
+            if any(abs(hdg - kh) <= _ANCHOR_DEDUPE_HEADING_DEG for kh in kept_headings):
+                continue
+            kept.append(a)
+            kept_headings.append(hdg)
+    return kept
+
+
 def extract_spb_placements(spb_path: Path, airport_lat: float, airport_lon: float, airport_alt: float, existing_placements: list, _log, name_map: dict = None, propdefs_dir: str = None, allow_fallback: bool = True):
     import sys
     import uuid
@@ -1123,6 +1185,7 @@ def extract_spb_placements(spb_path: Path, airport_lat: float, airport_lon: floa
     anchors = []
     if container_guid_hex:
         anchors = [p for p in existing_placements if p.get("guid") == container_guid_hex]
+        anchors = _dedupe_near_identical_anchors(anchors)
     used_fallback = not anchors
     if used_fallback:
         if not allow_fallback:
