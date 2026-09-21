@@ -14,6 +14,21 @@ real X-Plane 11 -- its DDS loader has no confirmed DX10/BC4-7 support
 (X-Plane's own official DDSTool manual documents only DXT1/DXT3/DXT5).
 Every format that can't be safely repackaged falls back to the full
 decode-to-PNG path instead of guessing again.
+
+INCLUDES A REAL MIP CHAIN -- CONFIRMED REAL BUG this also fixes: even
+after the DX10 fix above, real X-Plane Log.txt output still reported
+"missing" textures for structurally-valid DXT1/DXT5 files (correct
+magic bytes, correct FourCC, plausible size). A byte-for-byte header
+comparison against a different, real, working MSFS->X-Plane converter's
+own DDS output for the exact same source texture found the real cause:
+theirs had a real dwMipMapCount (11, for a 1024x1024 texture) with
+DDSD_MIPMAPCOUNT/DDSCAPS_MIPMAP/DDSCAPS_COMPLEX all set; this project's
+single-level output had none of those, and X-Plane 11's DDS loader
+rejects a single-level file outright. The source KTX2 already has a
+real mip chain (parse_ktx2_all_levels reads every level, not just
+level 0, unlike parse_ktx2_header which only decode_ktx2_to_png/
+decode_or_repackage_ktx2's PNG fallback still use -- PNG has no mip
+concept at all, so that path never needed this).
 """
 import struct
 import tempfile
@@ -26,19 +41,28 @@ from PIL import Image
 import main
 
 
-def _build_fake_ktx2(vk_format, width, height, compressed_bytes, supercompression=0):
+def _build_fake_ktx2(vk_format, width, height, compressed_bytes, supercompression=0, extra_levels=None):
     """A minimal, structurally-valid KTX2 file wrapping compressed_bytes
-    as its single mip level -- enough for main.parse_ktx2_header (which
-    only reads by field index, not full spec compliance) to parse
-    correctly. Real block CONTENT doesn't matter for these tests; only
-    that repackaging preserves it bit-for-bit and that both decode paths
-    agree on what it means."""
+    as level 0 (the base/highest-res level), optionally followed by
+    extra_levels (smaller mip levels, level 1 first) -- enough for
+    main.parse_ktx2_header / parse_ktx2_all_levels (which only read by
+    field index, not full spec compliance) to parse correctly. Real
+    block CONTENT doesn't matter for these tests; only that repackaging
+    preserves it bit-for-bit and that both decode paths agree on what
+    it means."""
+    levels = [compressed_bytes] + list(extra_levels or [])
+    level_count = len(levels)
     magic = b"\xabKTX 20\xbb\r\n\x1a\n"
-    header = struct.pack("<17I", vk_format, 1, width, height, 0, 1, 1, 1, supercompression,
+    header = struct.pack("<17I", vk_format, 1, width, height, 0, 1, 1, level_count, supercompression,
                           0, 0, 0, 0, 0, 0, 0, 0)
-    offset = len(magic) + len(header) + 24  # + one 24-byte level-index entry
-    level_index = struct.pack("<3Q", offset, len(compressed_bytes), len(compressed_bytes))
-    return magic + header + level_index + compressed_bytes
+    cur_offset = len(magic) + len(header) + level_count * 24
+    level_index = b""
+    data = b""
+    for lvl in levels:
+        level_index += struct.pack("<3Q", cur_offset, len(lvl), len(lvl))
+        data += lvl
+        cur_offset += len(lvl)
+    return magic + header + level_index + data
 
 
 def _fake_block_bytes(n, seed=0):
@@ -49,23 +73,56 @@ def _fake_block_bytes(n, seed=0):
 
 class TestBuildDdsBytes(unittest.TestCase):
     def test_starts_with_dds_magic(self):
-        out = main._build_dds_bytes(4, 4, b"\x00" * 8, b"DXT1", block_size=8)
+        out = main._build_dds_bytes(4, 4, [b"\x00" * 8], b"DXT1", block_size=8)
         self.assertTrue(out.startswith(b"DDS "))
 
     def test_fourcc_lands_at_byte_84(self):
-        out = main._build_dds_bytes(8, 8, b"\x00" * 32, b"DXT5", block_size=16)
+        out = main._build_dds_bytes(8, 8, [b"\x00" * 32], b"DXT5", block_size=16)
         self.assertEqual(out[84:88], b"DXT5")
 
     def test_dx10_payload_starts_at_byte_148(self):
         payload = b"\xAB" * 16
-        out = main._build_dds_bytes(4, 4, payload, b"DX10", dxgi_format=98, block_size=16)
+        out = main._build_dds_bytes(4, 4, [payload], b"DX10", dxgi_format=98, block_size=16)
         self.assertEqual(out[84:88], b"DX10")
         self.assertEqual(out[148:], payload)
 
     def test_no_dx10_payload_starts_at_byte_128(self):
         payload = b"\xCD" * 8
-        out = main._build_dds_bytes(4, 4, payload, b"DXT1", block_size=8)
+        out = main._build_dds_bytes(4, 4, [payload], b"DXT1", block_size=8)
         self.assertEqual(out[128:], payload)
+
+    def test_single_level_has_no_mipmap_flags(self):
+        """A single-level file keeps the OLD, already-proven-fine
+        convention (no DDSD_MIPMAPCOUNT/DDSCAPS_MIPMAP, dwMipMapCount=0)
+        -- only a real multi-level file needs the new flags."""
+        out = main._build_dds_bytes(4, 4, [b"\x00" * 8], b"DXT1", block_size=8)
+        dwFlags, dwHeight, dwWidth, dwPitchOrLinearSize, dwDepth, dwMipMapCount = struct.unpack_from("<6I", out, 8)
+        self.assertEqual(dwFlags & 0x20000, 0, "DDSD_MIPMAPCOUNT must not be set for a single level")
+        self.assertEqual(dwMipMapCount, 0)
+        dwCaps = struct.unpack_from("<I", out, 76 + 32)[0]
+        self.assertEqual(dwCaps & 0x400000, 0, "DDSCAPS_MIPMAP must not be set for a single level")
+
+    def test_multi_level_sets_real_mipmap_count_and_flags(self):
+        """CONFIRMED REAL BUG this pins: X-Plane 11's DDS loader rejects
+        a single-level file outright ("missing texture" even with valid
+        magic bytes and FourCC) -- a real converter's own working DDS
+        output for the same source texture had dwMipMapCount=11 (for a
+        1024x1024 texture) with DDSD_MIPMAPCOUNT/DDSCAPS_MIPMAP/
+        DDSCAPS_COMPLEX all set. A multi-level file here must match."""
+        level0 = b"\x00" * 8  # 4x4, 1 BC1 block
+        level1 = b"\x11" * 8  # 2x2, still 1 block (BC1 pads up to a full block)
+        level2 = b"\x22" * 8  # 1x1, still 1 block
+        out = main._build_dds_bytes(4, 4, [level0, level1, level2], b"DXT1", block_size=8)
+        dwFlags, dwHeight, dwWidth, dwPitchOrLinearSize, dwDepth, dwMipMapCount = struct.unpack_from("<6I", out, 8)
+        self.assertEqual(dwFlags & 0x20000, 0x20000, "DDSD_MIPMAPCOUNT must be set")
+        self.assertEqual(dwMipMapCount, 3)
+        dwCaps = struct.unpack_from("<I", out, 76 + 32)[0]
+        self.assertEqual(dwCaps & 0x8, 0x8, "DDSCAPS_COMPLEX must be set")
+        self.assertEqual(dwCaps & 0x400000, 0x400000, "DDSCAPS_MIPMAP must be set")
+        # dwPitchOrLinearSize is level 0's own size only, never the sum.
+        self.assertEqual(dwPitchOrLinearSize, 8)
+        # All three levels' bytes present, in order, right after the header.
+        self.assertEqual(out[128:], level0 + level1 + level2)
 
 
 class TestRepackageKtx2ToDds(unittest.TestCase):
@@ -93,6 +150,51 @@ class TestRepackageKtx2ToDds(unittest.TestCase):
 
             redecoded_png = td / "redecoded.png"
             self.assertTrue(convert_module.decode_dds_bytes_to_png(dds_path.read_bytes(), redecoded_png))
+            actual = np.array(Image.open(redecoded_png).convert("RGBA"))
+            np.testing.assert_array_equal(actual, expected)
+
+    def test_real_multi_level_source_produces_a_real_mip_chain_end_to_end(self):
+        """CONFIRMED REAL BUG this pins, end-to-end through
+        repackage_ktx2_to_dds itself (not just _build_dds_bytes in
+        isolation): a source KTX2 with a real mip chain (3 levels here,
+        matching how real MSFS textures are actually authored) must
+        produce a DDS whose header correctly declares that same mip
+        chain (X-Plane 11 rejects a single-level DDS outright, even one
+        with fully valid magic bytes and FourCC -- confirmed via a
+        byte-for-byte comparison against a different, real, working
+        converter's own DDS output for the same source texture), AND
+        whose level-0 pixels still decode identically to a full PNG
+        decode of the source's own level 0."""
+        import importlib
+        convert_module = importlib.import_module("mesh_convert.convert")
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            level0 = _fake_block_bytes(32, seed=1)  # 8x8 -> 2x2 blocks -> 4 BC1 blocks
+            level1 = _fake_block_bytes(8, seed=2)    # 4x4 -> 1 block
+            level2 = _fake_block_bytes(8, seed=3)    # 2x2 -> 1 block (padded up to a full block)
+            ktx2_path = td / "some_wall.ktx2"
+            ktx2_path.write_bytes(_build_fake_ktx2(
+                main.VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 8, 8, level0,
+                extra_levels=[level1, level2]))
+
+            dds_path = td / "some_wall.dds"
+            self.assertIs(main.repackage_ktx2_to_dds(ktx2_path, dds_path), True)
+            dds_bytes = dds_path.read_bytes()
+
+            dwMipMapCount = struct.unpack_from("<I", dds_bytes, 28)[0]
+            self.assertEqual(dwMipMapCount, 3, "must declare the real 3-level mip chain")
+            dwFlags = struct.unpack_from("<I", dds_bytes, 8)[0]
+            self.assertEqual(dwFlags & 0x20000, 0x20000, "DDSD_MIPMAPCOUNT must be set")
+            dwCaps = struct.unpack_from("<I", dds_bytes, 76 + 32)[0]
+            self.assertEqual(dwCaps & 0x400000, 0x400000, "DDSCAPS_MIPMAP must be set")
+
+            png_path = td / "some_wall_full.png"
+            self.assertIs(main.decode_ktx2_to_png(ktx2_path, png_path), True)
+            expected = np.array(Image.open(png_path).convert("RGBA"))
+
+            redecoded_png = td / "redecoded.png"
+            self.assertTrue(convert_module.decode_dds_bytes_to_png(dds_bytes, redecoded_png))
             actual = np.array(Image.open(redecoded_png).convert("RGBA"))
             np.testing.assert_array_equal(actual, expected)
 

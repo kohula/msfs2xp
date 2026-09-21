@@ -648,35 +648,64 @@ _KTX2_SUPERCOMPRESSION_ZSTD   = 2
 _KTX2_SUPERCOMPRESSION_ZLIB   = 3
 
 
-def _build_dds_bytes(width, height, compressed_bytes, fourcc, dxgi_format=None, block_size=16):
-    """Builds a minimal, single-mip-level DDS file (magic + DDS_HEADER,
-    with a DDS_HEADER_DXT10 extension when dxgi_format is given) wrapping
-    compressed_bytes UNCHANGED -- a pure container rewrap, not a
-    recompress: the GPU-native block data X-Plane's own DDS loader reads
-    is bit-for-bit identical to what the source KTX2 already had. Byte
-    offsets (fourCC at 84, compressed data at 128, or 148 with a DX10
-    header) match mesh_convert.convert.decode_dds_bytes_to_png's own
-    reader exactly, so a file this writes decodes correctly there too."""
+def _build_dds_bytes(width, height, level_bytes_list, fourcc, dxgi_format=None, block_size=16):
+    """Builds a DDS file (magic + DDS_HEADER, with a DDS_HEADER_DXT10
+    extension when dxgi_format is given) wrapping level_bytes_list
+    UNCHANGED -- a pure container rewrap, not a recompress: the GPU-
+    native block data X-Plane's own DDS loader reads is bit-for-bit
+    identical to what the source KTX2 already had. level_bytes_list is
+    every mip level's own bytes, level 0 (base/highest-res) first,
+    concatenated in that order after the header -- DDS has no per-level
+    framing of its own, just a flat byte stream at the sizes implied by
+    width/height halving each level, so all this does is concatenate
+    them in the right order with the right header fields.
+
+    Sets DDSD_MIPMAPCOUNT/DDSCAPS_MIPMAP/DDSCAPS_COMPLEX and a real
+    dwMipMapCount when there's more than one level -- CONFIRMED REAL
+    BUG this fixes: X-Plane 11's own DDS loader rejects a single-level
+    file outright ("missing texture" in its own Log.txt, even with
+    fully valid magic bytes and a correct legacy FourCC), confirmed by
+    a byte-for-byte header comparison against a different, real,
+    working MSFS->X-Plane converter's own DDS output for the exact same
+    source texture (dwMipMapCount=11 for a 1024x1024 texture, all three
+    of those flags/caps set -- this project's single-level output had
+    none of them).
+
+    Byte offsets (fourCC at 84, level-0 data starting at 128, or 148
+    with a DX10 header) match mesh_convert.convert.decode_dds_bytes_to_
+    png's own reader exactly -- it only reads level 0, which is
+    correct: any further mip data after it is simply extra trailing
+    bytes that reader never looks at."""
     DDSD_CAPS = 0x1
     DDSD_HEIGHT = 0x2
     DDSD_WIDTH = 0x4
     DDSD_PIXELFORMAT = 0x1000
     DDSD_LINEARSIZE = 0x80000
+    DDSD_MIPMAPCOUNT = 0x20000
     DDSCAPS_TEXTURE = 0x1000
+    DDSCAPS_COMPLEX = 0x8
+    DDSCAPS_MIPMAP = 0x400000
     DDPF_FOURCC = 0x4
 
     blocks_w = max(1, (width + 3) // 4)
     blocks_h = max(1, (height + 3) // 4)
-    linear_size = blocks_w * blocks_h * block_size
+    linear_size = blocks_w * blocks_h * block_size  # level 0's own size only, regardless of mip count
     flags = DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PIXELFORMAT | DDSD_LINEARSIZE
+    caps = DDSCAPS_TEXTURE
+    mip_count = 0
+    n_levels = len(level_bytes_list)
+    if n_levels > 1:
+        flags |= DDSD_MIPMAPCOUNT
+        caps |= DDSCAPS_COMPLEX | DDSCAPS_MIPMAP
+        mip_count = n_levels
 
-    header_pre_pf = struct.pack("<7I11I", 124, flags, height, width, linear_size, 0, 0, *([0] * 11))
+    header_pre_pf = struct.pack("<7I11I", 124, flags, height, width, linear_size, 0, mip_count, *([0] * 11))
     pixelformat = struct.pack("<2I4s5I", 32, DDPF_FOURCC, fourcc, 0, 0, 0, 0, 0)
-    caps = struct.pack("<5I", DDSCAPS_TEXTURE, 0, 0, 0, 0)
-    out = b"DDS " + header_pre_pf + pixelformat + caps
+    caps_block = struct.pack("<5I", caps, 0, 0, 0, 0)
+    out = b"DDS " + header_pre_pf + pixelformat + caps_block
     if dxgi_format is not None:
         out += struct.pack("<5I", dxgi_format, 3, 0, 1, 0)  # resourceDimension=3 (TEXTURE2D)
-    return out + compressed_bytes
+    return out + b"".join(level_bytes_list)
 
 
 def _bc5_snorm_to_unorm_bytes(data):
@@ -1078,6 +1107,55 @@ def parse_ktx2_header(file_path):
         "compressed_bytes": compressed_bytes,
     }
 
+
+def parse_ktx2_all_levels(file_path):
+    """Like parse_ktx2_header, but returns EVERY mip level's own raw
+    (still supercompressed) bytes, not just level 0 -- needed to build a
+    DDS with a REAL mip chain. CONFIRMED REAL BUG this exists to fix:
+    X-Plane 11's own DDS loader rejects a single-level DDS outright
+    ("missing texture" in its own Log.txt, even with fully valid magic
+    bytes and a correct legacy FourCC) -- confirmed by a byte-for-byte
+    header comparison against a different, real, working MSFS->X-Plane
+    converter's own DDS output for the exact same source texture: theirs
+    had a real dwMipMapCount (11, for a 1024x1024 texture) with
+    DDSD_MIPMAPCOUNT/DDSCAPS_MIPMAP/DDSCAPS_COMPLEX all set; this
+    project's repackaged output had none of those. KTX2 level index
+    entry 0 is level 0 (the base/highest-resolution level, same
+    convention parse_ktx2_header already relies on), ascending index =
+    smaller mip, matching DDS's own level ordering exactly -- no
+    reordering needed, just reading every entry instead of only the
+    first."""
+    with open(file_path, "rb") as f:
+        magic = f.read(12)
+        if magic != b"\xabKTX 20\xbb\r\n\x1a\n":
+            raise ValueError(f"Not a valid KTX2 file: {file_path}")
+
+        header_data = f.read(17 * 4)
+        unpacked = struct.unpack("<17I", header_data)
+
+        vk_format = unpacked[0]
+        pixel_width = unpacked[2]
+        pixel_height = unpacked[3]
+        level_count = unpacked[7]
+        supercompression_scheme = unpacked[8]
+
+        level_index_data = f.read(level_count * 24)
+        level_spans = [struct.unpack_from("<3Q", level_index_data, i * 24)[:2] for i in range(level_count)]
+
+        levels = []
+        for offset, length in level_spans:
+            f.seek(offset)
+            levels.append(f.read(length))
+
+    return {
+        "width": pixel_width,
+        "height": pixel_height,
+        "vk_format": vk_format,
+        "supercompression": supercompression_scheme,
+        "levels": levels,
+    }
+
+
 def decode_ktx2_to_png(input_path, output_path):
     try:
         info = parse_ktx2_header(input_path)
@@ -1172,9 +1250,13 @@ def repackage_ktx2_to_dds(input_path, output_path):
     lighting in-sim. The caller is responsible for routing "_norm"
     textures to decode_ktx2_to_png instead, using the same filename
     convention decode_ktx2_to_png itself already keys its own
-    reconstruction on."""
+    reconstruction on.
+
+    Includes EVERY mip level the source KTX2 has, not just level 0 --
+    see _build_dds_bytes's own docstring for the confirmed real bug
+    (X-Plane 11 rejects a single-level DDS outright) this fixes."""
     try:
-        info = parse_ktx2_header(input_path)
+        info = parse_ktx2_all_levels(input_path)
     except Exception as e:
         return str(e)
 
@@ -1183,15 +1265,18 @@ def repackage_ktx2_to_dds(input_path, output_path):
         return "Skipped: true ETC1S/BasisLZ supercompression requires the Basis Universal transcoder."
 
     width, height, vk_fmt = info["width"], info["height"], info["vk_format"]
-    raw_data = _decompress_supercompressed(info["compressed_bytes"], scheme)
-    if raw_data is None:
-        name = {2: "Zstd", 3: "ZLIB"}.get(scheme, str(scheme))
-        return f"Skipped: {name}-supercompressed KTX2 but the '{name.lower()}' module isn't installed."
+    level_bytes_list = []
+    for raw_level in info["levels"]:
+        decompressed = _decompress_supercompressed(raw_level, scheme)
+        if decompressed is None:
+            name = {2: "Zstd", 3: "ZLIB"}.get(scheme, str(scheme))
+            return f"Skipped: {name}-supercompressed KTX2 but the '{name.lower()}' module isn't installed."
+        level_bytes_list.append(decompressed)
 
     if vk_fmt in (VK_FORMAT_BC1_RGB_UNORM_BLOCK, VK_FORMAT_BC1_RGBA_UNORM_BLOCK):
-        dds_bytes = _build_dds_bytes(width, height, raw_data, b"DXT1", block_size=8)
+        dds_bytes = _build_dds_bytes(width, height, level_bytes_list, b"DXT1", block_size=8)
     elif vk_fmt == VK_FORMAT_BC3_UNORM_BLOCK:
-        dds_bytes = _build_dds_bytes(width, height, raw_data, b"DXT5", block_size=16)
+        dds_bytes = _build_dds_bytes(width, height, level_bytes_list, b"DXT5", block_size=16)
     else:
         return f"Unsupported VkFormat for repackaging (X-Plane 11's DDS loader has no confirmed DX10/BC4-7 support): {vk_fmt}"
 
