@@ -129,7 +129,7 @@ class MatBuilder:
         self.double_sided = False
         self.is_glass = False
         self.is_decal = False
-        self.is_near_ground_flat = False  # per-material draping fallback -- see convert()
+        self.is_near_ground_flat = False  # per-material ground-level detection -- DROPS the builder, doesn't drape it -- see convert()
         self.all_source_nodes_flat = True  # AND-reduced across every contributing node -- see convert()
         self.block_footprint_areas = []  # per-node-block XZ bbox area, m^2 -- see convert()'s footprint write-up
 
@@ -466,31 +466,34 @@ def compute_file_flatness_and_reference(gltf, buffers, world_transforms, flat_ep
         same two tallies broken out PER MATERIAL instead -- matches the
         actual granularity convert() builds output objects at (one
         "builder" per mat_idx, see builder_key in convert()), unlike
-        node_stats above. Used as a narrow, OPT-IN fallback for materials
-        the file-wide verdict rejects: a real EGLC ground-layer model
-        packs ~25 unrelated materials (asphalt, concrete, paint markings,
-        individual paver/tile decals, plus one genuinely 3D ramp detail)
-        into ONE file, and that one non-flat material vetoes ATTR_draped
-        for every other material too under the file-wide, all-or-nothing
-        check -- confirmed real symptom: paver/tile materials each
-        individually ~95%+ flat (by this same per-triangle test, just at
-        a looser per-material threshold -- see
-        _NEAR_GROUND_FLAT_FRACTION_THRESHOLD in convert()) end up written
-        as RIGID objects instead, at whatever small nonzero local Y they
-        happened to be authored at (a baked authoring-tool artifact,
-        confirmed ~1.5m for one real case), which repro's exactly as
-        "pavement floating above the ground" once compiled (rigid
-        geometry renders its authored Y as-is; only ATTR_draped discards
-        it and re-projects onto real terrain at render time). convert()
-        only trusts material_stats for a material when its own
-        reference_height is ALSO close to the file's overall
+        node_stats above. Used to DETECT materials the file-wide verdict
+        rejects but that are themselves near-flat and near ground level: a
+        real EGLC ground-layer model packs ~25 unrelated materials
+        (asphalt, concrete, paint markings, individual paver/tile decals,
+        plus one genuinely 3D ramp detail) into ONE file, and that one
+        non-flat material vetoes ATTR_draped for every other material too
+        under the file-wide, all-or-nothing check -- confirmed real
+        symptom: paver/tile materials each individually ~95%+ flat (by
+        this same per-triangle test, just at a looser per-material
+        threshold -- see _NEAR_GROUND_FLAT_FRACTION_THRESHOLD in
+        convert()) end up written as RIGID objects instead, at whatever
+        small nonzero local Y they happened to be authored at (a baked
+        authoring-tool artifact, confirmed ~1.5m for one real case), which
+        repro's exactly as "pavement floating above the ground" once
+        compiled. convert() only trusts material_stats for a material when
+        its own reference_height is ALSO close to the file's overall
         reference_height (see _NEAR_GROUND_FLAT_TOLERANCE_M in convert())
         -- flatness alone isn't enough, since a building's flat ROOF or a
         bridge deck's flat TOP would also pass a pure per-material
         flatness test despite being meters above the file's own ground
         level, and must stay rigid (this is exactly the failure mode an
         earlier, more aggressive per-material attempt hit this session:
-        it had no ground-proximity check at all).
+        it had no ground-proximity check at all). A material detected this
+        way is DROPPED from the output entirely, not draped with a
+        guessed layer rank -- MSFS's own intended stacking order for this
+        kind of small patch/paver detail can't be recovered from the
+        source data, per explicit instruction, so omitting it is
+        preferred over risking another wrong-looking render.
     """
     total_tris = 0
     flat_tris = 0
@@ -2093,14 +2096,17 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
 
                         builder.is_decal = "decal" in raw_mat_name.lower() or "ASOBO_material_decal" in exts
 
-                        # Narrow fallback for materials the file-wide
-                        # verdict rejects (see material_stats in
-                        # compute_file_flatness_and_reference's own
-                        # docstring for the full real-world case this
-                        # covers -- ground-layer models with one non-flat
-                        # sibling material vetoing ATTR_draped for every
-                        # OTHER, individually-flat material in the same
-                        # file). Two conditions, both required:
+                        # Narrow DETECTION (not draping -- see
+                        # builder_is_dropped_map below, where a material
+                        # that only qualifies here gets DROPPED from the
+                        # output entirely, not drape-and-ranked) for
+                        # materials the file-wide verdict rejects (see
+                        # material_stats in compute_file_flatness_and_
+                        # reference's own docstring for the full real-world
+                        # case this covers -- ground-layer models with one
+                        # non-flat sibling material vetoing ATTR_draped for
+                        # every OTHER, individually-flat material in the
+                        # same file). Two conditions, both required:
                         #   1. This material's OWN geometry passes a strict
                         #      per-triangle flatness test, at
                         #      _NEAR_GROUND_FLAT_FRACTION_THRESHOLD (0.90,
@@ -2109,34 +2115,37 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                         #      seam detail that keeps it under 0.98 even
                         #      when it's unambiguously ground-level pavement.
                         #      Confirmed against the real EGLC source: the
-                        #      exact material this fallback exists for,
+                        #      exact material this exists for,
                         #      ini_GP_GEN_SmallTiles_4m_01, measures 0.9577
-                        #      -- 0.98 never fired on it at all, silently
-                        #      leaving it rigid/floating even with this
-                        #      fallback in place. 0.90 isn't an arbitrary
-                        #      retreat: it's the same threshold this
-                        #      project's own (currently-unused) per-node
-                        #      classification already used, for the same
-                        #      reasoning -- a node wrongly classified flat
-                        #      costs nothing (ATTR_draped just re-projects
-                        #      it onto terrain), while one wrongly left
-                        #      rigid visibly floats, so leniency is the
-                        #      safe direction to round to. Checked every
-                        #      other material in the same real file at this
-                        #      threshold too: every material that should
-                        #      stay rigid (the genuine 3D ramp Slope_01,
-                        #      plus Concrete_01/Grunge_01/Colour_01) sits at
-                        #      0.89 or well below, comfortably clear of 0.90.
+                        #      -- 0.98 never fired on it at all. Not an
+                        #      arbitrary retreat: 0.90 is the same threshold
+                        #      this project's own (currently-unused)
+                        #      per-node classification already used.
+                        #      Checked every other material in the same
+                        #      real file at this threshold too: every
+                        #      material that should stay rigid (the genuine
+                        #      3D ramp Slope_01, plus Concrete_01/
+                        #      Grunge_01/Colour_01) sits at 0.89 or well
+                        #      below, comfortably clear of 0.90. The outcome
+                        #      here is DROP, not drape (see
+                        #      builder_is_dropped_map below) -- a false
+                        #      positive loses one small patch-scale detail
+                        #      object, a false negative just leaves the
+                        #      original rigid/floating symptom in place;
+                        #      neither is as costly as it would be if the
+                        #      outcome were still "drape with a guessed
+                        #      rank", which is why this can stay lenient.
                         #   2. Its own flat elevation is close to the
                         #      file's overall ground-level reference. Flatness
                         #      alone isn't enough: a building's flat ROOF or a
                         #      bridge's flat deck TOP would also pass condition
                         #      1 despite sitting meters above the file's real
-                        #      ground level, and must stay rigid -- this is
-                        #      exactly the failure mode a more aggressive
-                        #      per-material attempt hit earlier this session
-                        #      (it had no ground-proximity check at all and
-                        #      wrongly flattened chairs/glass/rooftops).
+                        #      ground level, and must stay rigid (not get
+                        #      dropped) -- this is exactly the failure mode a
+                        #      more aggressive per-material attempt hit
+                        #      earlier this session (it had no ground-
+                        #      proximity check at all and wrongly flattened
+                        #      chairs/glass/rooftops).
                         _mat_flat_fraction, _mat_ref_height = material_flatness_stats.get(mat_idx, (0.0, None))
                         builder.is_near_ground_flat = (
                             _mat_flat_fraction >= _NEAR_GROUND_FLAT_FRACTION_THRESHOLD
@@ -2930,10 +2939,27 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
     # texture assignment) is safe.
     draped_areas = {}
     builder_is_draped_map = {}
+    builder_is_dropped_map = {}
     for builder_key, builder in builders.items():
         num_verts = len(builder.vertices)
-        is_draped = (bool(num_verts) and builder.all_source_nodes_flat) or getattr(builder, 'is_decal', False) or (
-            bool(num_verts) and getattr(builder, 'is_near_ground_flat', False))
+        file_wide_flat = bool(num_verts) and builder.all_source_nodes_flat
+        is_decal = getattr(builder, 'is_decal', False)
+        # DROPPED, not draped: a material that ONLY qualifies through the
+        # near-ground-flat fallback (not the file-wide verdict, not the
+        # explicit "decal"-named path) gets OMITTED from the output
+        # entirely rather than draped with a guessed layer rank. Per
+        # explicit instruction: MSFS's own intended stacking order for
+        # these small patch/paver-style materials can't be recovered from
+        # the source data, so a wrong guess (floating OR wrongly stacked)
+        # is worse than simply not including them -- the confirmed real
+        # cases (EGLC's SmallTiles/ConcreteTile materials) are individually
+        # small texture-atlas details, not load-bearing geometry, so
+        # dropping them is an acceptable trade against risking another
+        # wrong-looking render.
+        is_dropped = (not file_wide_flat and not is_decal
+                      and bool(num_verts) and getattr(builder, 'is_near_ground_flat', False))
+        builder_is_dropped_map[builder_key] = is_dropped
+        is_draped = (not is_dropped) and (file_wide_flat or is_decal)
         builder_is_draped_map[builder_key] = is_draped
         if is_draped and builder.block_footprint_areas:
             draped_areas[builder_key] = float(np.median(builder.block_footprint_areas))
@@ -2941,6 +2967,14 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
 
     obj_paths = []
     for builder_key, builder in builders.items():
+        if builder_is_dropped_map.get(builder_key):
+            logger.info(
+                f"{glb_path.name}: dropping '{builder.name}' -- only qualifies as ground-level "
+                f"via the near-ground-flat fallback (not file-wide flat, not decal-named); MSFS's "
+                f"own intended stacking order for this content can't be recovered, so it's omitted "
+                f"rather than rendered with a guessed layer rank."
+            )
+            continue
         if not builder.texture_name:
             # A BLEND material (glass, tinted panels, etc.) with no texture
             # of its own MUST get a texture whose alpha channel actually

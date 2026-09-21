@@ -426,16 +426,19 @@ class TestFlatnessTiltedExclusivity(unittest.TestCase):
 
         return b.build()
 
-    def test_near_ground_flat_material_drapes_despite_file_wide_veto(self):
-        """The per-material near-ground-flat fallback (convert()'s
+    def test_near_ground_flat_material_is_dropped_not_draped(self):
+        """The per-material near-ground-flat DETECTION (convert()'s
         builder.is_near_ground_flat): a non-"decal"-named material that is
         individually ~100% flat AND close to the file's own ground-level
-        reference must still drape, even though the file-wide verdict
-        fails because of the building's genuinely non-flat walls.
-        Confirmed real case this pins: EGLC's SmallTiles/ConcreteTile
-        materials, baked ~1.5m off true ground level, previously stayed
-        rigid (visibly floating) because only the "decal"-named sibling in
-        the same file got draped."""
+        reference is DROPPED from the output entirely (not written), even
+        though the file-wide verdict fails because of the building's
+        genuinely non-flat walls -- per explicit instruction: MSFS's own
+        intended stacking order for this kind of small patch/paver detail
+        can't be recovered from the source data, so it's safer to omit it
+        than render it wrong (floating, or drape-ranked in a guessed
+        position). Confirmed real case this pins: EGLC's SmallTiles/
+        ConcreteTile materials, baked ~1.5m off true ground level -- this
+        mechanism used to drape them; now it drops them instead."""
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             glb_path = td / "ground_layer.glb"
@@ -449,29 +452,28 @@ class TestFlatnessTiltedExclusivity(unittest.TestCase):
             self.assertTrue(result)
 
             building_obj = next(p for p in result if "BuildingMat" in p.name)
-            paver_obj = next(p for p in result if "PaverMat" in p.name)
-
             building_text = building_obj.read_text(encoding="utf-8")
-            paver_text = paver_obj.read_text(encoding="utf-8")
-
             self.assertIn("TILTED", building_text.splitlines(), "the rigid building must still get TILTED")
             self.assertNotIn("ATTR_draped", building_text, "the rigid building must not be draped")
 
-            self.assertIn("ATTR_draped", paver_text,
-                          "a non-decal material that's individually flat and near ground level must drape")
-            self.assertNotIn("TILTED", paver_text.splitlines(),
-                              "a draped material must never also get TILTED")
+            paver_matches = [p for p in result if "PaverMat" in p.name]
+            self.assertEqual(paver_matches, [],
+                              "a non-decal material that only qualifies via the near-ground-flat "
+                              "fallback must be dropped from the output, not written at all")
 
-    def test_elevated_flat_material_does_not_drape_just_because_its_flat(self):
-        """The near-ground-flat fallback must NOT fire for a flat material
-        that sits meters above the file's own ground level (a roof, a
-        bridge deck top) -- flatness alone isn't the signal, proximity to
-        ground level is what distinguishes "floating pavement" from "a
-        real elevated flat surface that must stay rigid". This is exactly
-        the failure mode an earlier, more aggressive per-material attempt
-        hit this session (no ground-proximity check at all, wrongly
-        flattened chairs/glass/rooftops) -- this test pins that it can't
-        happen again via this narrower mechanism."""
+    def test_elevated_flat_material_stays_rigid_not_dropped(self):
+        """The near-ground-flat DETECTION must NOT fire for a flat
+        material that sits meters above the file's own ground level (a
+        roof, a bridge deck top) -- flatness alone isn't the signal,
+        proximity to ground level is what distinguishes "floating
+        pavement" from "a real elevated flat surface that must stay
+        rigid". This is exactly the failure mode an earlier, more
+        aggressive per-material attempt hit this session (no ground-
+        proximity check at all, wrongly flattened chairs/glass/rooftops)
+        -- this test pins that it can't happen again via this narrower
+        mechanism. Unlike a true near-ground-flat match, this must stay
+        present in the output (rigid), not get dropped -- dropping is
+        only for the ground-level case."""
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             glb_path = td / "ground_layer.glb"
@@ -489,7 +491,7 @@ class TestFlatnessTiltedExclusivity(unittest.TestCase):
 
             self.assertNotIn("ATTR_draped", roof_text,
                              "an individually-flat but elevated material must not drape just because it's flat")
-            self.assertIn("TILTED", roof_text.splitlines(), "it must stay rigid instead")
+            self.assertIn("TILTED", roof_text.splitlines(), "it must stay rigid instead, and stay present in the output")
 
 
 if __name__ == "__main__":
