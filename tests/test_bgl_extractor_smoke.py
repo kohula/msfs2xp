@@ -960,5 +960,72 @@ class TestDedupeNearIdenticalAnchors(unittest.TestCase):
         self.assertEqual(len(out), 2, "an anchor with no position can't be grouped -- kept as-is, not dropped")
 
 
+class TestRemoveRedundantContainerWrappers(unittest.TestCase):
+    """CONFIRMED REAL BUG (a real EGLC package): three TateLyle factory
+    buildings (Pier01_clutter, Pier02, Wall) were each placed twice --
+    once via their raw SimPropContainer wrapper placement, once via that
+    same container's own SPB expansion -- because the wrapper's own guid
+    ALSO happened to be independently resolvable (present in guid_map),
+    which the old removal condition treated as "must survive, this is
+    real separate content" even though the wrapper's guid was PROVEN
+    identical to one of its own expanded children's guids (a confirmed
+    duplicate, not a legitimate container=shell/child=detail case)."""
+
+    def test_wrapper_removed_when_its_guid_matches_one_of_its_own_children(self):
+        wrapper = {"guid": "container-g1", "container_guid": None, "title": "Wrapper"}
+        child = {"guid": "container-g1", "container_guid": "container-g1", "title": "Child"}
+        resolvably_expanded = {"container-g1": {"container-g1"}}
+        guid_map = {"container-g1": "SomeModel"}
+        out, dropped = bgl_extractor._remove_redundant_container_wrappers(
+            [wrapper, child], resolvably_expanded, guid_map)
+        self.assertEqual(dropped, 1)
+        self.assertEqual(out, [child], "the wrapper must be dropped, the real child placement kept")
+
+    def test_wrapper_kept_when_its_guid_resolves_to_something_unrelated_to_its_children(self):
+        """The case the original condition exists to protect: the
+        wrapper's own guid is independently resolvable, but to a model
+        that's genuinely different from anything its children produced
+        (container=shell, child=attached detail) -- must NOT be dropped."""
+        wrapper = {"guid": "container-g1", "container_guid": None, "title": "Shell"}
+        child = {"guid": "detail-g2", "container_guid": "container-g1", "title": "AttachedDetail"}
+        resolvably_expanded = {"container-g1": {"detail-g2"}}
+        guid_map = {"container-g1": "ShellModel", "detail-g2": "DetailModel"}
+        out, dropped = bgl_extractor._remove_redundant_container_wrappers(
+            [wrapper, child], resolvably_expanded, guid_map)
+        self.assertEqual(dropped, 0)
+        self.assertEqual(len(out), 2, "both the shell and its attached detail are real, separate content")
+
+    def test_wrapper_removed_when_its_guid_is_not_independently_resolvable(self):
+        """The pre-existing condition, unchanged: a wrapper whose own
+        guid isn't in guid_map at all still gets dropped once its
+        container is known to have expanded successfully."""
+        wrapper = {"guid": "container-g1", "container_guid": None, "title": "Wrapper"}
+        child = {"guid": "child-g2", "container_guid": "container-g1", "title": "Child"}
+        resolvably_expanded = {"container-g1": {"child-g2"}}
+        guid_map = {"child-g2": "ChildModel"}  # container-g1 itself is NOT in guid_map
+        out, dropped = bgl_extractor._remove_redundant_container_wrappers(
+            [wrapper, child], resolvably_expanded, guid_map)
+        self.assertEqual(dropped, 1)
+        self.assertEqual(out, [child])
+
+    def test_spb_child_placements_never_removed_even_if_their_guid_qualifies(self):
+        """container_guid is not None for a real SPB child -- the filter
+        must never remove an actual child placement, only a wrapper."""
+        child_a = {"guid": "container-g1", "container_guid": "container-g1", "title": "ChildA"}
+        resolvably_expanded = {"container-g1": {"container-g1"}}
+        guid_map = {"container-g1": "SomeModel"}
+        out, dropped = bgl_extractor._remove_redundant_container_wrappers(
+            [child_a], resolvably_expanded, guid_map)
+        self.assertEqual(dropped, 0)
+        self.assertEqual(out, [child_a])
+
+    def test_unrelated_placement_untouched(self):
+        other = {"guid": "totally-unrelated", "container_guid": None, "title": "Other"}
+        out, dropped = bgl_extractor._remove_redundant_container_wrappers(
+            [other], {"container-g1": {"child-g2"}}, {"child-g2": "ChildModel"})
+        self.assertEqual(dropped, 0)
+        self.assertEqual(out, [other])
+
+
 if __name__ == "__main__":
     unittest.main()

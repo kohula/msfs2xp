@@ -1881,6 +1881,49 @@ def _dedupe_placements(placements):
     return out, dropped
 
 
+def _remove_redundant_container_wrappers(placements, resolvably_expanded, guid_map):
+    """placements: the accumulated placement list. resolvably_expanded:
+    {container_guid: {child_guid, ...}} -- every container whose SPB
+    expansion produced at least one child resolving to a real model, and
+    exactly which child guids those were. guid_map: the guid->model
+    index. Returns (filtered_placements, dropped_count).
+
+    A container's own raw BGL wrapper placement is redundant, and safe
+    to drop, once its SPB expansion is known to have produced real
+    content -- EXCEPT when the wrapper's own guid independently resolves
+    to a model that's genuinely separate from anything its children
+    produced (a container=shell, child=attached-detail case; dropping
+    the wrapper there would delete the main visible shell and leave only
+    the small attached detail).
+
+    CONFIRMED REAL BUG (a real EGLC package) this closes a gap in: the
+    "not independently resolvable" condition alone let a wrapper survive
+    even when its own guid resolved to the EXACT SAME model as one of
+    its own expanded children -- a confirmed, PROVEN duplicate (not
+    merely a plausible one), not the shell+detail case the condition was
+    meant to protect. Visible real symptom: three TateLyle factory
+    buildings (Pier01_clutter, Pier02, Wall) each placed twice, once via
+    the surviving wrapper and once via its own SPB expansion, offset by
+    ~10m/~1 degree between the two -- confirmed via the compiled DSF,
+    both placements referencing the identical converted model. The
+    original condition stays; this only ADDS a second, proof-based
+    removal path on top of it, so it can only remove MORE confirmed
+    duplicates, never fewer."""
+    before = len(placements)
+    filtered = [
+        p for p in placements
+        if not (
+            p.get("guid") in resolvably_expanded
+            and p.get("container_guid") is None      # not an SPB child itself
+            and (
+                p.get("guid") not in guid_map                            # not independently resolvable
+                or p.get("guid") in resolvably_expanded[p.get("guid")]   # OR proven identical to one of its own expanded children
+            )
+        )
+    ]
+    return filtered, before - len(filtered)
+
+
 def extract(target_path: Path, out_dir: Path, log_callback=None, msfs_install_root=None, scan_terrain_vectors=True,
             propdefs_dir=None):
     def _log(msg, level="info"):
@@ -2135,8 +2178,10 @@ def extract(target_path: Path, out_dir: Path, log_callback=None, msfs_install_ro
         # for when its SPB actually produced at least one child placement
         # that resolves to a model (guid_map or a title cross-match) --
         # otherwise the wrapper must survive so it still reaches the
-        # unresolved picker.
-        _resolvably_expanded = set()
+        # unresolved picker. Maps container_guid -> the set of its own
+        # children's guids that resolved to a real model (not just a
+        # bool) -- see the removal filter below for why.
+        _resolvably_expanded = {}
         # Multi-pass: a container whose own real-world anchor is only
         # producible by ANOTHER .spb's attach output (nested attach
         # chains) has no anchor yet on an early pass purely because of
@@ -2160,8 +2205,10 @@ def extract(target_path: Path, out_dir: Path, log_callback=None, msfs_install_ro
                 _progress = True
                 if spb_placements:
                     cg = spb_placements[0].get("container_guid")
-                    if cg and any(c.get("guid") in guid_map for c in spb_placements):
-                        _resolvably_expanded.add(cg)
+                    if cg:
+                        resolved_child_guids = {c.get("guid") for c in spb_placements if c.get("guid") in guid_map}
+                        if resolved_child_guids:
+                            _resolvably_expanded.setdefault(cg, set()).update(resolved_child_guids)
                     placements.extend(spb_placements)
             if not _progress:
                 if _next_pending:
@@ -2174,16 +2221,7 @@ def extract(target_path: Path, out_dir: Path, log_callback=None, msfs_install_ro
                 break
             _pending = _next_pending
         if _resolvably_expanded:
-            _before = len(placements)
-            placements = [
-                p for p in placements
-                if not (
-                    p.get("guid") in _resolvably_expanded
-                    and p.get("container_guid") is None      # not an SPB child itself
-                    and p.get("guid") not in guid_map        # not independently resolvable
-                )
-            ]
-            _dropped = _before - len(placements)
+            placements, _dropped = _remove_redundant_container_wrappers(placements, _resolvably_expanded, guid_map)
             if _dropped:
                 _log(f"      Removed {_dropped} raw SimPropContainer wrapper placement(s) -- their "
                      f"contained model(s) were expanded and resolved above.", "info")
