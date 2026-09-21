@@ -109,6 +109,84 @@ class TestFlatnessTiltedExclusivity(unittest.TestCase):
                               "the flat decal must never get TILTED -- the exact combination that made "
                               "a real converted object disappear entirely in X-Plane")
 
+    def test_elevated_decal_material_stays_rigid_not_draped(self):
+        """CONFIRMED REAL BUG this pins: a "decal"-named/ASOBO_material_
+        decal-tagged material used to be draped unconditionally on name
+        alone, with no elevation check at all (unlike is_near_ground_flat's
+        own check on the same kind of material one call below). MSFS uses
+        that same BLEND-mode decal material type for more than ground-
+        level stains/markings -- a rooftop weathering/grime overlay meant
+        to stay coincident with its own rigid roof is authored the same
+        way. Confirmed against a real converted LHBP building: a
+        "roof_decal" material at genuine roof height was draped flat onto
+        the ground, far below the roof it was meant to sit on. This
+        fixture mirrors that: a decal-named quad sitting AT the building's
+        own roof height (not at its ground level) must stay rigid."""
+        b = GltfBuilder()
+        tex = b.add_image_data_uri((150, 150, 150, 255))
+        texi = b.add_texture(tex)
+        building_mat = b.add_material("BuildingMat", base_color_texture_index=texi)
+        decal_mat = b.add_material("roof_decal", base_color_texture_index=texi)
+
+        bx = [(-5, 0, -5), (5, 0, -5), (5, 0, 5), (-5, 0, 5), (-5, 6, -5), (5, 6, -5), (5, 6, 5), (-5, 6, 5)]
+        wall_tris = []
+        for a, c, d, e in [(0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)]:
+            wall_tris += [(a, c, d), (a, d, e)]
+        roof_tris = [(4, 5, 6), (4, 6, 7)]
+        # A finely subdivided ground-level floor slab (4x4=32 tris @ y=0)
+        # so the file's own dominant flat reference level resolves to true
+        # ground (y=0), heavily outnumbering the roof's 2 flat tris @ y=6
+        # -- without this, the roof would itself be the only other flat
+        # geometry in the file and could wrongly become the "dominant"
+        # level, defeating the point of this fixture (the roof_decal must
+        # be judged against GROUND level, not against the roof it sits on).
+        floor_tris = []
+        floor_verts = []
+        n = 4
+        for iz in range(n):
+            for ix in range(n):
+                x0, x1 = -5 + ix * (10 / n), -5 + (ix + 1) * (10 / n)
+                z0, z1 = -5 + iz * (10 / n), -5 + (iz + 1) * (10 / n)
+                base = len(bx) + len(floor_verts)
+                floor_verts += [(x0, 0.0, z0), (x1, 0.0, z0), (x1, 0.0, z1), (x0, 0.0, z1)]
+                floor_tris += [(base, base + 1, base + 2), (base, base + 2, base + 3)]
+        building_indices = [i for tri in (wall_tris + roof_tris + floor_tris) for i in tri]
+        building_mesh = b.add_mesh(
+            bx + floor_verts, building_indices,
+            normals=[(0.0, 1.0, 0.0)] * (len(bx) + len(floor_verts)),
+            uvs=[(0.0, 0.0)] * (len(bx) + len(floor_verts)), material_index=building_mat,
+        )
+        b.add_node(mesh_index=building_mesh, name="Building")
+
+        # A "roof_decal" quad sitting AT the roof's own height (y=6, same
+        # as the building's roof triangles above -- not at the file's
+        # ground level, y=0) -- the real-world case this fix targets.
+        decal_verts = [(-4.0, 6.0, -4.0), (4.0, 6.0, -4.0), (4.0, 6.0, 4.0), (-4.0, 6.0, 4.0)]
+        decal_indices = [0, 1, 2, 0, 2, 3]
+        decal_mesh = b.add_mesh(
+            decal_verts, decal_indices,
+            normals=[(0.0, 1.0, 0.0)] * 4, uvs=[(0.0, 0.0)] * 4, material_index=decal_mat,
+        )
+        b.add_node(mesh_index=decal_mesh, name="RoofDecal")
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            glb_path = td / "building_with_roof_decal.glb"
+            glb_path.write_bytes(b.build())
+            obj_dir = td / "objects"
+            tex_dir = td / "textures"
+            obj_dir.mkdir()
+            tex_dir.mkdir()
+
+            result = mesh_convert.convert(glb_path, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
+            self.assertTrue(result)
+
+            decal_obj = next(p for p in result if "roof_decal" in p.name)
+            decal_text = decal_obj.read_text(encoding="utf-8")
+            self.assertNotIn("ATTR_draped", decal_text,
+                              "a decal at genuine roof height must stay rigid, not get projected onto "
+                              "the ground far below its authored position")
+
     def test_mostly_flat_node_with_minor_embossing_still_drapes(self):
         """Flatness/draping is a FILE-WIDE verdict: a node with a small
         amount of embossed/raised detail (here, 10 flat tris + 1 near-

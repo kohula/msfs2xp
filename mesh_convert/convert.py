@@ -2192,7 +2192,26 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                         builder.alpha_cutoff = mat.get("alphaCutoff", 0.5)
                         builder.double_sided = bool(mat.get("doubleSided", False))
 
-                        builder.is_decal = "decal" in raw_mat_name.lower() or "ASOBO_material_decal" in exts
+                        # Name-based signal only here -- the real verdict
+                        # (builder.is_decal) is finalized a bit further
+                        # down, once material_flatness_stats' per-material
+                        # reference height is available, so it can be
+                        # gated on ground-proximity the same way
+                        # is_near_ground_flat is (see that assignment's own
+                        # comment for why: a "decal"-named/ASOBO_material_
+                        # decal-tagged material isn't always a GROUND
+                        # decal -- MSFS also uses that same material type
+                        # for a rooftop weathering/grime overlay meant to
+                        # stay coincident with its own rigid roof, not get
+                        # globally reprojected onto real terrain. CONFIRMED
+                        # REAL BUG this fixes: a real LHBP building's
+                        # "roof_decal" material -- alpha_mode BLEND,
+                        # authored at genuine roof height -- was draped
+                        # unconditionally on name alone, with no elevation
+                        # check at all (unlike is_near_ground_flat's own
+                        # check just below), landing it flat on the ground
+                        # far below the roof it was meant to sit on.
+                        _decal_name_matched = "decal" in raw_mat_name.lower() or "ASOBO_material_decal" in exts
 
                         # Narrow DETECTION only -- this used to gate a DROP
                         # (see the removed builder_is_dropped_map below),
@@ -2263,6 +2282,26 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                             and _mat_ref_height is not None
                             and file_reference_height is not None
                             and abs(_mat_ref_height - file_reference_height) <= _NEAR_GROUND_FLAT_TOLERANCE_M
+                        )
+
+                        # Finalizing is_decal here (see _decal_name_matched
+                        # above): only exclude a decal-named material from
+                        # draping when there's POSITIVE evidence it sits
+                        # away from the file's own ground level -- an
+                        # unknown reference height (None, e.g. non-planar
+                        # decal geometry) keeps the permissive, historical
+                        # behavior (still draped) rather than guessing,
+                        # same asymmetric-default reasoning as is_near_
+                        # ground_flat's own tolerance check just above,
+                        # just inverted: that one defaults to NOT
+                        # qualifying unless proven near ground, this one
+                        # defaults to qualifying unless proven far from it,
+                        # since the name/extension signal is already a
+                        # much stronger positive indicator than mere
+                        # flatness is.
+                        builder.is_decal = _decal_name_matched and (
+                            _mat_ref_height is None or file_reference_height is None
+                            or abs(_mat_ref_height - file_reference_height) <= _NEAR_GROUND_FLAT_TOLERANCE_M
                         )
 
                         # MSFS has shipped several glass extension names
