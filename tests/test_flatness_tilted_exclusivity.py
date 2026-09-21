@@ -384,11 +384,35 @@ class TestFlatnessTiltedExclusivity(unittest.TestCase):
         )
         b.add_node(mesh_index=ground_mesh, name="GroundFill")
 
-        paver_verts = [(10.0, 1.5, 10.0), (12.0, 1.5, 10.0), (12.0, 1.5, 12.0), (10.0, 1.5, 12.0)]
-        paver_indices = [0, 1, 2, 0, 2, 3]
+        # A grid of small individual tile quads (20 of them, 40 flat tris)
+        # plus a couple of small tilted "seam" triangles between them (2
+        # non-flat tris) -- NOT an artificially perfect 100%-flat single
+        # quad. Real tile/paver geometry has genuine small edge/seam
+        # detail; the confirmed real EGLC material this fixture mirrors
+        # (ini_GP_GEN_SmallTiles_4m_01) measures 0.9577 flat, not 1.0 --
+        # an earlier version of this fixture used a single perfect quad,
+        # which passed even the old, too-strict 0.98 per-material
+        # threshold and gave false confidence that threshold was correct.
+        # This fixture's ~40/42 = 0.952 fraction sits in the same real
+        # range, so it only passes at 0.90, not 0.98 -- pinning the actual
+        # regression the real threshold had to be tuned against.
+        paver_verts, paver_tris = [], []
+        for i in range(20):
+            base = len(paver_verts)
+            x0 = 10.0 + i * 0.5
+            paver_verts += [(x0, 1.5, 10.0), (x0 + 0.4, 1.5, 10.0), (x0 + 0.4, 1.5, 10.4), (x0, 1.5, 10.4)]
+            paver_tris += [(base, base + 1, base + 2), (base, base + 2, base + 3)]
+        seam_base = len(paver_verts)
+        paver_verts += [(10.0, 1.5, 10.4), (10.2, 1.7, 10.4), (10.2, 1.5, 10.6)]
+        paver_tris += [(seam_base, seam_base + 1, seam_base + 2)]
+        seam_base2 = len(paver_verts)
+        paver_verts += [(10.5, 1.5, 10.4), (10.7, 1.7, 10.4), (10.7, 1.5, 10.6)]
+        paver_tris += [(seam_base2, seam_base2 + 1, seam_base2 + 2)]
+        paver_indices = [i for tri in paver_tris for i in tri]
         paver_mesh = b.add_mesh(
             paver_verts, paver_indices,
-            normals=[(0.0, 1.0, 0.0)] * 4, uvs=[(0.0, 0.0)] * 4, material_index=paver_mat,
+            normals=[(0.0, 1.0, 0.0)] * len(paver_verts), uvs=[(0.0, 0.0)] * len(paver_verts),
+            material_index=paver_mat,
         )
         b.add_node(mesh_index=paver_mesh, name="PaverPatch")
 

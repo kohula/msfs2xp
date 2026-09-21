@@ -473,7 +473,9 @@ def compute_file_flatness_and_reference(gltf, buffers, world_transforms, flat_ep
         into ONE file, and that one non-flat material vetoes ATTR_draped
         for every other material too under the file-wide, all-or-nothing
         check -- confirmed real symptom: paver/tile materials each
-        individually ~100% flat (by this SAME strict test) end up written
+        individually ~95%+ flat (by this same per-triangle test, just at
+        a looser per-material threshold -- see
+        _NEAR_GROUND_FLAT_FRACTION_THRESHOLD in convert()) end up written
         as RIGID objects instead, at whatever small nonzero local Y they
         happened to be authored at (a baked authoring-tool artifact,
         confirmed ~1.5m for one real case), which repro's exactly as
@@ -1798,6 +1800,10 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
     # elevated flat surface (a roof, a bridge top) still can't qualify
     # just because it's flat.
     _NEAR_GROUND_FLAT_TOLERANCE_M = 2.0
+    # Deliberately looser than flat_fraction_threshold (0.98) -- see the
+    # long comment where this is consumed (builder.is_near_ground_flat)
+    # for the real measured numbers this was picked from.
+    _NEAR_GROUND_FLAT_FRACTION_THRESHOLD = 0.90
     file_flat_fraction, file_reference_height, file_max_radius, file_max_horizontal_radius, node_flatness_stats, material_flatness_stats = compute_file_flatness_and_reference(gltf, buffers, world_transforms)
     file_is_flat_only = file_flat_fraction >= flat_fraction_threshold and file_reference_height is not None
 
@@ -2095,10 +2101,32 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                         # sibling material vetoing ATTR_draped for every
                         # OTHER, individually-flat material in the same
                         # file). Two conditions, both required:
-                        #   1. This material's OWN geometry passes the
-                        #      exact same strict per-triangle flatness test
-                        #      as the file-wide check (flat_fraction_threshold,
-                        #      0.98 -- not a looser bar).
+                        #   1. This material's OWN geometry passes a strict
+                        #      per-triangle flatness test, at
+                        #      _NEAR_GROUND_FLAT_FRACTION_THRESHOLD (0.90,
+                        #      not the file-wide 0.98 -- real tile/paver
+                        #      geometry has a small amount of genuine edge/
+                        #      seam detail that keeps it under 0.98 even
+                        #      when it's unambiguously ground-level pavement.
+                        #      Confirmed against the real EGLC source: the
+                        #      exact material this fallback exists for,
+                        #      ini_GP_GEN_SmallTiles_4m_01, measures 0.9577
+                        #      -- 0.98 never fired on it at all, silently
+                        #      leaving it rigid/floating even with this
+                        #      fallback in place. 0.90 isn't an arbitrary
+                        #      retreat: it's the same threshold this
+                        #      project's own (currently-unused) per-node
+                        #      classification already used, for the same
+                        #      reasoning -- a node wrongly classified flat
+                        #      costs nothing (ATTR_draped just re-projects
+                        #      it onto terrain), while one wrongly left
+                        #      rigid visibly floats, so leniency is the
+                        #      safe direction to round to. Checked every
+                        #      other material in the same real file at this
+                        #      threshold too: every material that should
+                        #      stay rigid (the genuine 3D ramp Slope_01,
+                        #      plus Concrete_01/Grunge_01/Colour_01) sits at
+                        #      0.89 or well below, comfortably clear of 0.90.
                         #   2. Its own flat elevation is close to the
                         #      file's overall ground-level reference. Flatness
                         #      alone isn't enough: a building's flat ROOF or a
@@ -2111,7 +2139,7 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                         #      wrongly flattened chairs/glass/rooftops).
                         _mat_flat_fraction, _mat_ref_height = material_flatness_stats.get(mat_idx, (0.0, None))
                         builder.is_near_ground_flat = (
-                            _mat_flat_fraction >= flat_fraction_threshold
+                            _mat_flat_fraction >= _NEAR_GROUND_FLAT_FRACTION_THRESHOLD
                             and _mat_ref_height is not None
                             and file_reference_height is not None
                             and abs(_mat_ref_height - file_reference_height) <= _NEAR_GROUND_FLAT_TOLERANCE_M
