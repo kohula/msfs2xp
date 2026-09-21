@@ -193,6 +193,44 @@ class TestDecodeOrRepackageKtx2(unittest.TestCase):
             self.assertTrue((td / "roof_albd.dds").exists())
             self.assertFalse((td / "roof_albd.png").exists())
 
+    def test_stale_dds_from_an_older_run_is_removed_when_now_falling_back_to_png(self):
+        """CONFIRMED REAL BUG: run_convert_resume.py's output textures
+        folder isn't cleared between runs. A .dds written under an OLDER
+        version of repackage_ktx2_to_dds (before BC4/BC5/BC7 were
+        excluded) can still be sitting there after an upgrade makes this
+        run correctly fall back to .png for the same stem -- and
+        extract_image's own "prefer an existing .dds" check has no way
+        to know that leftover file is stale, reintroducing the exact
+        DX10-header breakage that was supposedly fixed. Confirmed in
+        real X-Plane Log.txt output: "we are missing the texture" for
+        several *_albd.dds files that had both a stale bad .dds and a
+        fresh, correct .png sitting side by side."""
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            stale_dds = td / "roof_albd.dds"
+            stale_dds.write_bytes(b"DDS " + b"\x00" * 200)  # stands in for an old DX10-header file
+
+            ktx2_path = td / "roof_albd.ktx2"
+            # BC7: unsupported for repackaging, must fall back to .png.
+            ktx2_path.write_bytes(_build_fake_ktx2(main.VK_FORMAT_BC7_UNORM_BLOCK, 4, 4, _fake_block_bytes(16)))
+            result = main.decode_or_repackage_ktx2(ktx2_path, td)
+            self.assertIs(result, True)
+            self.assertTrue((td / "roof_albd.png").exists())
+            self.assertFalse(stale_dds.exists(), "the stale .dds must be removed, not left to shadow the fresh .png")
+
+    def test_stale_png_from_an_older_run_is_removed_when_now_repackaging_to_dds(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            stale_png = td / "roof_albd.png"
+            stale_png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 50)
+
+            ktx2_path = td / "roof_albd.ktx2"
+            ktx2_path.write_bytes(_build_fake_ktx2(main.VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 4, 4, _fake_block_bytes(8)))
+            result = main.decode_or_repackage_ktx2(ktx2_path, td)
+            self.assertIs(result, True)
+            self.assertTrue((td / "roof_albd.dds").exists())
+            self.assertFalse(stale_png.exists(), "the stale .png must be removed, not left to shadow the fresh .dds")
+
     def test_normal_map_never_becomes_dds(self):
         """_norm textures MUST stay on the full decode+Z-reconstruct path
         -- a raw BC5 passthrough would silently drop the reconstructed Z

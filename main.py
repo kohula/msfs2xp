@@ -1212,13 +1212,32 @@ def decode_or_repackage_ktx2(input_path, out_dir):
     Falls back to the full decode-to-PNG path for anything
     repackage_ktx2_to_dds can't handle (true Basis/ETC1S
     supercompression, an unsupported VkFormat, or a missing
-    decompression module)."""
+    decompression module).
+
+    Also deletes a stale FILE OF THE OTHER FORMAT for this same stem, if
+    one exists -- CONFIRMED REAL BUG this fixes: the output textures
+    folder isn't cleared between runs (run_convert_resume.py is
+    deliberately resumable), so a .dds this function wrote under an
+    OLDER version of repackage_ktx2_to_dds (before BC4/BC5/BC7 were
+    excluded) can still be sitting there from a previous run even after
+    an upgrade makes this run correctly choose .png instead for the same
+    stem. extract_image's own "prefer an existing .dds" check (see
+    mesh_convert.convert) has no way to know that stale file is invalid
+    -- it just finds a same-stem .dds and uses it, reintroducing the
+    exact DX10-header breakage that was supposedly fixed. Real symptom
+    confirmed in X-Plane's own Log.txt: "we are missing the texture"
+    for several ini_gp_gen_*_albd.dds files that had both a stale bad
+    .dds AND a fresh, correct .png sitting side by side."""
     stem = _clean_texture_stem(input_path)
-    if "_norm" not in stem:
-        dds_path = out_dir / f"{stem}.dds"
-        if repackage_ktx2_to_dds(input_path, dds_path) is True:
-            return True
+    dds_path = out_dir / f"{stem}.dds"
     png_path = out_dir / f"{stem}.png"
+    if "_norm" not in stem:
+        if repackage_ktx2_to_dds(input_path, dds_path) is True:
+            if png_path.exists():
+                png_path.unlink()
+            return True
+    if dds_path.exists():
+        dds_path.unlink()
     return decode_ktx2_to_png(input_path, png_path)
 
 
