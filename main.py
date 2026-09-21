@@ -3216,7 +3216,7 @@ class ModularPythonConverterApp:
                     all_exclusions = [reference_bbox]
                 source_parts = []
                 if _used_per_object_rects:
-                    source_parts.append("each converted object's own footprint edges (per-object, +2m each)")
+                    source_parts.append("each converted object's own footprint edges (per-object, +0.5m each)")
                 else:
                     if boundary_points and shaped_rects:
                         source_parts.append(f"{matched_apt_ident}'s default boundary shape ({len(boundary_points)} point(s))")
