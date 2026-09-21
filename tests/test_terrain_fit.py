@@ -33,6 +33,24 @@ class TestTerrainFit(unittest.TestCase):
         dsf_dir.mkdir(parents=True, exist_ok=True)
         (dsf_dir / f"{tile_lat:+03d}{tile_lon:+04d}.dsf").write_bytes(build_elevation_dsf(grid))
 
+    def _write_bumpy_terrain(self, root: Path, tile_lat: int, tile_lon: int, bump_scale: float):
+        """A real quadratic bump (not a pure linear ramp) -- unlike
+        _write_sloped_terrain, a symmetric footprint's own grid samples
+        do NOT cancel out to zero when averaged: a linear slope sampled
+        symmetrically around its own center averages to exactly the
+        center's own value (a pure tilt, which _robust_vertical_shift
+        correctly leaves alone -- that's what rotation is for), while a
+        real bump/dip genuinely shifts the whole footprint's average
+        elevation relative to the anchor, which is what a uniform shift
+        SHOULD correct for."""
+        N = 5  # same grid size as _write_sloped_terrain, whose spacing is proven to reach a real object's footprint
+        mid = N // 2
+        grid = [[int(((r - mid) ** 2 + (c - mid) ** 2) * bump_scale) for c in range(N)] for r in range(N)]
+        folder = f"{(tile_lat // 10) * 10:+03d}{(tile_lon // 10) * 10:+04d}"
+        dsf_dir = root / "Global Scenery" / "X-Plane 12 Global Scenery" / "Earth nav data" / folder
+        dsf_dir.mkdir(parents=True, exist_ok=True)
+        (dsf_dir / f"{tile_lat:+03d}{tile_lon:+04d}.dsf").write_bytes(build_elevation_dsf(grid))
+
     def _build_glb(self, path: Path, name: str, texture_name: str, x0, x1, z0, z1, y=0.0):
         b = GltfBuilder()
         tex = b.add_image_data_uri((150, 150, 150, 255), name=texture_name)
@@ -217,28 +235,20 @@ class TestTerrainFit(unittest.TestCase):
             self.assertEqual(results[walls_stem], (walls_stem, False, "skipped_for_polygon_mode"))
             self.assertTrue(results[lights_stem][1], "lights companion is still corrected")
 
-    def test_large_tilted_building_gets_a_rigid_rotation_not_a_shear(self):
-        """Confirmed real regression from a live conversion, in two acts:
-        first an earlier version of this module applied the same
-        per-vertex Y-warp to RIGID (non-draped) siblings too, shearing
-        architectural detail into visibly warped/jagged geometry even on
-        near-flat terrain -- worse than doing nothing. That was fixed by
-        leaving rigid siblings completely untouched (see
-        test_small_tilted_object_stays_disqualified_and_unmodified for
-        that still-correct behavior on a too-small object). But "untouched"
-        for a LARGE qualifying rigid building just means it's still stuck
-        with X-Plane's own crude single-point TILTED rotation -- the
-        original "one side floating" symptom this whole module exists to
-        fix. The real fix: a large TILTED building now gets a single RIGID
-        rotation (not per-vertex) fit against several real terrain samples
-        across its footprint (better than TILTED's one sampled point),
-        replacing TILTED rather than stacking with it -- shape must be
-        perfectly preserved (a rotation, unlike a per-vertex shear, can't
-        distort it)."""
+    def test_large_tilted_building_gets_a_uniform_shift_not_a_shear_or_rotation(self):
+        """A large TILTED building on sloped terrain used to be stuck with
+        X-Plane's own crude single-point TILTED rotation -- the "one side
+        floating" symptom this module exists to fix. It's now corrected
+        with a single UNIFORM vertical shift (every vertex moves by the
+        identical amount), replacing TILTED rather than stacking with it.
+        Not a rotation (a rotation only fixes a genuine tilt, never a
+        uniform height-offset error -- see the module's own docstring for
+        why that was replaced) and not a per-vertex shear (which would
+        distort architectural detail)."""
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             xplane_root = td / "XPlaneRoot"
-            self._write_sloped_terrain(xplane_root, 47, 8, slope_per_post=3000.0)
+            self._write_bumpy_terrain(xplane_root, 47, 8, bump_scale=1500.0)
             obj_dir = td / "objects"
             tex_dir = td / "textures"
             obj_dir.mkdir()
@@ -256,58 +266,39 @@ class TestTerrainFit(unittest.TestCase):
             results = terrain_fit.get_or_create_fitted_group(obj_dir, [stem], 47.5, 8.5, 0.0, xplane_root)
             result_stem, applied, reason = results[stem]
             self.assertTrue(applied, f"a large TILTED building on meaningfully sloped terrain must be corrected (reason={reason})")
-            self.assertEqual(reason, "applied_rigid_tilt")
+            self.assertEqual(reason, "applied_vertical_shift")
             self.assertNotEqual(result_stem, stem, "a corrected copy should have been written")
 
             corrected_text = (obj_dir / f"{result_stem}.obj").read_text(encoding="utf-8")
             self.assertNotIn("TILTED", corrected_text.splitlines(),
-                              "the rigid rotation must REPLACE TILTED, not stack with it")
+                              "the vertical shift must REPLACE TILTED, not stack with it")
 
             corrected_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{result_stem}.obj"))
             self.assertFalse(
                 np.allclose(original_ir.positions, corrected_ir.positions, atol=1e-6),
-                "expected the rotation to actually move the geometry, not be a no-op"
+                "expected the shift to actually move the geometry, not be a no-op"
             )
 
-            # The core rigidity guarantee: a rotation can't change distances
-            # between vertices. Check every pair among a sample of vertices
-            # -- if this were still a per-vertex shear, these would differ.
-            n = len(original_ir.positions)
-            idx = list(range(0, n, max(1, n // 12)))
-            for i in idx:
-                for j in idx:
-                    if i >= j:
-                        continue
-                    d_before = np.linalg.norm(original_ir.positions[i] - original_ir.positions[j])
-                    d_after = np.linalg.norm(corrected_ir.positions[i] - corrected_ir.positions[j])
-                    self.assertAlmostEqual(d_before, d_after, places=5,
-                                            msg=f"vertex pair ({i},{j}) distance changed -- geometry was sheared, not rotated")
+            # X/Z entirely unchanged, and every vertex's Y moved by the
+            # SAME amount -- the core "uniform translation" guarantee. If
+            # this were a rotation or a per-vertex shear, different
+            # vertices would move by different (or nonzero X/Z) amounts.
+            np.testing.assert_allclose(corrected_ir.positions[:, [0, 2]], original_ir.positions[:, [0, 2]], atol=1e-9)
+            dy = corrected_ir.positions[:, 1] - original_ir.positions[:, 1]
+            self.assertAlmostEqual(float(dy.max() - dy.min()), 0.0, places=6,
+                                    msg="every vertex must move by the identical Y amount (a uniform shift)")
 
-    def test_tall_building_with_excessive_implied_roof_displacement_gets_ground_skirt_only(self):
-        """CONFIRMED REAL BUG (part 1): the displacement guard only ever
-        tested the footprint's own GROUND-level (Y=0) corners against
-        _RIGID_TILT_MAX_DISPLACEMENT_M -- but displacement from a rotation
-        scales with distance from the pivot, so a TALL, narrow building's
-        roof moves far more than its base for the exact same angle. A
-        rotation whose ground-corner displacement comfortably passes (as
-        in test_large_tilted_building_gets_a_rigid_rotation_not_a_shear,
-        same terrain/footprint) can still swing a tower's roof many times
-        further than the guard is supposed to allow, since the guard never
-        looked at the object's own height at all -- confirmed real
-        symptom: large buildings visibly floating/leaning after
-        "correction". This building is identical to that passing test
-        except for height (150m instead of 6m) -- the ROTATION must now
-        be rejected.
-
-        CONFIRMED REAL BUG (part 2, found right after part 1 shipped):
-        rejecting the rotation used to mean NO correction at all (result
-        stem unchanged, reason "rigid_skip") -- reverting the whole
-        building to its dead-flat original left a visible gap under the
-        WHOLE base on this same sloped terrain, not just an excessive
-        roof tilt -- worse than before, and especially visible through a
-        glass facade (user: "the glass is worse now"). The base must
-        still get a ground-only "skirt" correction -- ROOF height
-        unchanged (no rotation), base nudged to real terrain."""
+    def test_tall_building_gets_the_same_uniform_shift_as_a_short_one(self):
+        """A rotation-based correction used to need special-casing for a
+        TALL building (a rotation's implied displacement scales with
+        distance from the pivot, so a tower's roof would swing far more
+        than its base for the same angle -- the old "excessive implied
+        roof displacement" guard existed only because of that). A uniform
+        shift has no such scaling concern at all: roof and base both move
+        by the exact same amount, so there's nothing to special-case --
+        this tower (150m instead of the passing 6m box's height, otherwise
+        identical fixture/terrain) must get ordinary applied_vertical_shift,
+        not a different code path."""
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             xplane_root = td / "XPlaneRoot"
@@ -325,54 +316,30 @@ class TestTerrainFit(unittest.TestCase):
 
             results = terrain_fit.get_or_create_fitted_group(obj_dir, [stem], 47.5, 8.5, 0.0, xplane_root)
             result_stem, applied, reason = results[stem]
-            self.assertTrue(applied, "the ground band must still be corrected even though the roof-swinging rotation is rejected")
-            self.assertEqual(reason, "ground_skirt_only")
-            self.assertNotEqual(result_stem, stem, "a corrected copy should have been written")
+            self.assertTrue(applied)
+            self.assertEqual(reason, "applied_vertical_shift")
 
             corrected_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{result_stem}.obj"))
-
-            # Roof (top face, height 150) must be UNCHANGED -- no rotation
-            # means no roof swing at all, which is the whole point.
             roof_mask = original_ir.positions[:, 1] > 100.0
-            self.assertTrue(roof_mask.any(), "test setup issue: expected some roof-height vertices")
-            self.assertTrue(np.allclose(
-                original_ir.positions[roof_mask], corrected_ir.positions[roof_mask], atol=1e-6),
-                "the roof must stay exactly at its original position -- no rotation should reach it")
-
-            # Base (ground-contact band) must actually have moved -- this
-            # is the whole point of the skirt, on real sloped terrain.
             base_mask = original_ir.positions[:, 1] < 0.1
-            self.assertTrue(base_mask.any(), "test setup issue: expected some ground-level vertices")
-            self.assertFalse(np.allclose(
-                original_ir.positions[base_mask], corrected_ir.positions[base_mask], atol=1e-6),
-                "the ground-contact band should have been nudged to match real sampled terrain")
+            self.assertTrue(roof_mask.any() and base_mask.any(), "test setup issue")
+            roof_dy = corrected_ir.positions[roof_mask, 1] - original_ir.positions[roof_mask, 1]
+            base_dy = corrected_ir.positions[base_mask, 1] - original_ir.positions[base_mask, 1]
+            self.assertAlmostEqual(float(roof_dy.mean()), float(base_dy.mean()), places=5,
+                                    msg="roof and base must move by the identical amount -- no rotation-scaling concern")
 
-    def test_oversized_footprint_rejects_the_rotation_but_still_gets_ground_skirt(self):
-        """CONFIRMED REAL BUG (part 1): a single glTF that bundles one real
-        building together with a swath of unrelated nearby ground/decal
-        geometry reports a footprint far larger than the building itself
-        (a real control tower model came out 640x640 m). The SAME terrain
-        relief that produces a small, correct tilt for a normal-sized
-        building (see test_large_tilted_building_gets_rigid_rotation_
-        correction, identical terrain) fits a much steeper plane across
-        that inflated span -- rotating the whole combined mesh rigidly by
-        it would swing whichever of its sub-parts sit far from the shared
-        local origin by many metres (the "one wall/window panel floating
-        away from the rest of the building" the user actually saw). The
-        ROTATION must be rejected outright, not applied.
-
-        CONFIRMED REAL BUG (part 2, found on a live EGLC package): a
-        genuinely large SINGLE building -- not bundled-unrelated-content,
-        a real continuous terminal structure -- can ALSO exceed
-        _MAX_SIDE_M (EGLC's own terminal measured 380m wide). Rejecting
-        the rotation used to mean NO correction at all, leaving the whole
-        building floating/sunk relative to real terrain with zero ground
-        contact -- worse than the excessive tilt this guard was meant to
-        avoid. _MAX_SIDE_M's own justification for rejecting the ROTATION
-        is about a SEPARATE, differently-anchored sibling desyncing from
-        it -- irrelevant to the ground skirt, which applies zero rotation
-        (identity only). So an oversized footprint still gets its base
-        conformed to real terrain, exactly like the height-rejected case."""
+    def test_oversized_footprint_still_gets_the_ordinary_uniform_shift(self):
+        """CONFIRMED REAL BUG this pins: a genuinely large SINGLE building
+        (not bundled-unrelated-content -- a real continuous terminal
+        structure) can have a large footprint (EGLC's own terminal
+        measured 380m wide). The old rotation-based mechanism rejected a
+        rotation for any oversized footprint (risk of swinging a
+        separately-anchored sibling that stays too small to qualify on
+        its own), which left large buildings like this with NO correction
+        at all, or only a partial "ground skirt". A uniform shift has none
+        of that risk -- it can't swing anything relative to anything else,
+        so an oversized footprint now just gets the SAME ordinary
+        correction as any other qualifying group, no special-casing."""
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             xplane_root = td / "XPlaneRoot"
@@ -392,28 +359,21 @@ class TestTerrainFit(unittest.TestCase):
 
             results = terrain_fit.get_or_create_fitted_group(obj_dir, [stem], 47.5, 8.5, 0.0, xplane_root)
             result_stem, applied, reason = results[stem]
-            self.assertTrue(applied, "the ground band must still be corrected even though the oversized rotation is rejected")
-            self.assertEqual(reason, "ground_skirt_only")
+            self.assertTrue(applied, "an oversized footprint must still be corrected, not left floating")
+            self.assertEqual(reason, "applied_vertical_shift")
             self.assertNotEqual(result_stem, stem, "a corrected copy should have been written")
 
             corrected_text = (obj_dir / f"{result_stem}.obj").read_text(encoding="utf-8")
-            self.assertNotIn("TILTED", corrected_text.splitlines(),
-                              "TILTED must be replaced by the (identity) correction, not stack with it")
+            self.assertNotIn("TILTED", corrected_text.splitlines())
 
             corrected_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{result_stem}.obj"))
-            # Roof (top face, height 6.0 -- _build_box_glb's default) must
-            # be UNCHANGED -- no rotation means no roof swing at all.
             roof_mask = original_ir.positions[:, 1] > 3.0
-            self.assertTrue(roof_mask.any(), "test setup issue: expected some roof-height vertices")
-            self.assertTrue(np.allclose(
-                original_ir.positions[roof_mask], corrected_ir.positions[roof_mask], atol=1e-6),
-                "the roof must stay exactly at its original position -- no rotation should reach it")
-            # Base must actually have moved -- the whole point of the skirt.
             base_mask = original_ir.positions[:, 1] < 0.1
-            self.assertTrue(base_mask.any(), "test setup issue: expected some ground-level vertices")
-            self.assertFalse(np.allclose(
-                original_ir.positions[base_mask], corrected_ir.positions[base_mask], atol=1e-6),
-                "the ground-contact band should have been nudged to match real sampled terrain")
+            self.assertTrue(roof_mask.any() and base_mask.any(), "test setup issue")
+            roof_dy = corrected_ir.positions[roof_mask, 1] - original_ir.positions[roof_mask, 1]
+            base_dy = corrected_ir.positions[base_mask, 1] - original_ir.positions[base_mask, 1]
+            self.assertAlmostEqual(float(roof_dy.mean()), float(base_dy.mean()), places=5,
+                                    msg="an oversized footprint still gets ONE uniform shift, not a partial/rejected correction")
 
     def test_small_tilted_object_stays_disqualified_and_unmodified(self):
         """A TILTED object too small for terrain_fit's own size gate (but
@@ -445,22 +405,22 @@ class TestTerrainFit(unittest.TestCase):
             self.assertFalse(applied)
             self.assertEqual(result_stem, stem, "a disqualified object's original file must be left alone")
 
-    def test_shared_rotation_links_a_disqualified_sibling_at_the_same_anchor(self):
+    def test_shared_shift_links_a_disqualified_sibling_at_the_same_anchor(self):
         """Universal fix for: one real-world building instance split into
         two placements from different source paths (confirmed real case:
         LHBP's ATC tower -- an SPB-attached exterior shell + a plain-BGL-
         placed interior, at the same real-world anchor, that never share a
         model stem so never reach the same terrain_fit group_key). The
-        large shell here qualifies for and gets a real rigid rotation; a
+        large shell here qualifies for and gets a real vertical shift; a
         small companion object at the SAME anchor is, on its own,
         disqualified (matches test_small_tilted_object_stays_disqualified_
-        and_unmodified). apply_shared_rotation_to_group, fed the shell's
-        cached transform via get_cached_transform, must rotate the small
-        object by the IDENTICAL matrix -- proven here by checking the
-        rotated small object's positions equal its own original positions
-        pre-multiplied by the SAME rotation the shell got, not by
-        re-deriving a rotation independently (which would fail: its own
-        footprint doesn't qualify)."""
+        and_unmodified). apply_shared_shift_to_group, fed the shell's
+        cached transform via get_cached_transform, must shift the small
+        object by the IDENTICAL amount -- no anchor-delta bookkeeping
+        needed (unlike the rotation this replaced): the shift is a
+        property of the shared real-world anchor, not of either object's
+        own local-frame convention, so it applies directly regardless of
+        the interior's own (different) recenter offset or AGL height."""
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             xplane_root = td / "XPlaneRoot"
@@ -500,200 +460,38 @@ class TestTerrainFit(unittest.TestCase):
 
             transform = terrain_fit.get_cached_transform(shell_group_key)
             self.assertIsNotNone(transform)
-            self.assertIsNotNone(transform["rigid_rotation"])
+            self.assertIsNotNone(transform["vertical_shift"])
 
-            linked_results = terrain_fit.apply_shared_rotation_to_group(
-                obj_dir, [interior_stem], transform, xplane_root)
+            linked_results = terrain_fit.apply_shared_shift_to_group(obj_dir, [interior_stem], transform, xplane_root)
             linked_stem, linked_applied, linked_reason = linked_results[interior_stem]
-            self.assertTrue(linked_applied, "the interior must be corrected once linked to the shell's rotation")
-            self.assertEqual(linked_reason, "applied_shared_rotation")
+            self.assertTrue(linked_applied, "the interior must be corrected once linked to the shell's shift")
+            self.assertEqual(linked_reason, "applied_shared_shift")
             self.assertNotEqual(linked_stem, interior_stem)
 
             linked_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{linked_stem}.obj"))
-            # Checked via the rigidity/distance-preservation invariant
-            # (same style as test_large_tilted_building_gets_a_rigid_
-            # rotation_not_a_shear) rather than exact positional equality
-            # to the naive rotation, since the foundation skirt may still
-            # nudge base-band vertices by a real-terrain residual.
-            n = len(original_interior_positions)
-            for i in range(n):
-                for j in range(i + 1, n):
-                    d_before = np.linalg.norm(original_interior_positions[i] - original_interior_positions[j])
-                    d_after = np.linalg.norm(linked_ir.positions[i] - linked_ir.positions[j])
-                    self.assertAlmostEqual(d_before, d_after, places=5,
-                                            msg=f"vertex pair ({i},{j}) distance changed -- not a rigid rotation")
-            self.assertFalse(np.allclose(linked_ir.positions, original_interior_positions, atol=1e-6),
-                              "expected the shared rotation to actually move the interior's geometry")
+            # X/Z entirely unchanged, every vertex's Y moved by the exact
+            # shift value the shell got -- proves it was linked, not
+            # independently re-derived (which would fail: its own
+            # footprint doesn't qualify).
+            np.testing.assert_allclose(linked_ir.positions[:, [0, 2]], original_interior_positions[:, [0, 2]], atol=1e-9)
+            dy = linked_ir.positions[:, 1] - original_interior_positions[:, 1]
+            np.testing.assert_allclose(dy, transform["vertical_shift"], atol=1e-6,
+                                        err_msg="every vertex must move by exactly the shell's own shift amount")
 
-    def test_shared_rotation_accounts_for_a_different_agl_anchor_height(self):
-        """CONFIRMED REAL BUG (found after the first version of this fix
-        made the actual tower shift WORSE, not better): a rigid rotation
-        is only physically correct around a PIVOT both objects share. Two
-        placements at the same (lat,lon) but different AGL height (a
-        ground-anchored shell vs. its cab-floor-anchored interior, ~42m
-        up) do NOT share a pivot at either object's own local (0,0,0) --
-        the correct pivot is the reference's. Naively rotating the
-        interior's own local-frame vertices in place (anchor_delta_y=0)
-        ignores that its 42m-high anchor point ALSO has to swing
-        laterally by height*sin(angle) as part of one rigid assembly.
-        This test proves the anchor_delta_y-corrected math against a hand
-        -derived expectation: rotated_local = R @ (v + d) - d, where d =
-        (0, anchor_delta_y, 0) -- NOT simply R @ v."""
+    def test_shared_shift_is_a_noop_when_the_source_group_had_no_shift_to_offer(self):
+        """get_cached_transform on a group whose cached transform has
+        vertical_shift=None (no usable terrain samples at all) must make
+        apply_shared_shift_to_group a no-op, not synthesize a spurious
+        shift -- propagating "no shift to share" is exactly as valid a
+        shared decision as propagating a real one. Constructed directly
+        (rather than engineering a real all-samples-failed scenario)
+        since the transform dict's own shape is all this checks."""
         with tempfile.TemporaryDirectory() as td:
-            td = Path(td)
-            xplane_root = td / "XPlaneRoot"
-            self._write_sloped_terrain(xplane_root, 47, 8, slope_per_post=3000.0)
-            obj_dir = td / "objects"
-            tex_dir = td / "textures"
-            obj_dir.mkdir()
-            tex_dir.mkdir()
-
-            shell_glb = td / "shell2.glb"
-            self._build_box_glb(shell_glb, "Shell2", "Shell2Tex", half_size=15.0)
-            shell_result = mesh_convert.convert(shell_glb, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
-            shell_stem = shell_result[0].stem
-
-            cab_glb = td / "cab2.glb"
-            self._build_box_glb(cab_glb, "Cab2", "Cab2Tex", half_size=4.0, height=3.0)
-            cab_result = mesh_convert.convert(cab_glb, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
-            cab_stem = cab_result[0].stem
-            original_cab_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{cab_stem}.obj"))
-
-            anchor_lat, anchor_lon, anchor_hdg = 47.5, 8.5, 0.0
-            shell_group_key = (tuple(sorted([shell_stem])), round(anchor_lat, 6), round(anchor_lon, 6),
-                                round(anchor_hdg, 2), False)
-            terrain_fit.get_or_create_fitted_group(obj_dir, [shell_stem], anchor_lat, anchor_lon, anchor_hdg, xplane_root)
-            transform = terrain_fit.get_cached_transform(shell_group_key)
-            self.assertIsNotNone(transform["rigid_rotation"], "test setup issue: expected the shell to tilt")
-
-            anchor_delta_y = 42.0  # the cab's AGL height above the shell's ground anchor
-            linked_results = terrain_fit.apply_shared_rotation_to_group(
-                obj_dir, [cab_stem], transform, xplane_root, anchor_delta_y=anchor_delta_y)
-            linked_stem = linked_results[cab_stem][0]
-            linked_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{linked_stem}.obj"))
-
-            rigid_rotation = transform["rigid_rotation"]
-            d = np.array([0.0, anchor_delta_y, 0.0])
-            expected = (original_cab_ir.positions + d) @ rigid_rotation.T - d
-            naive_wrong = original_cab_ir.positions @ rigid_rotation.T
-
-            np.testing.assert_allclose(linked_ir.positions, expected, atol=1e-6,
-                                        err_msg="must match the anchor-height-corrected rotation exactly")
-            self.assertFalse(
-                np.allclose(linked_ir.positions, naive_wrong, atol=1e-3),
-                "must NOT match the naive (anchor_delta_y-ignoring) rotation -- that's the confirmed bug"
-            )
-
-    def test_shared_rotation_accounts_for_a_different_horizontal_recenter_pivot(self):
-        """CONFIRMED THIRD REAL BUG (found after the anchor_delta_y-only
-        fix above was shipped and still left a residual shift, both
-        horizontal AND vertical): mesh_convert.convert() re-centers EVERY
-        model independently around its OWN median footprint before
-        terrain_fit ever runs, so "local (0,0,0)" is a DIFFERENT real-
-        world point for two independently-recentred source models even
-        when their raw BGL/SPB placement anchor was identical -- the
-        shell and the cab here stand in for exactly that (two separate
-        source files, at the same real-world anchor). anchor_delta_y alone
-        assumes the horizontal parts of their local origins coincide;
-        they don't in general, and because a tilt rotation's off-diagonal
-        terms couple X/Z into Y, the missing horizontal pivot correction
-        ALSO reintroduces vertical error even when anchor_delta_y itself
-        is exactly right. This test proves the fully-corrected math
-        against a hand-derived expectation: rotated_local = R @ (v + d)
-        - d, where d = (anchor_delta_x, anchor_delta_y, anchor_delta_z)
-        -- NOT just the y-only version above."""
-        with tempfile.TemporaryDirectory() as td:
-            td = Path(td)
-            xplane_root = td / "XPlaneRoot"
-            self._write_sloped_terrain(xplane_root, 47, 8, slope_per_post=3000.0)
-            obj_dir = td / "objects"
-            tex_dir = td / "textures"
-            obj_dir.mkdir()
-            tex_dir.mkdir()
-
-            shell_glb = td / "shell3.glb"
-            self._build_box_glb(shell_glb, "Shell3", "Shell3Tex", half_size=15.0)
-            shell_result = mesh_convert.convert(shell_glb, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
-            shell_stem = shell_result[0].stem
-
-            cab_glb = td / "cab3.glb"
-            self._build_box_glb(cab_glb, "Cab3", "Cab3Tex", half_size=4.0, height=3.0)
-            cab_result = mesh_convert.convert(cab_glb, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
-            cab_stem = cab_result[0].stem
-            original_cab_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{cab_stem}.obj"))
-
-            anchor_lat, anchor_lon, anchor_hdg = 47.5, 8.5, 0.0
-            shell_group_key = (tuple(sorted([shell_stem])), round(anchor_lat, 6), round(anchor_lon, 6),
-                                round(anchor_hdg, 2), False)
-            terrain_fit.get_or_create_fitted_group(obj_dir, [shell_stem], anchor_lat, anchor_lon, anchor_hdg, xplane_root)
-            transform = terrain_fit.get_cached_transform(shell_group_key)
-            self.assertIsNotNone(transform["rigid_rotation"], "test setup issue: expected the shell to tilt")
-
-            # The cab's own recenter offset differs from the shell's own --
-            # exactly the LHBP tower case (each source model's own median
-            # drags its own recenter by a different amount).
-            anchor_delta_x, anchor_delta_y, anchor_delta_z = 3.0, 42.0, -2.0
-            linked_results = terrain_fit.apply_shared_rotation_to_group(
-                obj_dir, [cab_stem], transform, xplane_root, anchor_delta_y=anchor_delta_y,
-                anchor_delta_x=anchor_delta_x, anchor_delta_z=anchor_delta_z)
-            linked_stem = linked_results[cab_stem][0]
-            linked_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{linked_stem}.obj"))
-
-            rigid_rotation = transform["rigid_rotation"]
-            d = np.array([anchor_delta_x, anchor_delta_y, anchor_delta_z])
-            expected = (original_cab_ir.positions + d) @ rigid_rotation.T - d
-            y_only_d = np.array([0.0, anchor_delta_y, 0.0])
-            y_only_wrong = (original_cab_ir.positions + y_only_d) @ rigid_rotation.T - y_only_d
-
-            np.testing.assert_allclose(linked_ir.positions, expected, atol=1e-6,
-                                        err_msg="must match the fully anchor-corrected (X, Y, and Z) rotation")
-            self.assertFalse(
-                np.allclose(linked_ir.positions, y_only_wrong, atol=1e-3),
-                "must NOT match the y-only-corrected rotation -- that's the confirmed follow-up bug"
-            )
-
-    def test_shared_rotation_is_a_noop_when_the_source_group_never_tilted(self):
-        """get_cached_transform on a group that legitimately never got a
-        ROTATION (rejected for an oversized/bogus footprint -- see
-        test_oversized_footprint_rejects_the_rotation_but_still_gets_
-        ground_skirt, same terrain/fixture -- the group still gets a
-        ground-skirt-only correction now, but that's an identity rotation,
-        not a real one) must make apply_shared_rotation_to_group a no-op,
-        not synthesize a spurious rotation -- propagating "no rotation to
-        share" is exactly as valid a shared decision as propagating a
-        real one. (A group disqualified at the earlier too-small-footprint
-        gate never reaches the transform cache write at all -- see
-        test_get_cached_transform_returns_none_for_an_unprocessed_group;
-        this test targets the oversized-footprint gate specifically,
-        which does.)"""
-        with tempfile.TemporaryDirectory() as td:
-            td = Path(td)
-            xplane_root = td / "XPlaneRoot"
-            self._write_sloped_terrain(xplane_root, 47, 8, slope_per_post=3000.0)
-            obj_dir = td / "objects"
-            tex_dir = td / "textures"
-            obj_dir.mkdir()
-            tex_dir.mkdir()
-
-            huge_glb = td / "huge_box.glb"
-            self._build_box_glb(huge_glb, "HugeBox2", "HugeBox2Tex", half_size=300.0)
-            result = mesh_convert.convert(huge_glb, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
-            stem = result[0].stem
-
-            anchor_lat, anchor_lon, anchor_hdg = 47.5, 8.5, 0.0
-            group_key = (tuple(sorted([stem])), round(anchor_lat, 6), round(anchor_lon, 6), round(anchor_hdg, 2), False)
-            fit_results = terrain_fit.get_or_create_fitted_group(obj_dir, [stem], anchor_lat, anchor_lon, anchor_hdg, xplane_root)
-            _, applied, reason = fit_results[stem]
-            self.assertEqual((applied, reason), (True, "ground_skirt_only"),
-                              "test setup issue: expected the oversized footprint's rotation rejected, "
-                              "but a ground-skirt-only correction still applied")
-
-            transform = terrain_fit.get_cached_transform(group_key)
-            self.assertIsNotNone(transform, "an oversized-footprint group still reaches the transform cache write")
-            self.assertIsNone(transform["rigid_rotation"], "ground_skirt_only has no real rotation to cache/share")
-
+            obj_dir = Path(td)
+            transform = {"vertical_shift": None, "base_lat": 47.5, "base_lon": 8.5,
+                         "heading_deg": 0.0, "origin_elev": 10.0}
             other_stem = "some_other_stem_at_the_same_anchor"
-            results = terrain_fit.apply_shared_rotation_to_group(obj_dir, [other_stem], transform, xplane_root)
+            results = terrain_fit.apply_shared_shift_to_group(obj_dir, [other_stem], transform, None)
             self.assertEqual(results[other_stem], (other_stem, False, "not_applicable"))
 
     def test_get_cached_transform_returns_none_for_an_unprocessed_group(self):
@@ -727,83 +525,44 @@ class TestTerrainFit(unittest.TestCase):
 
             self.assertIsNone(terrain_fit.get_cached_transform(group_key))
 
-    def test_foundation_skirt_conforms_the_base_band_not_the_superstructure(self):
-        """On genuinely non-planar ground the rigid tilt averages the
-        bumps out, so the base can still float / dig in. The foundation
-        skirt additionally nudges ONLY vertices within _SKIRT_BAND_M of the
-        building's own lowest point by the terrain residual the plane fit
-        missed, ramped to zero across _SKIRT_BLEND_M above it -- clamped
-        per-vertex at _SKIRT_MAX_M. Measured as (fit WITH skirt) minus
-        (fit WITHOUT skirt), so the underlying rigid rotation cancels out
-        and only the skirt's own contribution is asserted."""
+    def test_qualifying_group_on_gentle_real_slope_gets_the_ordinary_shift(self):
+        """A plain integration check that a qualifying group on genuinely
+        bumpy real terrain gets applied_vertical_shift with a real,
+        non-zero, consistent correction -- outlier-rejection math itself
+        is unit-tested directly against synthetic samples in
+        TestRobustVerticalShift below, where exact DSF-grid/real-world
+        post alignment doesn't need to be reasoned about. (A pure linear
+        SLOPE, symmetric around the object's own anchor, averages to
+        exactly zero by construction -- that's a tilt, which a uniform
+        shift correctly leaves alone; a real bump/dip is what a uniform
+        shift is actually for, see _write_bumpy_terrain.)"""
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             xplane_root = td / "XPlaneRoot"
-            # a linear E-W ramp (gives a real, non-degenerate tilt so the
-            # rigid-rotation path runs) PLUS a symmetric quadratic bump in
-            # the same axis (the ramp fit can't represent it -> it lands
-            # entirely in the residual the skirt corrects).
-            N = 41
-            mid = N // 2
-            grid = [[int(c * 2.0 + ((c - mid) ** 2) * 10.0) for c in range(N)] for _ in range(N)]
-            dsf_dir = xplane_root / "Global Scenery" / "X-Plane 12 Global Scenery" / "Earth nav data" / "+40+000"
-            dsf_dir.mkdir(parents=True, exist_ok=True)
-            (dsf_dir / "+47+008.dsf").write_bytes(build_elevation_dsf(grid))
-
+            self._write_bumpy_terrain(xplane_root, 47, 8, bump_scale=1500.0)
             obj_dir = td / "objects"
             obj_dir.mkdir()
 
-            hs = 60.0   # a large-but-real building footprint, not the unbounded
-                        # synthetic 3000 this used to be -- terrain_fit now
-                        # rejects a rotation whose implied displacement is
-                        # bigger than any real building's own tilt correction
-                        # should ever be (see
-                        # test_oversized_footprint_rejects_the_rotation_
-                        # instead_of_tearing_it_apart), which a 6 km-wide box
-                        # tripped despite being a synthetic fixture, not a bug.
-            ring_y = (0.0, 1.5, 8.0)   # base band, inside blend zone, well above it
-            positions, ring_idx = [], {}
-            for y in ring_y:
-                ring_idx[y] = list(range(len(positions), len(positions) + 4))
-                positions += [(-hs, y, -hs), (hs, y, -hs), (hs, y, hs), (-hs, y, hs)]
-            positions = np.array(positions, dtype=np.float64)
+            hs = 60.0
+            positions = np.array(
+                [(-hs, 0.0, -hs), (hs, 0.0, -hs), (hs, 0.0, hs), (-hs, 0.0, hs)], dtype=np.float64)
             ir = mesh_ir.MeshIR(
-                name="bump_box", positions=positions,
-                normals=np.tile([0.0, 1.0, 0.0], (len(positions), 1)).astype(np.float64),
-                uvs=np.zeros((len(positions), 2), dtype=np.float64),
-                indices=np.array([0, 1, 2, 0, 2, 3, 8, 9, 10, 8, 10, 11], dtype=np.int64),
+                name="slope_box", positions=positions,
+                normals=np.tile([0.0, 1.0, 0.0], (4, 1)).astype(np.float64),
+                uvs=np.zeros((4, 2), dtype=np.float64),
+                indices=np.array([0, 1, 2, 0, 2, 3], dtype=np.int64),
                 texture="t.png", draped=False, footprint_area_m2=None,
             )
-            mesh_ir.save(ir, mesh_ir.sidecar_path_for(obj_dir / "bump_box.obj"))
+            mesh_ir.save(ir, mesh_ir.sidecar_path_for(obj_dir / "slope_box.obj"))
 
-            def fit_positions(skirt_on):
-                orig = terrain_fit._FOUNDATION_SKIRT
-                terrain_fit._FOUNDATION_SKIRT = skirt_on
-                terrain_fit._group_cache.clear()
-                for p in obj_dir.glob("bump_box_tfit_*"):
-                    p.unlink()
-                try:
-                    res = terrain_fit.get_or_create_fitted_group(obj_dir, ["bump_box"], 47.5, 8.5, 0.0, xplane_root)
-                    rstem, applied, reason = res["bump_box"]
-                    self.assertTrue(applied, f"reason={reason!r}")
-                    self.assertNotEqual(rstem, "bump_box")
-                    return mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{rstem}.obj")).positions
-                finally:
-                    terrain_fit._FOUNDATION_SKIRT = orig
-
-            without = fit_positions(False)
-            with_skirt = fit_positions(True)
-            dy = with_skirt[:, 1] - without[:, 1]
-
-            base_dy = float(np.mean(dy[ring_idx[0.0]]))
-            mid_dy = float(np.mean(dy[ring_idx[1.5]]))
-            top_dy = float(np.mean(dy[ring_idx[8.0]]))
-
-            self.assertGreater(abs(base_dy), 0.2, "base band must be conformed by the skirt")
-            self.assertLessEqual(abs(base_dy), terrain_fit._SKIRT_MAX_M + 1e-6, "per-vertex clamp respected")
-            self.assertGreater(abs(mid_dy), 0.0, "blend zone gets a partial nudge")
-            self.assertLess(abs(mid_dy), abs(base_dy) - 1e-6, "blend zone gets LESS than the full band")
-            self.assertAlmostEqual(top_dy, 0.0, delta=1e-6, msg="superstructure gets none of the skirt residual")
+            res = terrain_fit.get_or_create_fitted_group(obj_dir, ["slope_box"], 47.5, 8.5, 0.0, xplane_root)
+            rstem, applied, reason = res["slope_box"]
+            self.assertTrue(applied, f"reason={reason!r}")
+            self.assertEqual(reason, "applied_vertical_shift")
+            corrected = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{rstem}.obj"))
+            dy = corrected.positions[:, 1] - positions[:, 1]
+            self.assertAlmostEqual(float(dy.max() - dy.min()), 0.0, places=6, msg="a uniform shift, all 4 corners identical")
+            self.assertNotAlmostEqual(float(dy[0]), 0.0, places=3, msg="expected a real, non-zero correction on sloped terrain")
 
     def test_huge_draped_quad_gets_warped_like_a_building_now(self):
         """Draped/pavement geometry is eligible for the real per-vertex
@@ -936,62 +695,46 @@ class TestTerrainFit(unittest.TestCase):
             self.assertEqual(results[stem], (stem, False, "no_xplane_root"))
 
 
-class TestFitRigidTiltRotation(unittest.TestCase):
-    """_fit_rigid_tilt_rotation's own math, isolated from any file I/O or
-    terrain sampling -- the piece of this module with the highest cost of
-    a subtle bug (a wrong-signed rotation would tilt buildings the WRONG
-    way, silently, which would be much harder to notice/diagnose than an
-    object simply being left uncorrected)."""
+class TestRobustVerticalShift(unittest.TestCase):
+    """_robust_vertical_shift's own math, isolated from any file I/O or
+    terrain sampling -- the single number this returns gets applied to
+    every vertex of every rigid object in a group, so a bad value here
+    (e.g. one spiky sample dragging the average) is as costly as the old
+    rotation module's own wrong-signed-rotation risk was."""
 
-    def test_east_higher_terrain_tilts_east_side_up(self):
-        """Corner samples forming a plane that's 5m higher at x=+10 than
-        at x=-10 (rises to the east, flat in z) -- real terrain is higher
-        to the east, so the building's east edge must rotate UP (+Y) and
-        its west edge DOWN (-Y), matching a physical object tilting to
-        rest flush against a slope that's higher on its east side. Exact
-        expected numbers hand-derived from Rodrigues' rotation formula for
-        this slope (see terrain_fit.py's own math for the derivation)."""
-        corners = [(-10.0, -10.0, -5.0), (-10.0, 10.0, -5.0), (10.0, -10.0, 5.0), (10.0, 10.0, 5.0)]
-        rotation = terrain_fit._fit_rigid_tilt_rotation(corners)
-        self.assertIsNotNone(rotation)
+    def test_plain_average_when_all_samples_agree(self):
+        samples = [(-10.0, -10.0, 2.0), (10.0, -10.0, 2.1), (-10.0, 10.0, 1.9), (10.0, 10.0, 2.0)]
+        shift = terrain_fit._robust_vertical_shift(samples)
+        self.assertAlmostEqual(shift, 2.0, places=1)
 
-        east_point = np.array([10.0, 0.0, 0.0])
-        rotated_east = rotation @ east_point
-        self.assertGreater(rotated_east[1], 0.0, "the east edge (over higher real terrain) must tilt UP")
-        np.testing.assert_allclose(rotated_east, [8.9443, 4.4721, 0.0], atol=1e-3)
+    def test_one_spiky_outlier_is_rejected_not_averaged_in(self):
+        """8 samples agreeing closely on ~2.0m, 1 wild outlier at 500m --
+        a naive mean would land near 57m (500/9 dominates); the robust
+        estimate must stay close to what the consistent majority says."""
+        samples = [
+            (-10.0, -10.0, 2.0), (0.0, -10.0, 2.1), (10.0, -10.0, 1.9),
+            (-10.0, 0.0, 2.0), (10.0, 0.0, 2.2),
+            (-10.0, 10.0, 1.8), (0.0, 10.0, 2.0), (10.0, 10.0, 2.1),
+            (0.0, 0.0, 500.0),  # the spike -- e.g. a DSF triangulation seam or DEM read error
+        ]
+        shift = terrain_fit._robust_vertical_shift(samples)
+        self.assertLess(abs(shift - 2.0), 1.0, "must track the consistent majority, not the spike")
 
-        west_point = np.array([-10.0, 0.0, 0.0])
-        rotated_west = rotation @ west_point
-        self.assertLess(rotated_west[1], 0.0, "the west edge (over lower real terrain) must tilt DOWN")
-        np.testing.assert_allclose(rotated_west, [-8.9443, -4.4721, 0.0], atol=1e-3)
+    def test_two_disagreeing_samples_trusts_both_rather_than_guessing(self):
+        """With only 2 samples there's no way to tell which one (if
+        either) is the "real" outlier -- must fall back to using both
+        (the plain mean) rather than arbitrarily rejecting one."""
+        shift = terrain_fit._robust_vertical_shift([(-10.0, 0.0, 1.0), (10.0, 0.0, 3.0)])
+        self.assertAlmostEqual(shift, 2.0, places=6)
 
-    def test_rotation_matrix_is_orthogonal_ie_truly_rigid(self):
-        """R^T @ R must be the identity for any fitted slope -- the
-        algebraic guarantee behind "this can't shear anything", checked
-        directly rather than only inferred from a specific geometry test."""
-        corners = [(-8.0, -6.0, -1.5), (-8.0, 6.0, 0.5), (8.0, -6.0, 0.8), (8.0, 6.0, 2.9)]
-        rotation = terrain_fit._fit_rigid_tilt_rotation(corners)
-        self.assertIsNotNone(rotation)
-        np.testing.assert_allclose(rotation.T @ rotation, np.eye(3), atol=1e-9)
-        self.assertAlmostEqual(float(np.linalg.det(rotation)), 1.0, places=9,
-                                msg="determinant must be +1 (a proper rotation, not a reflection)")
+    def test_no_samples_returns_none(self):
+        self.assertIsNone(terrain_fit._robust_vertical_shift([]))
 
-    def test_flat_samples_return_none(self):
-        """All 4 corners at the same real elevation (delta=0 everywhere) --
-        no tilt needed, must return None rather than an identity-but-not-
-        quite matrix that'd trigger a pointless corrected copy."""
-        corners = [(-10.0, -10.0, 0.0), (-10.0, 10.0, 0.0), (10.0, -10.0, 0.0), (10.0, 10.0, 0.0)]
-        self.assertIsNone(terrain_fit._fit_rigid_tilt_rotation(corners))
-
-    def test_too_few_samples_returns_none(self):
-        self.assertIsNone(terrain_fit._fit_rigid_tilt_rotation([(-10.0, -10.0, -5.0), (10.0, 10.0, 5.0)]))
-
-    def test_collinear_samples_return_none(self):
-        """3 samples all lying on the same line through the origin can't
-        pin down a unique plane (infinitely many planes fit them equally
-        well) -- must decline rather than fit an arbitrary/unstable one."""
-        corners = [(-10.0, -10.0, -5.0), (0.0, 0.0, 0.0), (10.0, 10.0, 5.0)]
-        self.assertIsNone(terrain_fit._fit_rigid_tilt_rotation(corners))
+    def test_every_sample_identical_returns_that_value(self):
+        """No spread at all to reject against (MAD=0) -- must return the
+        common value directly, not divide by zero or otherwise choke."""
+        samples = [(-10.0, -10.0, 4.0), (10.0, -10.0, 4.0), (-10.0, 10.0, 4.0), (10.0, 10.0, 4.0)]
+        self.assertAlmostEqual(terrain_fit._robust_vertical_shift(samples), 4.0, places=6)
 
 
 if __name__ == "__main__":

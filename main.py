@@ -760,8 +760,8 @@ def _terrain_fit_group_worker(obj_stems, base_lat, base_lon, heading_deg,
     CONFIRMED REAL BUG: this used to return only the per-stem result dict.
     terrain_fit._group_transform_cache -- what the parent's own anchor-
     clustering pass (main.py, right after this pre-warm) reads via
-    get_cached_transform() to find a rotation one placement's terrain-fit
-    computed, and retroactively apply it to a DIFFERENT placement sharing
+    get_cached_transform() to find a vertical shift one placement's
+    terrain-fit computed, and retroactively apply it to a DIFFERENT placement sharing
     the same real-world anchor (e.g. a building's own shell vs. its
     separately-placed glass/interior) -- lives in the terrain_fit MODULE
     in THIS subprocess. A ProcessPoolExecutor worker's module state is
@@ -2429,14 +2429,12 @@ class ModularPythonConverterApp:
             # "the same real-world instance decoded via two different
             # paths", not "buildings near each other") but DIFFERENT model
             # stems (so they never shared a terrain_fit group_key),
-            # propagate whichever member's rotation actually got applied
-            # onto every other member that came back disqualified/
+            # propagate whichever member's vertical shift actually got
+            # applied onto every other member that came back disqualified/
             # rigid_skip/negligible on its own. See terrain_fit.
-            # apply_shared_rotation_to_group's own docstring for why
-            # sharing one anchor point makes reusing the identical
-            # rotation matrix correct. Requiring matching heading too, not
-            # just position, sidesteps re-expressing the rotation relative
-            # to a different local-frame convention.
+            # apply_shared_shift_to_group's own docstring for why sharing
+            # one anchor point makes reusing the identical shift correct
+            # regardless of each object's own local-frame convention.
             #
             # Bucket key is the RAW placement anchor (p["lat"]/p["lon"]),
             # not each candidate's own recenter-compensated abs_lat/
@@ -2456,7 +2454,7 @@ class ModularPythonConverterApp:
                 _with_ref = sum(1 for b in _multi_group_buckets if any(c["any_applied"] for c in b))
                 self.log(f"Anchor clustering: {len(_multi_group_buckets)} real-world anchor(s) are shared by "
                          f"2+ differently-named placements ({_with_ref} of them have at least one member with "
-                         f"an applied terrain-fit rotation to share with the others).", "info")
+                         f"an applied terrain-fit shift to share with the others).", "info")
             for bucket in _anchor_buckets.values():
                 if len({c["group_key"] for c in bucket}) < 2:
                     continue
@@ -2464,7 +2462,7 @@ class ModularPythonConverterApp:
                 if applied_cand is None:
                     continue
                 transform = terrain_fit.get_cached_transform(applied_cand["group_key"])
-                if transform is None or transform.get("rigid_rotation") is None:
+                if transform is None or transform.get("vertical_shift") is None:
                     continue
 
                 for cand in bucket:
@@ -2476,25 +2474,13 @@ class ModularPythonConverterApp:
                     ]
                     if not unresolved_stems:
                         continue
-                    # This candidate's own AGL height relative to the
-                    # reference's -- e.g. a ground-anchored shell (agl=0)
-                    # vs. its cab-floor-anchored interior (agl~42) -- see
-                    # _apply_rigid_rotation's docstring for why this must
-                    # be threaded through rather than rotating each
-                    # object around its own local origin independently.
-                    anchor_delta_y = cand["agl"] - applied_cand["agl"]
-                    # Same idea, horizontally: each candidate is an
-                    # independent source model with its own mesh_convert
-                    # recenter offset (mid_x/mid_z), so "local (0,0,0)" is
-                    # only the same real-world point for both once this
-                    # difference is folded in too -- a tilt rotation's
-                    # off-diagonal terms couple X/Z into Y, so skipping
-                    # this would leave a residual vertical miss as well.
-                    anchor_delta_x = cand["mid_x"] - applied_cand["mid_x"]
-                    anchor_delta_z = cand["mid_z"] - applied_cand["mid_z"]
-                    linked_results = terrain_fit.apply_shared_rotation_to_group(
-                        obj_dir, unresolved_stems, transform, xplane_root, anchor_delta_y=anchor_delta_y,
-                        anchor_delta_x=anchor_delta_x, anchor_delta_z=anchor_delta_z)
+                    # No anchor-delta bookkeeping needed here (unlike the
+                    # rotation this replaced): the shift is a property of
+                    # the shared real-world anchor point, not of either
+                    # candidate's own local-frame convention -- see
+                    # apply_shared_shift_to_group's own docstring.
+                    linked_results = terrain_fit.apply_shared_shift_to_group(
+                        obj_dir, unresolved_stems, transform, xplane_root)
                     for stem in unresolved_stems:
                         new_name, linked_applied, _linked_reason = linked_results[stem]
                         if linked_applied:
