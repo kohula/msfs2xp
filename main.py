@@ -531,7 +531,14 @@ def _rasterize_footprint_mask(xz, tris, cell_m, max_cells=2_000_000):
     return mask, x_min, z_min, _cell
 
 
-_ELONGATED_RECT_MAX_ASPECT = 1.5  # split a local grid rect into near-square segments past this long/short ratio
+_ELONGATED_RECT_MAX_ASPECT = 2.5  # split a local grid rect into near-square segments past this long/short ratio --
+                                   # CONFIRMED REAL BUG a too-aggressive 1.5 threshold caused: it triggers on any
+                                   # even moderately-rectangular room/segment, not just genuinely elongated arms,
+                                   # which measured an 8.3x total exclusion-rect count increase on a real EGLC
+                                   # conversion (18507 -> 152909) and made a real LHBP conversion (already ~5x
+                                   # more placements) unworkably slow. 2.5 still comfortably catches the
+                                   # motivating real case (a building arm/wing, 5:1+ aspect) while leaving
+                                   # moderately-shaped rects alone.
 _ELONGATED_RECT_MIN_OFF_CARDINAL_DEG = 2.0  # skip splitting when heading is this close to axis-aligned (no waste to fix)
 _ELONGATED_RECT_MAX_SEGMENTS = 12  # hard cap -- a pathologically long/thin rect (a fence, a boundary wall) still
                                     # gets SOME benefit from a bounded number of coarser segments rather than
