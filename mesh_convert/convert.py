@@ -3263,6 +3263,25 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
         builder_is_draped_map[builder_key] = is_draped
         if is_draped and builder.block_footprint_areas:
             draped_areas[builder_key] = float(np.median(builder.block_footprint_areas))
+    if len(draped_areas) > 11:
+        # rank_draped_layer_offsets can only guarantee a DISTINCT offset
+        # for up to 11 draped layers in one file (OBJ8's own -5..+5
+        # range) -- past that it falls back to bucketing by absolute
+        # footprint area, which does NOT guarantee distinctness, so two
+        # layers landing in the same bucket collide with no draw-order
+        # guarantee between them (X-Plane 12's own documented behavior
+        # for coincident ATTR_layer_group_draped geometry) -- exactly a
+        # z-fighting/flicker risk. Now that is_near_ground_flat feeds
+        # is_draped too, a real ground-layer model packing ~25 unrelated
+        # materials into one file (confirmed real EGLC case, see is_near_
+        # ground_flat's own comment) can push its OWN draped-layer count
+        # well past 11 where it previously didn't -- logged here so this
+        # is visible instead of a silent, unexplained flicker in-sim.
+        logger.warning(
+            f"{glb_path.name}: {len(draped_areas)} draped layers in this file -- past the 11 "
+            f"OBJ8 offers a distinct draw-order slot for, some may collide (flicker/z-fight) "
+            f"against each other in-sim."
+        )
     draped_layer_offsets = rank_draped_layer_offsets(draped_areas)
 
     obj_paths = []
