@@ -8,6 +8,7 @@ import struct
 import json
 import io
 import hashlib
+import logging
 import threading
 import multiprocessing
 import pickle
@@ -34,6 +35,24 @@ import scenery_viewer
 import geo_transform
 from mesh_convert import mesh_ir
 from mesh_convert.convert import flag_stray_vertices
+
+# CONFIRMED REAL BUG this fixes: mesh_convert/convert.py (and any other
+# module using logging.getLogger(__name__)) calls logger.info/warning
+# throughout, but nothing in the real app ever configured a handler for
+# the standard logging module -- Python's logging defaults to WARNING
+# with no handler at all, so every info-level message (including ones
+# describing exactly why a piece of content was dropped or reclassified)
+# was silently discarded, in every real run, GUI or headless. Module-
+# level (not inside a function) so it also re-runs in every
+# ProcessPoolExecutor worker: Windows multiprocessing always uses
+# "spawn", which re-imports this module fresh in each worker process
+# before calling into cached_convert/mesh_convert.convert() there, so
+# each worker independently gets its own configured handler too --
+# without this, a handler set up only in the main process would still
+# never see logger calls made inside a worker. Level and format match
+# the one place this was already done, convert.py's own standalone
+# __main__ block, so behavior there doesn't change.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 CONFIG_FILE = Path("msfs2xp_config.json")
 
