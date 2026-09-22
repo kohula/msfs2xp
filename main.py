@@ -533,6 +533,11 @@ def _rasterize_footprint_mask(xz, tris, cell_m, max_cells=2_000_000):
 
 _ELONGATED_RECT_MAX_ASPECT = 1.5  # split a local grid rect into near-square segments past this long/short ratio
 _ELONGATED_RECT_MIN_OFF_CARDINAL_DEG = 2.0  # skip splitting when heading is this close to axis-aligned (no waste to fix)
+_ELONGATED_RECT_MAX_SEGMENTS = 12  # hard cap -- a pathologically long/thin rect (a fence, a boundary wall) still
+                                    # gets SOME benefit from a bounded number of coarser segments rather than
+                                    # exploding into hundreds of tiny ones (real placement counts already run into
+                                    # the tens of thousands per airport; an unbounded per-rect multiplier risks a
+                                    # severe compile-time/rect-count blowup for one extreme outlier shape)
 
 
 def _split_elongated_rect_for_rotation(lx_min, lx_max, lz_min, lz_max, heading_deg,
@@ -569,7 +574,7 @@ def _split_elongated_rect_for_rotation(lx_min, lx_max, lz_min, lz_max, heading_d
     if off_cardinal < _ELONGATED_RECT_MIN_OFF_CARDINAL_DEG or long_span / short_span < max_aspect:
         yield (lx_min, lx_max, lz_min, lz_max)
         return
-    n = max(1, math.ceil(long_span / short_span))
+    n = min(_ELONGATED_RECT_MAX_SEGMENTS, max(1, math.ceil(long_span / short_span)))
     if span_x >= span_z:
         step = span_x / n
         for i in range(n):
