@@ -129,7 +129,8 @@ class MatBuilder:
         self.double_sided = False
         self.is_glass = False
         self.is_decal = False
-        self.is_near_ground_flat = False  # per-material ground-level detection -- currently informational only, see convert()
+        self.is_near_ground_flat = False  # per-material ground-level detection -- see convert()
+        self.near_ground_ref_height = None  # this material's OWN dominant local Y -- see convert()'s near-ground-flat snap
         self.all_source_nodes_flat = True  # AND-reduced across every contributing node -- see convert()
         self.block_footprint_areas = []  # per-node-block XZ bbox area, m^2 -- see convert()'s footprint write-up
 
@@ -2307,13 +2308,42 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                         #      earlier this session (it had no ground-
                         #      proximity check at all and wrongly flattened
                         #      chairs/glass/rooftops).
+                        # Compared against file_min_height (the file's own
+                        # lowest clean vertex), not file_reference_height
+                        # (the most vertex-heavy FLAT band) -- same
+                        # reasoning as the is_decal finalization just below:
+                        # a large flat roof can dominate reference_height
+                        # for a building with little explicit ground-
+                        # contact flat geometry, which would wrongly fail a
+                        # genuinely ground-level material's proximity check
+                        # against it (the material's own low Y would look
+                        # "far" from a roof-biased reference). Failing to
+                        # qualify here only costs a missed snap (see
+                        # near_ground_ref_height below) -- never a wrong
+                        # one -- so this is a strict improvement either way.
                         _mat_flat_fraction, _mat_ref_height = material_flatness_stats.get(mat_idx, (0.0, None))
                         builder.is_near_ground_flat = (
                             _mat_flat_fraction >= _NEAR_GROUND_FLAT_FRACTION_THRESHOLD
                             and _mat_ref_height is not None
-                            and file_reference_height is not None
-                            and abs(_mat_ref_height - file_reference_height) <= _NEAR_GROUND_FLAT_TOLERANCE_M
+                            and file_min_height is not None
+                            and abs(_mat_ref_height - file_min_height) <= _NEAR_GROUND_FLAT_TOLERANCE_M
                         )
+                        # Stashed on the builder (not just used for the
+                        # bool verdict above) so the write loop further
+                        # down can snap this material's own baked-authoring
+                        # offset back to the object's real local ground
+                        # level -- see the snap itself for the confirmed
+                        # real bug this fixes (EGLC pavement still floating
+                        # even after it stopped being dropped: staying
+                        # rigid alone was never enough, since nothing had
+                        # ever corrected the ~1.5m baked authoring offset
+                        # itself -- terrain_fit.py's own group-wide shift
+                        # corrects real-world terrain-vs-anchor mismatches,
+                        # not an internal offset between one material and
+                        # its siblings baked in at authoring time, which is
+                        # a completely different error this material-level
+                        # snap is the first thing to actually address).
+                        builder.near_ground_ref_height = _mat_ref_height if builder.is_near_ground_flat else None
 
                         # Finalizing is_decal here (see _decal_name_matched
                         # above): only exclude a decal-named material from
@@ -2332,9 +2362,8 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                         # flatness is.
                         #
                         # Deliberately compared against file_min_height
-                        # here, NOT file_reference_height (the near-ground-
-                        # flat check above still uses that one -- see its
-                        # own docstring, it degrades safely either way).
+                        # here, same as the near-ground-flat check just
+                        # above now does too (both switched together).
                         # CONFIRMED REAL BUG comparing against
                         # file_reference_height caused: that reference is
                         # the flat band with the MOST vertex support, which
@@ -3275,6 +3304,28 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
             # corrected-offset copy) sees the same zeroed value instead of
             # reintroducing the stale one on any object they touch.
             builder.vertices = [(v[0], 0.0, v[2]) for v in builder.vertices]
+        elif (builder.is_near_ground_flat and builder.vertices
+              and builder.near_ground_ref_height is not None and file_min_height is not None):
+            # CONFIRMED REAL BUG this fixes: a near-ground-flat material
+            # staying rigid instead of being dropped (see is_near_ground_
+            # flat's own docstring) was never enough on its own -- nothing
+            # had ever corrected its baked-authoring offset from the
+            # object's real local ground level (confirmed ~1.5m for the
+            # real EGLC case this whole mechanism exists for), so it kept
+            # rendering floating above the ground even after it stopped
+            # being dropped. terrain_fit.py's own group-wide vertical shift
+            # (which DOES run on this object afterwards, being rigid) can't
+            # fix this either -- that shift corrects real-world terrain
+            # elevation vs. the object's anchor point, a completely
+            # different error than one material sitting at the wrong LOCAL
+            # height relative to its own siblings within the same object.
+            # A uniform pure-translation snap here, same shape-preserving
+            # approach as terrain_fit's own shift (just applied at
+            # authoring level instead of terrain level), brings this
+            # material's own dominant level down (or up) to match the
+            # object's real local ground level (file_min_height) exactly.
+            snap = file_min_height - builder.near_ground_ref_height
+            builder.vertices = [(v[0], v[1] + snap, v[2]) for v in builder.vertices]
 
         with obj_path.open("w", encoding="utf-8") as f:
             f.write("I\n800\nOBJ\n\n")

@@ -465,6 +465,25 @@ class TestFlatnessTiltedExclusivity(unittest.TestCase):
                               "for this content can't be recovered")
             self.assertTrue(paver_text.strip())
 
+            # CONFIRMED REAL BUG this pins: staying rigid instead of
+            # dropped was never enough on its own -- PaverMat is baked at
+            # y=1.5 (see the fixture's own docstring), and nothing used to
+            # correct that baked-authoring offset, so it kept rendering
+            # floating 1.5m above the real ground (y=0, GroundMat/the
+            # walls' own base) even after it stopped being dropped. Median,
+            # not every vertex: the fixture's own deliberately-tilted seam
+            # triangles (see its docstring) have one corner intentionally
+            # 0.2m off the flat tile quads' own level, and the snap is a
+            # uniform shape-preserving translation, so that relative offset
+            # is correctly preserved after the shift -- only the dominant
+            # (flat-tile-quad) level is expected to land exactly on 0.0.
+            paver_ys = [float(line.split()[2]) for line in paver_text.splitlines() if line.startswith("VT")]
+            self.assertTrue(paver_ys)
+            self.assertAlmostEqual(float(np.median(paver_ys)), 0.0, places=3,
+                                    msg="the near-ground-flat snap must bring this material's baked 1.5m "
+                                        "offset down to the object's real local ground level (0.0), not "
+                                        "leave it floating at its originally authored height")
+
     def test_elevated_flat_material_stays_rigid_not_dropped(self):
         """The near-ground-flat DETECTION must NOT fire for a flat
         material that sits meters above the file's own ground level (a
