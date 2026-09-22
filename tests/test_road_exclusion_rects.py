@@ -316,6 +316,46 @@ class TestPerObjectExclusionRects(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             self.assertEqual(main._per_object_exclusion_rects(Path(td), []), [])
 
+    def test_stray_vertex_does_not_balloon_the_exclusion_rect(self):
+        """CONFIRMED REAL BUG this pins: a single corrupted/leftover stray
+        vertex sitting far outside a real object's own bulk extent (the
+        exact same failure mode compute_file_flatness_and_reference's own
+        max_radius had to guard against -- see flag_stray_vertices' own
+        docstring) used to blow up this stem's x_min/x_max/z_min/z_max
+        completely unfiltered, producing a wildly oversized exclusion
+        rectangle for that one object while every other, unaffected object
+        stayed tight. A dense real 10x10 grid (225 vertices -- needs to be
+        this dense, not just "more than a handful": flag_stray_vertices'
+        own 1st/99th-percentile bounds are themselves computed FROM the
+        same array, so a single outlier among too few points (confirmed
+        empirically: even 36 wasn't enough) skews the percentile just
+        drawing the bounds around itself instead of getting caught by
+        them -- it needs the real bulk to dominate the top/bottom ~1%
+        band, same requirement flag_stray_vertices' own docstring implies
+        for its real-world usage against a full building mesh) plus ONE
+        stray vertex 500m away must still produce a tight rectangle around
+        the real footprint."""
+        with tempfile.TemporaryDirectory() as td:
+            obj_dir = Path(td)
+            grid_positions = []
+            for iz in range(15):
+                for ix in range(15):
+                    grid_positions.append([-5.0 + ix * (10.0 / 14), 0.0, -5.0 + iz * (10.0 / 14)])
+            grid_positions.append([500.0, 0.0, 500.0])  # stray -- far outside the real 10x10 bulk
+            ir = mesh_ir.MeshIR(name="Stray_Building", positions=np.array(grid_positions, dtype=np.float64))
+            mesh_ir.save(ir, mesh_ir.sidecar_path_for(obj_dir / "Stray_Building.obj"))
+
+            rects = main._per_object_exclusion_rects(
+                obj_dir, [(["Stray_Building"], 47.0, 19.0, 0.0)])
+            self.assertTrue(rects)
+            m_per_deg_lat = 111320.0
+            max_reach_m = max(
+                max(abs(r["north"] - 47.0), abs(r["south"] - 47.0)) for r in rects
+            ) * m_per_deg_lat
+            self.assertLess(max_reach_m, 20.0,
+                             "a stray vertex 500m away must not balloon the exclusion rectangle -- it "
+                             "should stay tight around the real 10x10 footprint (+0.5m default padding)")
+
 
 class TestPerObjectExclusionRectsConcave(unittest.TestCase):
     """The actual motivating case: a real object whose true footprint is

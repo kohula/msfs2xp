@@ -33,6 +33,7 @@ import pick_replacements
 import scenery_viewer
 import geo_transform
 from mesh_convert import mesh_ir
+from mesh_convert.convert import flag_stray_vertices
 
 CONFIG_FILE = Path("msfs2xp_config.json")
 
@@ -584,8 +585,37 @@ def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=0.5, cell_m
                     try:
                         ir = mesh_ir.load(sidecar)
                         if len(ir.positions):
-                            positions = ir.positions[:, [0, 2]]
-                            indices = ir.indices
+                            # CONFIRMED REAL BUG this filter fixes: a
+                            # single corrupted/leftover stray vertex (the
+                            # exact same failure mode compute_file_
+                            # flatness_and_reference's own max_radius had
+                            # to guard against, see flag_stray_vertices'
+                            # docstring) sitting hundreds of meters outside
+                            # a primitive's real bulk extent used to blow
+                            # up this stem's own x_min/x_max/z_min/z_max
+                            # unfiltered -- producing a wildly oversized
+                            # exclusion rectangle for that one object while
+                            # every other, unaffected object stayed tight.
+                            # Whole triangles referencing a stray vertex
+                            # are dropped (not just the vertex itself, to
+                            # keep index buffers consistent), same as
+                            # convert()'s own equivalent filter.
+                            not_stray = ~flag_stray_vertices(ir.positions)
+                            if not_stray.all():
+                                positions = ir.positions[:, [0, 2]]
+                                indices = ir.indices
+                            elif not_stray.any():
+                                positions = ir.positions[not_stray][:, [0, 2]]
+                                new_index = np.cumsum(not_stray) - 1
+                                kept_tris = []
+                                for tri in np.asarray(ir.indices, dtype=np.int64).reshape(-1, 3):
+                                    a, b, c = tri
+                                    if not_stray[a] and not_stray[b] and not_stray[c]:
+                                        kept_tris.append((new_index[a], new_index[b], new_index[c]))
+                                indices = [i for tri in kept_tris for i in tri]
+                            # else: every vertex flagged stray (degenerate
+                            # sidecar) -- positions/indices stay None,
+                            # same as "no usable geometry" below.
                     except (OSError, EOFError, pickle.UnpicklingError):
                         positions, indices = None, None
                 sidecar_cache[stem] = (positions, indices)
