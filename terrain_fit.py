@@ -212,29 +212,56 @@ def get_cached_transform(group_key):
 
 
 def apply_shared_shift_to_group(obj_dir, obj_stems, transform, xplane_root):
-    """Retroactively applies an already-computed vertical shift (from a
+    """Retroactively applies an already-computed correction (from a
     different group_key's terrain-fit result at the same real-world
-    anchor -- see main.py's anchor-clustering pass) to stems that came
-    back disqualified/rigid_skip/negligible on their own.
+    anchor -- see main.py's anchor-clustering pass) to every stem in
+    obj_stems, UNCONDITIONALLY overriding any correction they may already
+    have computed independently.
 
     Fixes one real-world building split across multiple placements from
     different source files, which never reach the same group_key since
     they don't share a model stem (e.g. LHBP's ATC tower: an SPB-attached
-    shell and a plain-BGL-placed interior at the same anchor). Unlike the
-    rotation this replaced, no anchor-delta bookkeeping is needed here:
-    the shift is a property of the shared real-world anchor point (how
-    much real terrain differs from assumed, AT THAT LAT/LON), not of
+    shell and a plain-BGL-placed interior at the same anchor; or a
+    building's shell alongside the people/props placed inside it).
+    CONFIRMED REAL BUG this always-override behavior fixes: this used to
+    only patch up stems that came back disqualified/rigid_skip/negligible
+    on their own, leaving alone any stem that had already independently
+    computed its OWN correction (on the reasoning that an independent
+    per-vertex warp is more accurate than a borrowed shift) -- but a
+    shared real-world anchor is one physical thing, and letting different
+    members use DIFFERENT correction mechanisms (one shifted, one warped)
+    computed independently means they generally do NOT agree at their
+    shared boundary even when each is individually reasonable, producing
+    a visible vertical seam between them. Every member at a shared anchor
+    must move as the canonical member did, full stop.
+
+    Branches on transform["uses_rigid_warp"] (see get_or_create_fitted_
+    group) to match whichever mechanism the CANONICAL member itself used
+    -- a uniform shift needs no anchor-delta bookkeeping at all (the
+    shift is a property of the shared real-world anchor point, not of
     either object's own local coordinate convention, so the identical
     number applies correctly regardless of the two objects' respective
-    local origins, recenter offsets, or (non-AGL) height conventions.
+    local origins, recenter offsets, or non-AGL height conventions); a
+    warp samples each of THIS stem's own vertices' own real (lat, lon)
+    directly, so it's likewise unaffected by either object's local-frame
+    convention -- only the shared base_lat/base_lon/heading_deg/
+    origin_elev (the anchor's own real elevation, which every member's
+    delta is measured against) needs to come from the canonical
+    transform, not be recomputed per member.
 
-    Skips draped geometry (never shifted this way) and anything with no
-    real position data (lights are corrected independently, regardless
-    of rigid-shift eligibility)."""
+    Skips draped geometry (never shifted/warped this way) and anything
+    with no real position data (lights are corrected independently,
+    regardless of rigid-correction eligibility)."""
     obj_dir = Path(obj_dir)
-    vertical_shift = transform.get("vertical_shift") if transform else None
+    if not transform:
+        return {stem: (stem, False, "not_applicable") for stem in obj_stems}
+    vertical_shift = transform.get("vertical_shift")
     if vertical_shift is None:
         return {stem: (stem, False, "not_applicable") for stem in obj_stems}
+    uses_rigid_warp = transform.get("uses_rigid_warp", False)
+    base_lat, base_lon = transform["base_lat"], transform["base_lon"]
+    heading_deg, origin_elev = transform["heading_deg"], transform["origin_elev"]
+    point_cache = {}
 
     result = {}
     for stem in obj_stems:
@@ -243,21 +270,31 @@ def apply_shared_shift_to_group(obj_dir, obj_stems, transform, xplane_root):
             result[stem] = (stem, False, "not_applicable")
             continue
 
-        shifted = _apply_vertical_shift(ir, vertical_shift)
+        if uses_rigid_warp:
+            corrected_positions = ir.positions.copy()
+            for i in range(len(corrected_positions)):
+                d = _point_elevation_delta(
+                    base_lat, base_lon, heading_deg,
+                    float(ir.positions[i, 0]), float(ir.positions[i, 2]),
+                    xplane_root, origin_elev, point_cache)
+                if d is not None:
+                    corrected_positions[i, 1] += d
+        else:
+            corrected_positions = _apply_vertical_shift(ir, vertical_shift)
 
-        digest = hashlib.md5(f"{vertical_shift}_{stem}".encode("utf-8")).hexdigest()[:10]
+        digest = hashlib.md5(f"{vertical_shift}_{uses_rigid_warp}_{stem}".encode("utf-8")).hexdigest()[:10]
         corrected = mesh_ir.MeshIR(
             name=f"{stem}_tfitlink_{digest}", texture=ir.texture, tilted=False,
             draped=ir.draped, draped_layer_offset=ir.draped_layer_offset,
             double_sided=ir.double_sided, alpha_mode=ir.alpha_mode, alpha_cutoff=ir.alpha_cutoff,
             footprint_area_m2=ir.footprint_area_m2, proximity_dataref=ir.proximity_dataref,
-            positions=shifted, normals=ir.normals, uvs=ir.uvs, indices=ir.indices,
+            positions=corrected_positions, normals=ir.normals, uvs=ir.uvs, indices=ir.indices,
         )
         fitted_path = obj_dir / f"{corrected.name}.obj"
         if not fitted_path.exists():
             mesh_ir.write_obj8(corrected, fitted_path)
             mesh_ir.save(corrected, mesh_ir.sidecar_path_for(fitted_path))
-        result[stem] = (corrected.name, True, "applied_shared_shift")
+        result[stem] = (corrected.name, True, "applied_shared_warp" if uses_rigid_warp else "applied_shared_shift")
 
     return result
 

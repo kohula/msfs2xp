@@ -2893,18 +2893,30 @@ class ModularPythonConverterApp:
                 for cand in bucket:
                     if cand["group_key"] == best_gk:
                         continue
-                    # A stem that already got the module's own precise
-                    # per-vertex warp (applied_rigid_warp -- small
-                    # footprint or real local slope, see terrain_fit.py's
-                    # own docstring) must NOT be overridden here: it
-                    # already sampled real terrain at its own vertices,
-                    # which is strictly more accurate than borrowing the
-                    # canonical sibling's single averaged shift value.
-                    # Only a plain shift (or no correction at all) is
-                    # worth replacing with a more reliable shared number.
+                    # CONFIRMED REAL BUG this reverts: exempting a member
+                    # that already got its own "applied_rigid_warp" from
+                    # being overridden here (on the reasoning that its own
+                    # per-vertex sampling was already more accurate than a
+                    # borrowed shift) broke exactly what this whole pass
+                    # exists for -- a shared real-world anchor IS one
+                    # physical thing (e.g. a building's shell + the people/
+                    # props placed inside it), and letting one member use a
+                    # SHIFT while another independently uses a WARP means
+                    # they're corrected by two different mechanisms that
+                    # don't compute the same number at their shared
+                    # boundary, even when each is individually "accurate"
+                    # -- confirmed real symptom (user): a vertical seam
+                    # between a building and the people/objects inside it.
+                    # Every member at a shared anchor now always gets the
+                    # SAME correction as the canonical member -- shift or
+                    # warp, whichever the canonical one itself used (see
+                    # apply_shared_shift_to_group, which now branches on
+                    # best_transform["uses_rigid_warp"]) -- so the whole
+                    # group moves as one, cohesion taking priority over a
+                    # theoretically-more-accurate independent estimate.
                     linkable_stems = [
                         stem for stem, (entry, fit_applied, part_is_draped, fit_reason) in cand["stem_entries"].items()
-                        if not part_is_draped and fit_reason != "applied_rigid_warp"
+                        if not part_is_draped
                     ]
                     if not linkable_stems:
                         continue

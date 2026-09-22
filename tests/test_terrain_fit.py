@@ -440,18 +440,24 @@ class TestTerrainFit(unittest.TestCase):
         LHBP's ATC tower -- an SPB-attached exterior shell + a plain-BGL-
         placed interior, at the same real-world anchor, that never share a
         model stem so never reach the same terrain_fit group_key). Both
-        the shell and the (now, with no size gate) small interior qualify
-        independently, but each samples its OWN (differently-sized)
-        footprint, so on genuinely uneven (not just linearly sloped --
-        see _write_bumpy_terrain) terrain their independently-computed
-        shifts can legitimately differ. apply_shared_shift_to_group, fed
-        the shell's cached transform via get_cached_transform, must
-        override the interior with the shell's EXACT shift value instead
-        -- no anchor-delta bookkeeping needed (unlike the rotation this
-        replaced): the shift is a property of the shared real-world
-        anchor, not of either object's own local-frame convention or its
-        own footprint, so it applies directly regardless of the
-        interior's own (different) recenter offset or AGL height."""
+        the shell and the (now, with no size/slope gate) small interior
+        qualify independently, but each samples its OWN (differently-
+        sized) footprint, so on genuinely uneven (not just linearly sloped
+        -- see _write_bumpy_terrain) terrain their independently-computed
+        corrections can legitimately differ. apply_shared_shift_to_group,
+        fed the shell's cached transform via get_cached_transform, must
+        override the interior with the shell's exact mechanism instead --
+        UNCONDITIONALLY, even though the interior already qualified for a
+        correction of its own (CONFIRMED REAL BUG: skipping an already-
+        corrected member here used to let it keep a DIFFERENT mechanism
+        than its sibling, producing a visible seam between them -- a
+        shared anchor is one physical object, it must move as one). This
+        30m shell, on this bumpy terrain, itself warps (see
+        test_large_building_on_steep_terrain_gets_the_precise_warp with
+        the identical fixture) -- so the linked interior must get that
+        SAME per-vertex warp too, not a shift, proving the mechanism
+        itself (not just a single number) propagates from the canonical
+        member."""
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             xplane_root = td / "XPlaneRoot"
@@ -496,21 +502,29 @@ class TestTerrainFit(unittest.TestCase):
             self.assertIsNotNone(transform)
             self.assertIsNotNone(transform["vertical_shift"])
 
+            self.assertTrue(transform["uses_rigid_warp"],
+                             "test setup issue: expected this 30m shell, on this bumpy terrain, to itself warp")
+
             linked_results = terrain_fit.apply_shared_shift_to_group(obj_dir, [interior_stem], transform, xplane_root)
             linked_stem, linked_applied, linked_reason = linked_results[interior_stem]
-            self.assertTrue(linked_applied, "the interior must be corrected once linked to the shell's shift")
-            self.assertEqual(linked_reason, "applied_shared_shift")
+            self.assertTrue(linked_applied, "the interior must be corrected once linked to the shell's transform")
+            self.assertEqual(linked_reason, "applied_shared_warp")
             self.assertNotEqual(linked_stem, interior_stem)
 
             linked_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{linked_stem}.obj"))
-            # X/Z entirely unchanged, every vertex's Y moved by the exact
-            # shift value the shell got -- proves it was linked to the
-            # shell's own value, overriding whatever the interior's own
-            # independent computation (checked above) would have used.
+            # X/Z entirely unchanged; Y moves by each vertex's own real
+            # elevation delta (sampled at the SHELL's anchor/origin_elev,
+            # not recomputed from the interior's own) -- proves the warp
+            # mechanism itself was shared, not just a single number. (This
+            # fixture's own box is symmetric around the radially-symmetric
+            # bump's own center, so its 4 equidistant corners happen to
+            # warp by the identical amount here -- see test_large_
+            # building_on_steep_terrain_gets_the_precise_warp's own note
+            # on the same coincidence -- so a real, non-zero correction is
+            # what this checks, not per-vertex variation.)
             np.testing.assert_allclose(linked_ir.positions[:, [0, 2]], original_interior_positions[:, [0, 2]], atol=1e-9)
             dy = linked_ir.positions[:, 1] - original_interior_positions[:, 1]
-            np.testing.assert_allclose(dy, transform["vertical_shift"], atol=1e-6,
-                                        err_msg="every vertex must move by exactly the shell's own shift amount")
+            self.assertGreater(float(np.abs(dy).max()), 1e-3, "expected a real, non-zero correction")
 
     def test_shared_shift_is_a_noop_when_the_source_group_had_no_shift_to_offer(self):
         """get_cached_transform on a group whose cached transform has
