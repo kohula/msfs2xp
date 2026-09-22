@@ -129,6 +129,7 @@ class MatBuilder:
         self.double_sided = False
         self.is_glass = False
         self.is_decal = False
+        self.is_dropped_elevated_decal = False  # decal-named/tagged but elevation-disqualified -- see convert()
         self.is_near_ground_flat = False  # per-material ground-level detection -- see convert()
         self.near_ground_ref_height = None  # this material's OWN dominant local Y -- see convert()'s near-ground-flat snap
         self.all_source_nodes_flat = True  # AND-reduced across every contributing node -- see convert()
@@ -2380,6 +2381,31 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                             _mat_ref_height is None or file_min_height is None
                             or abs(_mat_ref_height - file_min_height) <= _NEAR_GROUND_FLAT_TOLERANCE_M
                         )
+                        # CONFIRMED REAL BUG this fixes: an elevation-
+                        # disqualified decal (positive elevation evidence,
+                        # see just above) used to fall through to being
+                        # rendered as ORDINARY RIGID geometry at its own
+                        # authored position -- which fixed the common case
+                        # (a genuine weathering/grime overlay coincident
+                        # with its own roof, see the "roof_decal" case in
+                        # is_decal's own comment) but exposed a DIFFERENT
+                        # one: MSFS's decal material type is also used for
+                        # true "decal PROJECTOR" quads, authored floating
+                        # somewhat above the real surface they're meant to
+                        # project onto at runtime (a common technique in
+                        # other engines too) -- X-Plane has no equivalent
+                        # projection step, so rendering that quad literally
+                        # at its own authored position reads as exactly
+                        # what a real user confirmed: "a floating
+                        # transparent layer above the top of the building,
+                        # that wasn't there anytime". Unlike near-ground-
+                        # flat pavement (explicit instruction: never drop
+                        # real MSFS ground geometry), there's no reliable
+                        # real surface height to snap an elevation-
+                        # disqualified decal TO -- it isn't ground-surface
+                        # geometry at all -- so it's dropped instead of
+                        # guessing a position that's very likely wrong.
+                        builder.is_dropped_elevated_decal = _decal_name_matched and not builder.is_decal
 
                         # MSFS has shipped several glass extension names
                         # ("ASOBO_material_glass", "_glass_v2", "_kitty_glass")
@@ -3230,6 +3256,16 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
 
     obj_paths = []
     for builder_key, builder in builders.items():
+        if getattr(builder, "is_dropped_elevated_decal", False):
+            logger.info(
+                f"{glb_path.name}: dropping '{builder.name}' -- decal-named/tagged but sits away from "
+                f"this file's own ground level, so it's very likely a decal-PROJECTOR quad (authored "
+                f"floating above the real surface it targets, not literal geometry) rather than "
+                f"genuine ground-surface content; X-Plane has no equivalent projection step, so "
+                f"rendering it literally at its own authored position reads as a floating transparent "
+                f"layer, which is omitted instead."
+            )
+            continue
         if not builder.texture_name:
             # A BLEND material (glass, tinted panels, etc.) with no texture
             # of its own MUST get a texture whose alpha channel actually
