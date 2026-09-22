@@ -648,10 +648,68 @@ def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=0.5, cell_m
     only objects have no footprint to exclude). Returns [] if nothing
     produced a usable footprint at all, so the caller can fall back to
     the airport-wide shape.
+
+    Rasterization + greedy-rect decomposition is cached per unique sorted
+    generated_stems tuple (raster_cache below) -- CONFIRMED REAL BUG this
+    fixes: a real airport places the same fixture (a light, a bollard, a
+    barrier segment, a sign) hundreds of times, and every placement was
+    re-rasterizing the IDENTICAL local geometry from scratch even though
+    the local mask depends only on the stems' own combined triangles,
+    never on the placement's own lat/lon/heading. Measured on real EGLC/
+    LHBP data: this is what turned an otherwise-cheap change (padding/
+    elongated-rect splitting) into an apparent multi-minute stall, by
+    tipping an already just-barely-acceptable per-airport aggregate
+    rasterization cost over some visible threshold.
     """
     rects = []
     sidecar_cache = {}
+    # CONFIRMED REAL BUG this cache fixes: a real airport places the same
+    # fixture (a light, a bollard, a barrier segment, a sign) hundreds of
+    # times, and every placement was re-rasterizing the IDENTICAL local
+    # geometry from scratch -- the local mask/grid-rects depend only on
+    # generated_stems' own combined triangles (via sidecar_cache, which
+    # already guarantees the same stem always yields the same positions/
+    # indices), never on base_lat/base_lon/heading_deg, so every repeat
+    # placement of one model was pure wasted work. Measured on real EGLC/
+    # LHBP data: rasterization alone (PIL's own per-triangle polygon
+    # fill, already efficient in isolation -- ~2us/triangle) accumulates
+    # to minutes once aggregated across an entire airport's placement
+    # count, which is what turned a real elongated-rect-splitting change
+    # (itself cheap) into an apparent multi-minute stall once it tipped
+    # already-marginal per-airport totals over some visible threshold.
+    # Keyed on the sorted stem tuple, which is exactly what determines
+    # the combined local mask.
+    raster_cache = {}
     for generated_stems, base_lat, base_lon, heading_deg in footprint_candidates:
+        raster_key = tuple(sorted(generated_stems))
+        if raster_key in raster_cache:
+            grid_rects, x_min, z_min, cell = raster_cache[raster_key]
+            if grid_rects is None:
+                continue
+            m_lat, m_lon = geo_transform.metres_per_degree(base_lat)
+            pad_lat_deg = pad_m / m_lat
+            pad_lon_deg = pad_m / m_lon
+            for (gy0, gx0, gy1, gx1) in grid_rects:
+                lx_min = x_min + gx0 * cell
+                lx_max = x_min + (gx1 + 1) * cell
+                lz_min = z_min + gy0 * cell
+                lz_max = z_min + (gy1 + 1) * cell
+                for slx_min, slx_max, slz_min, slz_max in _split_elongated_rect_for_rotation(
+                        lx_min, lx_max, lz_min, lz_max, heading_deg):
+                    corners = [(slx_min, slz_min), (slx_max, slz_min), (slx_max, slz_max), (slx_min, slz_max)]
+                    lats, lons = [], []
+                    for cx, cz in corners:
+                        la, lo = geo_transform.local_offset_to_latlon(base_lat, base_lon, heading_deg, cx, cz)
+                        lats.append(la)
+                        lons.append(lo)
+                    rects.append({
+                        "west": min(lons) - pad_lon_deg,
+                        "east": max(lons) + pad_lon_deg,
+                        "south": min(lats) - pad_lat_deg,
+                        "north": max(lats) + pad_lat_deg,
+                    })
+            continue
+
         xz_parts = []
         tri_parts = []
         offset = 0
@@ -706,16 +764,20 @@ def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=0.5, cell_m
                 tri_parts.append(np.asarray(indices, dtype=np.int64).reshape(-1, 3) + offset)
             offset += len(positions)
         if not xz_parts:
+            raster_cache[raster_key] = (None, None, None, None)
             continue
         xz = np.concatenate(xz_parts, axis=0)
         tris = np.concatenate(tri_parts, axis=0) if tri_parts else None
 
         mask, x_min, z_min, cell = _rasterize_footprint_mask(xz, tris, cell_m)
         if mask is None:
+            raster_cache[raster_key] = (None, None, None, None)
             continue
         grid_rects = _greedy_rects_from_mask(mask)
         if not grid_rects:
+            raster_cache[raster_key] = (None, None, None, None)
             continue
+        raster_cache[raster_key] = (grid_rects, x_min, z_min, cell)
 
         m_lat, m_lon = geo_transform.metres_per_degree(base_lat)
         pad_lat_deg = pad_m / m_lat
