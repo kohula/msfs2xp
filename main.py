@@ -531,6 +531,55 @@ def _rasterize_footprint_mask(xz, tris, cell_m, max_cells=2_000_000):
     return mask, x_min, z_min, _cell
 
 
+_ELONGATED_RECT_MAX_ASPECT = 1.5  # split a local grid rect into near-square segments past this long/short ratio
+_ELONGATED_RECT_MIN_OFF_CARDINAL_DEG = 2.0  # skip splitting when heading is this close to axis-aligned (no waste to fix)
+
+
+def _split_elongated_rect_for_rotation(lx_min, lx_max, lz_min, lz_max, heading_deg,
+                                        max_aspect=_ELONGATED_RECT_MAX_ASPECT):
+    """Splits a local-frame (pre-rotation) rectangle into near-square
+    segments along its own longer axis. CONFIRMED REAL BUG this fixes:
+    _per_object_exclusion_rects rotates each LOCAL grid rectangle into
+    real-world lat/lon and then reduces it to an axis-aligned west/south/
+    east/north box THERE (X-Plane's exclusion-zone format has no rotated-
+    rectangle primitive at all) -- fine for a roughly-square rect, but a
+    LONG, THIN one (a long building wing/arm) at any heading that isn't
+    axis-aligned needs a world-space box far larger than the rect's own
+    real area to contain it: a 40x8m arm at 45 degrees needs a ~34x34m
+    box, over 3.5x its real 320m2 area, and that waste keeps growing the
+    more elongated the rect is. Confirmed against a real user report
+    describing exactly this shape (a rotated cross/"X"-shaped building):
+    each long arm needs to be its own SEVERAL near-square segments (their
+    own report: two rectangles per outer arm, one for the shared middle)
+    instead of one rectangle for the whole arm, so each segment's own
+    rotation waste stays bounded to what a square needs (~41% at 45
+    degrees) instead of accumulating over the whole arm's length.
+
+    No-op (yields the input rect unchanged) when the heading is close
+    enough to a cardinal direction that an axis-aligned box already fits
+    exactly (splitting there would only add rects for no benefit), or
+    when the rect isn't elongated enough (aspect ratio under max_aspect)
+    for the waste to be worth the extra rect count."""
+    span_x = lx_max - lx_min
+    span_z = lz_max - lz_min
+    long_span = max(span_x, span_z)
+    short_span = max(min(span_x, span_z), 1e-6)
+    off_cardinal = heading_deg % 90.0
+    off_cardinal = min(off_cardinal, 90.0 - off_cardinal)
+    if off_cardinal < _ELONGATED_RECT_MIN_OFF_CARDINAL_DEG or long_span / short_span < max_aspect:
+        yield (lx_min, lx_max, lz_min, lz_max)
+        return
+    n = max(1, math.ceil(long_span / short_span))
+    if span_x >= span_z:
+        step = span_x / n
+        for i in range(n):
+            yield (lx_min + i * step, lx_min + (i + 1) * step, lz_min, lz_max)
+    else:
+        step = span_z / n
+        for i in range(n):
+            yield (lx_min, lx_max, lz_min + i * step, lz_min + (i + 1) * step)
+
+
 def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=0.5, cell_m=1.0):
     """Exclusion rectangles that cover each converted object's OWN
     footprint using close to the MINIMUM real area needed -- not one
@@ -664,18 +713,20 @@ def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=0.5, cell_m
             lx_max = x_min + (gx1 + 1) * cell
             lz_min = z_min + gy0 * cell
             lz_max = z_min + (gy1 + 1) * cell
-            corners = [(lx_min, lz_min), (lx_max, lz_min), (lx_max, lz_max), (lx_min, lz_max)]
-            lats, lons = [], []
-            for cx, cz in corners:
-                la, lo = geo_transform.local_offset_to_latlon(base_lat, base_lon, heading_deg, cx, cz)
-                lats.append(la)
-                lons.append(lo)
-            rects.append({
-                "west": min(lons) - pad_lon_deg,
-                "east": max(lons) + pad_lon_deg,
-                "south": min(lats) - pad_lat_deg,
-                "north": max(lats) + pad_lat_deg,
-            })
+            for slx_min, slx_max, slz_min, slz_max in _split_elongated_rect_for_rotation(
+                    lx_min, lx_max, lz_min, lz_max, heading_deg):
+                corners = [(slx_min, slz_min), (slx_max, slz_min), (slx_max, slz_max), (slx_min, slz_max)]
+                lats, lons = [], []
+                for cx, cz in corners:
+                    la, lo = geo_transform.local_offset_to_latlon(base_lat, base_lon, heading_deg, cx, cz)
+                    lats.append(la)
+                    lons.append(lo)
+                rects.append({
+                    "west": min(lons) - pad_lon_deg,
+                    "east": max(lons) + pad_lon_deg,
+                    "south": min(lats) - pad_lat_deg,
+                    "north": max(lats) + pad_lat_deg,
+                })
     return rects
 
 

@@ -356,6 +356,70 @@ class TestPerObjectExclusionRects(unittest.TestCase):
                              "a stray vertex 500m away must not balloon the exclusion rectangle -- it "
                              "should stay tight around the real 10x10 footprint (+0.5m default padding)")
 
+    def test_elongated_arm_at_a_diagonal_heading_splits_into_near_square_segments(self):
+        """CONFIRMED REAL BUG this pins (a real user report, a rotated
+        cross/"X"-shaped building): a LOCAL grid rectangle is rotated into
+        real-world lat/lon and then reduced to an axis-aligned west/south/
+        east/north box there (X-Plane's exclusion format has no rotated-
+        rectangle primitive) -- fine for a roughly-square rect, but one
+        LONG, THIN arm (this fixture: 40m x 8m, aspect 5:1) at a diagonal
+        heading used to become ONE giant box (~34x34m, over 3.5x the
+        arm's real 320m2 area) instead of hugging the arm tightly. Past
+        _ELONGATED_RECT_MAX_ASPECT, the arm must split into several near-
+        SQUARE segments along its own length first, each individually
+        rotated -- keeping every individual rect's own waste bounded to
+        what a square needs (~41% at 45 degrees) instead of accumulating
+        over the whole arm."""
+        with tempfile.TemporaryDirectory() as td:
+            obj_dir = Path(td)
+            ir = mesh_ir.MeshIR(
+                name="LongArm",
+                positions=np.array([
+                    [-20.0, 0.0, -4.0], [20.0, 0.0, -4.0], [20.0, 0.0, 4.0], [-20.0, 0.0, 4.0],
+                ], dtype=np.float64),
+            )
+            mesh_ir.save(ir, mesh_ir.sidecar_path_for(obj_dir / "LongArm.obj"))
+
+            rects_diagonal = main._per_object_exclusion_rects(
+                obj_dir, [(["LongArm"], 47.0, 19.0, 45.0)], pad_m=0.5)
+            rects_axis_aligned = main._per_object_exclusion_rects(
+                obj_dir, [(["LongArm"], 47.0, 19.0, 0.0)], pad_m=0.5)
+
+            # An axis-aligned heading needs no splitting at all -- an
+            # axis-aligned box already fits a local axis-aligned rect
+            # exactly, so splitting there would only add rects for zero
+            # benefit.
+            self.assertEqual(len(rects_axis_aligned), 1)
+
+            # The 45-degree heading must split into MULTIPLE near-square
+            # segments, not stay as one giant box.
+            self.assertGreater(len(rects_diagonal), 1)
+
+            m_per_deg_lat = 111320.0
+            m_per_deg_lon = 111320.0 * math.cos(math.radians(47.0))
+
+            def _rect_area_m2(r):
+                return (r["east"] - r["west"]) * m_per_deg_lon * (r["north"] - r["south"]) * m_per_deg_lat
+
+            def _rect_aspect(r):
+                w = (r["east"] - r["west"]) * m_per_deg_lon
+                h = (r["north"] - r["south"]) * m_per_deg_lat
+                return max(w, h) / max(min(w, h), 1e-6)
+
+            # No single segment may balloon into a long/wasteful box --
+            # each one must stay close to square (a modest allowance over
+            # 1.0 for grid/padding rounding).
+            for r in rects_diagonal:
+                self.assertLess(_rect_aspect(r), 1.5,
+                                 "each split segment must be near-square, not one long thin box")
+
+            # The OLD single-giant-box behavior would have needed a ~34x34m
+            # (~1156m2) box to contain the whole rotated 40x8m arm -- the
+            # split segments must never reach anywhere near that for any
+            # one piece.
+            self.assertLess(max(_rect_area_m2(r) for r in rects_diagonal), 300.0,
+                             "no individual split segment should approach the old single-box area")
+
 
 class TestPerObjectExclusionRectsConcave(unittest.TestCase):
     """The actual motivating case: a real object whose true footprint is
