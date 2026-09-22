@@ -152,6 +152,46 @@ def _point_elevation_delta(base_lat, base_lon, heading_deg, local_x, local_z, xp
     return delta
 
 
+def _warp_positions_batch(positions, base_lat, base_lon, heading_deg, xplane_root, origin_elev, cache):
+    """Vectorized equivalent of calling _point_elevation_delta once per
+    vertex and adding the result to positions[:, 1] -- CONFIRMED REAL
+    PERFORMANCE BUG this fixes: propagating a per-vertex warp to every
+    member of an anchor-linked group (main.py's own anchor-clustering
+    pass, which now must keep every member of a shared real-world anchor
+    in sync -- see the module docstring) can need many thousands of
+    individual samples across many stems, and a plain Python for-loop
+    calling terrain_dem.get_elevation once per vertex became the
+    dominant real wall-clock cost at that volume. Same cache (keyed by
+    (local_x, local_z) rounded to the centimetre) and exact same
+    per-point result as the scalar path -- this only batches the actual
+    terrain_dem call via DemLayer.bilinear_batch, nothing about which
+    points get sampled or how NODATA is handled changes. Returns a NEW
+    positions array; does not mutate the input."""
+    warped = positions.copy()
+    n = len(warped)
+    keys = [(round(float(warped[i, 0]), 2), round(float(warped[i, 2]), 2)) for i in range(n)]
+    to_query_idx = [i for i, k in enumerate(keys) if k not in cache]
+    if to_query_idx:
+        uncached_keys = [keys[i] for i in to_query_idx]
+        # de-dupe within this batch too -- many vertices (across siblings,
+        # or a shared mesh edge) commonly land on the exact same local
+        # point, same reasoning as the scalar cache.
+        unique_keys = list(dict.fromkeys(uncached_keys))
+        lats, lons = [], []
+        for kx, kz in unique_keys:
+            la, lo = local_offset_to_latlon(base_lat, base_lon, heading_deg, kx, kz)
+            lats.append(la)
+            lons.append(lo)
+        elevs = terrain_dem.get_elevations_batch(xplane_root, lats, lons)
+        for (kx, kz), elev in zip(unique_keys, elevs):
+            cache[(kx, kz)] = None if elev is None else (elev - origin_elev)
+    for i in range(n):
+        d = cache[keys[i]]
+        if d is not None:
+            warped[i, 1] += d
+    return warped
+
+
 def _robust_vertical_shift(corner_samples, mad_k=_SHIFT_OUTLIER_MAD_K):
     """corner_samples: [(local_x, local_z, elevation_delta), ...] real
     terrain samples across a group's shared footprint. Returns a single
@@ -271,14 +311,8 @@ def apply_shared_shift_to_group(obj_dir, obj_stems, transform, xplane_root):
             continue
 
         if uses_rigid_warp:
-            corrected_positions = ir.positions.copy()
-            for i in range(len(corrected_positions)):
-                d = _point_elevation_delta(
-                    base_lat, base_lon, heading_deg,
-                    float(ir.positions[i, 0]), float(ir.positions[i, 2]),
-                    xplane_root, origin_elev, point_cache)
-                if d is not None:
-                    corrected_positions[i, 1] += d
+            corrected_positions = _warp_positions_batch(
+                ir.positions, base_lat, base_lon, heading_deg, xplane_root, origin_elev, point_cache)
         else:
             corrected_positions = _apply_vertical_shift(ir, vertical_shift)
 
@@ -453,15 +487,8 @@ def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_d
             footprint_area_m2=ir.footprint_area_m2, proximity_dataref=ir.proximity_dataref,
         )
         if warp_positions or rigid_warp:
-            warped = ir.positions.copy()
-            for i in range(len(warped)):
-                d = _point_elevation_delta(
-                    base_lat, base_lon, heading_deg,
-                    float(ir.positions[i, 0]), float(ir.positions[i, 2]),
-                    xplane_root, origin_elev, point_cache)
-                if d is not None:
-                    warped[i, 1] += d
-            corrected.positions = warped
+            corrected.positions = _warp_positions_batch(
+                ir.positions, base_lat, base_lon, heading_deg, xplane_root, origin_elev, point_cache)
             corrected.normals = ir.normals
             corrected.uvs = ir.uvs
             corrected.indices = ir.indices

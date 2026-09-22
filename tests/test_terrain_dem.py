@@ -60,6 +60,38 @@ class TestTerrainDem(unittest.TestCase):
             v = terrain_dem.get_elevation(root, 47.25, 8.25)
             self.assertAlmostEqual(v, 55.0, places=6)
 
+    def test_bilinear_batch_matches_scalar_bilinear_exactly(self):
+        """get_elevations_batch (the vectorized numpy path, added to fix
+        a real performance regression -- see DemLayer._grid()/bilinear_
+        batch's own docstring) must return EXACTLY the same values as
+        calling get_elevation() once per point, including None at a
+        NODATA post and for a point outside any known tile."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            grid = [[-32768, 10, 20], [100, 110, 120], [200, 210, 220]]
+            self._write_tile(root, 47, 8, build_elevation_dsf(grid))
+            terrain_dem._dem_cache.clear()
+
+            points = [
+                (47.5, 8.5),   # exact center post
+                (47.0, 8.0),   # exact NODATA post
+                (47.1, 8.1),   # blend touching NODATA corner
+                (47.9, 8.9),   # far corner, unaffected by NODATA
+                (47.25, 8.25),  # quarter-point blend
+                (60.0, 60.0),  # no tile at all here
+            ]
+            expected = [terrain_dem.get_elevation(root, la, lo) for la, lo in points]
+            lats = [la for la, _ in points]
+            lons = [lo for _, lo in points]
+            batch = terrain_dem.get_elevations_batch(root, lats, lons)
+
+            self.assertEqual(len(batch), len(expected))
+            for exp, got in zip(expected, batch):
+                if exp is None:
+                    self.assertIsNone(got)
+                else:
+                    self.assertAlmostEqual(got, exp, places=6)
+
     def test_nodata_propagates_through_bilinear_blend(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
