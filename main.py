@@ -2760,7 +2760,7 @@ class ModularPythonConverterApp:
                         dataref = proximity_sidecars.get(obj_stem)
                         if dataref:
                             proximity_objects.append({"dataref": dataref, "lat": abs_lat, "lon": abs_lon})
-                        _stem_entries[obj_stem] = (entry, fit_applied, part_is_draped)
+                        _stem_entries[obj_stem] = (entry, fit_applied, part_is_draped, fit_reason)
 
                     _anchor_cluster_candidates.append({
                         "group_key": _fit_gk, "raw_lat": p["lat"], "raw_lon": p["lon"], "hdg": p["hdg"],
@@ -2893,9 +2893,18 @@ class ModularPythonConverterApp:
                 for cand in bucket:
                     if cand["group_key"] == best_gk:
                         continue
+                    # A stem that already got the module's own precise
+                    # per-vertex warp (applied_rigid_warp -- small
+                    # footprint or real local slope, see terrain_fit.py's
+                    # own docstring) must NOT be overridden here: it
+                    # already sampled real terrain at its own vertices,
+                    # which is strictly more accurate than borrowing the
+                    # canonical sibling's single averaged shift value.
+                    # Only a plain shift (or no correction at all) is
+                    # worth replacing with a more reliable shared number.
                     linkable_stems = [
-                        stem for stem, (entry, fit_applied, part_is_draped) in cand["stem_entries"].items()
-                        if not part_is_draped
+                        stem for stem, (entry, fit_applied, part_is_draped, fit_reason) in cand["stem_entries"].items()
+                        if not part_is_draped and fit_reason != "applied_rigid_warp"
                     ]
                     if not linkable_stems:
                         continue
@@ -2914,7 +2923,7 @@ class ModularPythonConverterApp:
                     for stem in linkable_stems:
                         new_name, linked_applied, _linked_reason = linked_results[stem]
                         if linked_applied:
-                            entry, _, _ = cand["stem_entries"][stem]
+                            entry, _, _, _ = cand["stem_entries"][stem]
                             entry["name"] = new_name
                             _linked_count += 1
 
