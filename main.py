@@ -8,6 +8,7 @@ import struct
 import json
 import io
 import hashlib
+import logging
 import threading
 import multiprocessing
 import pickle
@@ -33,6 +34,25 @@ import pick_replacements
 import scenery_viewer
 import geo_transform
 from mesh_convert import mesh_ir
+from mesh_convert.convert import flag_stray_vertices
+
+# CONFIRMED REAL BUG this fixes: mesh_convert/convert.py (and any other
+# module using logging.getLogger(__name__)) calls logger.info/warning
+# throughout, but nothing in the real app ever configured a handler for
+# the standard logging module -- Python's logging defaults to WARNING
+# with no handler at all, so every info-level message (including ones
+# describing exactly why a piece of content was dropped or reclassified)
+# was silently discarded, in every real run, GUI or headless. Module-
+# level (not inside a function) so it also re-runs in every
+# ProcessPoolExecutor worker: Windows multiprocessing always uses
+# "spawn", which re-imports this module fresh in each worker process
+# before calling into cached_convert/mesh_convert.convert() there, so
+# each worker independently gets its own configured handler too --
+# without this, a handler set up only in the main process would still
+# never see logger calls made inside a worker. Level and format match
+# the one place this was already done, convert.py's own standalone
+# __main__ block, so behavior there doesn't change.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 CONFIG_FILE = Path("msfs2xp_config.json")
 
@@ -584,8 +604,37 @@ def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=0.5, cell_m
                     try:
                         ir = mesh_ir.load(sidecar)
                         if len(ir.positions):
-                            positions = ir.positions[:, [0, 2]]
-                            indices = ir.indices
+                            # CONFIRMED REAL BUG this filter fixes: a
+                            # single corrupted/leftover stray vertex (the
+                            # exact same failure mode compute_file_
+                            # flatness_and_reference's own max_radius had
+                            # to guard against, see flag_stray_vertices'
+                            # docstring) sitting hundreds of meters outside
+                            # a primitive's real bulk extent used to blow
+                            # up this stem's own x_min/x_max/z_min/z_max
+                            # unfiltered -- producing a wildly oversized
+                            # exclusion rectangle for that one object while
+                            # every other, unaffected object stayed tight.
+                            # Whole triangles referencing a stray vertex
+                            # are dropped (not just the vertex itself, to
+                            # keep index buffers consistent), same as
+                            # convert()'s own equivalent filter.
+                            not_stray = ~flag_stray_vertices(ir.positions)
+                            if not_stray.all():
+                                positions = ir.positions[:, [0, 2]]
+                                indices = ir.indices
+                            elif not_stray.any():
+                                positions = ir.positions[not_stray][:, [0, 2]]
+                                new_index = np.cumsum(not_stray) - 1
+                                kept_tris = []
+                                for tri in np.asarray(ir.indices, dtype=np.int64).reshape(-1, 3):
+                                    a, b, c = tri
+                                    if not_stray[a] and not_stray[b] and not_stray[c]:
+                                        kept_tris.append((new_index[a], new_index[b], new_index[c]))
+                                indices = [i for tri in kept_tris for i in tri]
+                            # else: every vertex flagged stray (degenerate
+                            # sidecar) -- positions/indices stay None,
+                            # same as "no usable geometry" below.
                     except (OSError, EOFError, pickle.UnpicklingError):
                         positions, indices = None, None
                 sidecar_cache[stem] = (positions, indices)
@@ -2711,7 +2760,7 @@ class ModularPythonConverterApp:
                         dataref = proximity_sidecars.get(obj_stem)
                         if dataref:
                             proximity_objects.append({"dataref": dataref, "lat": abs_lat, "lon": abs_lon})
-                        _stem_entries[obj_stem] = (entry, fit_applied, part_is_draped)
+                        _stem_entries[obj_stem] = (entry, fit_applied, part_is_draped, fit_reason)
 
                     _anchor_cluster_candidates.append({
                         "group_key": _fit_gk, "raw_lat": p["lat"], "raw_lon": p["lon"], "hdg": p["hdg"],
@@ -2844,9 +2893,18 @@ class ModularPythonConverterApp:
                 for cand in bucket:
                     if cand["group_key"] == best_gk:
                         continue
+                    # A stem that already got the module's own precise
+                    # per-vertex warp (applied_rigid_warp -- small
+                    # footprint or real local slope, see terrain_fit.py's
+                    # own docstring) must NOT be overridden here: it
+                    # already sampled real terrain at its own vertices,
+                    # which is strictly more accurate than borrowing the
+                    # canonical sibling's single averaged shift value.
+                    # Only a plain shift (or no correction at all) is
+                    # worth replacing with a more reliable shared number.
                     linkable_stems = [
-                        stem for stem, (entry, fit_applied, part_is_draped) in cand["stem_entries"].items()
-                        if not part_is_draped
+                        stem for stem, (entry, fit_applied, part_is_draped, fit_reason) in cand["stem_entries"].items()
+                        if not part_is_draped and fit_reason != "applied_rigid_warp"
                     ]
                     if not linkable_stems:
                         continue
@@ -2865,7 +2923,7 @@ class ModularPythonConverterApp:
                     for stem in linkable_stems:
                         new_name, linked_applied, _linked_reason = linked_results[stem]
                         if linked_applied:
-                            entry, _, _ = cand["stem_entries"][stem]
+                            entry, _, _, _ = cand["stem_entries"][stem]
                             entry["name"] = new_name
                             _linked_count += 1
 

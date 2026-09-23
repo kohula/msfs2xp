@@ -129,7 +129,8 @@ class MatBuilder:
         self.double_sided = False
         self.is_glass = False
         self.is_decal = False
-        self.is_near_ground_flat = False  # per-material ground-level detection -- currently informational only, see convert()
+        self.is_dropped_elevated_decal = False  # decal-named/tagged but elevation-disqualified -- see convert()
+        self.is_near_ground_flat = False  # per-material ground-level detection -- see convert()
         self.all_source_nodes_flat = True  # AND-reduced across every contributing node -- see convert()
         self.block_footprint_areas = []  # per-node-block XZ bbox area, m^2 -- see convert()'s footprint write-up
 
@@ -505,16 +506,16 @@ def compute_file_flatness_and_reference(gltf, buffers, world_transforms, flat_ep
         level, and must stay rigid (this is exactly the failure mode an
         earlier, more aggressive per-material attempt hit this session:
         it had no ground-proximity check at all). A material detected this
-        way stays RIGID (is_near_ground_flat is informational only, not a
-        drape/drop decision) instead of being draped with a guessed layer
-        rank -- MSFS's own intended stacking order for this kind of small
-        patch/paver detail can't be recovered from the source data, so
-        it's left at its own authored position rather than guessing where
-        in the draw order it belongs. Used to be DROPPED from the output
-        entirely instead; reverted per a real-world comparison against
-        another converter's output for the same content (see convert()'s
-        own is_near_ground_flat comment), which showed dropping it was
-        worse than leaving it rigid.
+        way is DRAPED, same as file-wide-flat/decal content (see
+        convert()'s own is_near_ground_flat comment for the full history:
+        this went DROPPED -> rigid-with-a-vertical-snap -> draped, each
+        step fixing a confirmed real symptom the previous one left behind
+        -- dropping removed real content outright, and a rigid snap still
+        clipped through real terrain's own small undulation across any
+        sizeable footprint, producing a scattered "shredded" gap pattern.
+        Draping re-projects onto X-Plane's own compiled terrain mesh at
+        every point, which actually conforms to that undulation instead
+        of approximating it with one number).
     """
     total_tris = 0
     flat_tris = 0
@@ -2287,15 +2288,14 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                         #      3D ramp Slope_01, plus Concrete_01/
                         #      Grunge_01/Colour_01) sits at 0.89 or well
                         #      below, comfortably clear of 0.90. The outcome
-                        #      of qualifying here is just "stay rigid instead
-                        #      of draped" -- a false positive costs one
-                        #      small patch-scale object an unnecessary rigid
-                        #      placement (still rendered, just not draped), a
-                        #      false negative just leaves the original
-                        #      rigid/floating symptom in place; neither is as
-                        #      costly as it would be if the outcome were
-                        #      still "drape with a guessed rank", which is
-                        #      why this can stay lenient.
+                        #      of qualifying here is DRAPED -- a false
+                        #      positive costs one small patch-scale object
+                        #      an unnecessary (but harmless, ATTR_draped
+                        #      simply re-projects it) drape, a false
+                        #      negative just leaves the original rigid/
+                        #      floating symptom in place; neither is as
+                        #      costly as rendering it visibly wrong, which
+                        #      is why this can stay lenient.
                         #   2. Its own flat elevation is close to the
                         #      file's overall ground-level reference. Flatness
                         #      alone isn't enough: a building's flat ROOF or a
@@ -2307,13 +2307,41 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                         #      earlier this session (it had no ground-
                         #      proximity check at all and wrongly flattened
                         #      chairs/glass/rooftops).
+                        # Compared against file_min_height (the file's own
+                        # lowest clean vertex), not file_reference_height
+                        # (the most vertex-heavy FLAT band) -- same
+                        # reasoning as the is_decal finalization just below:
+                        # a large flat roof can dominate reference_height
+                        # for a building with little explicit ground-
+                        # contact flat geometry, which would wrongly fail a
+                        # genuinely ground-level material's proximity check
+                        # against it (the material's own low Y would look
+                        # "far" from a roof-biased reference). Failing to
+                        # qualify here only leaves the original rigid/
+                        # floating symptom in place -- never a wrong
+                        # correction -- so this is a strict improvement
+                        # either way.
                         _mat_flat_fraction, _mat_ref_height = material_flatness_stats.get(mat_idx, (0.0, None))
                         builder.is_near_ground_flat = (
                             _mat_flat_fraction >= _NEAR_GROUND_FLAT_FRACTION_THRESHOLD
                             and _mat_ref_height is not None
-                            and file_reference_height is not None
-                            and abs(_mat_ref_height - file_reference_height) <= _NEAR_GROUND_FLAT_TOLERANCE_M
+                            and file_min_height is not None
+                            and abs(_mat_ref_height - file_min_height) <= _NEAR_GROUND_FLAT_TOLERANCE_M
                         )
+                        # This flag now feeds is_draped directly (see the
+                        # pre-pass a bit further down in convert()) instead
+                        # of triggering a rigid vertical snap -- CONFIRMED
+                        # REAL BUG the snap approach still had: it keeps
+                        # the material perfectly flat, but real terrain
+                        # under any footprint bigger than a few metres has
+                        # its own small undulation, so a flat rigid slab
+                        # inevitably clips below the surface in spots and
+                        # floats above it in others (confirmed via a real
+                        # EGLC screenshot: a scattered "shredded" gap
+                        # pattern across the pavement). Draping re-projects
+                        # onto X-Plane's own compiled terrain mesh at every
+                        # point instead of approximating it with one
+                        # uniform number.
 
                         # Finalizing is_decal here (see _decal_name_matched
                         # above): only exclude a decal-named material from
@@ -2332,9 +2360,8 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                         # flatness is.
                         #
                         # Deliberately compared against file_min_height
-                        # here, NOT file_reference_height (the near-ground-
-                        # flat check above still uses that one -- see its
-                        # own docstring, it degrades safely either way).
+                        # here, same as the near-ground-flat check just
+                        # above now does too (both switched together).
                         # CONFIRMED REAL BUG comparing against
                         # file_reference_height caused: that reference is
                         # the flat band with the MOST vertex support, which
@@ -2351,6 +2378,31 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                             _mat_ref_height is None or file_min_height is None
                             or abs(_mat_ref_height - file_min_height) <= _NEAR_GROUND_FLAT_TOLERANCE_M
                         )
+                        # CONFIRMED REAL BUG this fixes: an elevation-
+                        # disqualified decal (positive elevation evidence,
+                        # see just above) used to fall through to being
+                        # rendered as ORDINARY RIGID geometry at its own
+                        # authored position -- which fixed the common case
+                        # (a genuine weathering/grime overlay coincident
+                        # with its own roof, see the "roof_decal" case in
+                        # is_decal's own comment) but exposed a DIFFERENT
+                        # one: MSFS's decal material type is also used for
+                        # true "decal PROJECTOR" quads, authored floating
+                        # somewhat above the real surface they're meant to
+                        # project onto at runtime (a common technique in
+                        # other engines too) -- X-Plane has no equivalent
+                        # projection step, so rendering that quad literally
+                        # at its own authored position reads as exactly
+                        # what a real user confirmed: "a floating
+                        # transparent layer above the top of the building,
+                        # that wasn't there anytime". Unlike near-ground-
+                        # flat pavement (explicit instruction: never drop
+                        # real MSFS ground geometry), there's no reliable
+                        # real surface height to snap an elevation-
+                        # disqualified decal TO -- it isn't ground-surface
+                        # geometry at all -- so it's dropped instead of
+                        # guessing a position that's very likely wrong.
+                        builder.is_dropped_elevated_decal = _decal_name_matched and not builder.is_decal
 
                         # MSFS has shipped several glass extension names
                         # ("ASOBO_material_glass", "_glass_v2", "_kitty_glass")
@@ -3182,25 +3234,68 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
         is_decal = getattr(builder, 'is_decal', False)
         # A material that ONLY qualifies through the near-ground-flat
         # fallback (not the file-wide verdict, not the explicit
-        # "decal"-named path) used to be DROPPED from the output entirely
-        # here. Reverted per real-world comparison against another
-        # converter's output for the same EGLC content (pavement/
-        # rail-ballast detail near the train): its tool keeps this content
-        # as ordinary rigid (non-draped) geometry instead of guessing a
-        # drape rank OR omitting it, and that reads fine in-sim even when
-        # it ends up floating a little proud of the ground -- unlike our
-        # DROP, which removed real content outright. So it now just stays
-        # rigid: not draped, not dropped, and (like every other rigid
-        # object since TILTED was removed) eligible for terrain_fit's
-        # vertical shift if its group qualifies.
-        is_draped = file_wide_flat or is_decal
+        # "decal"-named path) went through DROPPED, then RIGID-with-a-
+        # vertical-snap, before landing here. CONFIRMED REAL BUG the
+        # rigid-snap approach still had: a uniform vertical shift (even
+        # one that lands it at the right AVERAGE height) keeps the whole
+        # material perfectly FLAT, but real X-Plane terrain under any
+        # footprint larger than a few metres has its own small natural
+        # undulation -- a flat rigid slab laid over that inevitably clips
+        # below the surface in spots and floats above it in others, which
+        # reads as a scattered, "shredded" gap pattern across the pavement
+        # (confirmed via a real EGLC screenshot: countless small chunks of
+        # a tiled ground surface individually poking through or vanishing
+        # under the real terrain mesh). Only ATTR_draped re-projects onto
+        # X-Plane's own compiled terrain mesh at every point, which is the
+        # only way to actually conform to real undulation rather than
+        # approximate it with one number. Being the SOLE draped material
+        # in an otherwise-rigid file (the exact situation this fallback
+        # exists for) still ranks safely: rank_draped_layer_offsets gives
+        # a lone entry the most-negative offset (draws first/underneath),
+        # and draped_merge.py's own later cross-file re-ranking pass (see
+        # its "re-ranked ... against every other draped object in this
+        # tile" log line) resolves draw order against unrelated draped
+        # content sharing the same tile -- the wrong-guessed-rank risk
+        # that originally motivated moving away from draping no longer
+        # applies now that that pass exists.
+        is_near_ground_flat = getattr(builder, 'is_near_ground_flat', False)
+        is_draped = file_wide_flat or is_decal or is_near_ground_flat
         builder_is_draped_map[builder_key] = is_draped
         if is_draped and builder.block_footprint_areas:
             draped_areas[builder_key] = float(np.median(builder.block_footprint_areas))
+    if len(draped_areas) > 11:
+        # rank_draped_layer_offsets can only guarantee a DISTINCT offset
+        # for up to 11 draped layers in one file (OBJ8's own -5..+5
+        # range) -- past that it falls back to bucketing by absolute
+        # footprint area, which does NOT guarantee distinctness, so two
+        # layers landing in the same bucket collide with no draw-order
+        # guarantee between them (X-Plane 12's own documented behavior
+        # for coincident ATTR_layer_group_draped geometry) -- exactly a
+        # z-fighting/flicker risk. Now that is_near_ground_flat feeds
+        # is_draped too, a real ground-layer model packing ~25 unrelated
+        # materials into one file (confirmed real EGLC case, see is_near_
+        # ground_flat's own comment) can push its OWN draped-layer count
+        # well past 11 where it previously didn't -- logged here so this
+        # is visible instead of a silent, unexplained flicker in-sim.
+        logger.warning(
+            f"{glb_path.name}: {len(draped_areas)} draped layers in this file -- past the 11 "
+            f"OBJ8 offers a distinct draw-order slot for, some may collide (flicker/z-fight) "
+            f"against each other in-sim."
+        )
     draped_layer_offsets = rank_draped_layer_offsets(draped_areas)
 
     obj_paths = []
     for builder_key, builder in builders.items():
+        if getattr(builder, "is_dropped_elevated_decal", False):
+            logger.info(
+                f"{glb_path.name}: dropping '{builder.name}' -- decal-named/tagged but sits away from "
+                f"this file's own ground level, so it's very likely a decal-PROJECTOR quad (authored "
+                f"floating above the real surface it targets, not literal geometry) rather than "
+                f"genuine ground-surface content; X-Plane has no equivalent projection step, so "
+                f"rendering it literally at its own authored position reads as a floating transparent "
+                f"layer, which is omitted instead."
+            )
+            continue
         if not builder.texture_name:
             # A BLEND material (glass, tinted panels, etc.) with no texture
             # of its own MUST get a texture whose alpha channel actually

@@ -116,7 +116,28 @@ _SIGN_KEYWORDS = ("sign", "logo", "banner", "placard", "board", "letter", "glyph
 _BASE_KEYWORDS = ("asphalt", "concrete", "concret", "tarmac", "pavement", "apron",
                   "baselayer", "base_layer", "basecolor", "base_color", "groundpoly",
                   "ground_poly", "gp_base", "runway_base", "taxiway_base", "_tiles_",
-                  "tiles_1", "_asp_", "asp_w", "asp_d", "conc_tile", "_conc_", "gravel")
+                  "tiles_1", "_asp_", "asp_w", "asp_d", "conc_tile", "_conc_", "gravel",
+                  # CONFIRMED REAL BUG these were missing for: a bare "tile"
+                  # substring (not just the underscore-wrapped "_tiles_"/
+                  # "tiles_1" forms above) catches real MSFS ground-poly
+                  # material names like "SmallTiles" (ini_GP_GEN_SmallTiles_
+                  # 4m_01) that glue straight onto another word with no
+                  # underscore -- previously matched NONE of this module's
+                  # keyword lists at all, silently falling through to the
+                  # _DRAPED_GROUP_LINES default (the "markings" band, for
+                  # painted lines/text/signage) instead of the "taxiways"
+                  # base-pavement band it actually belongs in. Confirmed
+                  # real symptom this caused: real tile/paver/ballast-detail
+                  # ground content competing for the markings band's own
+                  # narrow -4..+4 structure-tier ranking against genuine
+                  # painted line markings, once mesh_convert.convert()
+                  # started draping this content (see is_near_ground_flat's
+                  # own comment) -- reported as pavement pieces flickering/
+                  # z-fighting against each other in-sim. "paver"/"cobble"/
+                  # "sett"/"ballast" cover the same real-world content
+                  # class described directly by a user report: "the stones
+                  # under the rail of the train".
+                  "tile", "paver", "cobble", "sett", "ballast")
 _WEAR_KEYWORDS = ("decal", "dirt", "crack", "stain", "leak", "grud", "grunge", "tire",
                   "skid", "wear", "damage", "oil", "rubber", "patch", "weather",
                   "mud", "puddle", "scuff", "roof", "grass", "turf", "moss", "seam",
@@ -134,7 +155,11 @@ def _draped_group_for_texture(texture):
         return _DRAPED_GROUP_GROUND
     if any(k in name for k in _SIGN_KEYWORDS):
         return _DRAPED_GROUP_SIGNS
-    if any(k in name for k in _BASE_KEYWORDS):
+    # "tileseam" must still win as WEAR (see _WEAR_KEYWORDS) despite the
+    # bare "tile" keyword added to _BASE_KEYWORDS below -- without this
+    # guard the more generic "tile" substring match would shadow it here,
+    # since BASE is checked before WEAR.
+    if any(k in name for k in _BASE_KEYWORDS) and "tileseam" not in name:
         return _DRAPED_GROUP_BASE
     if any(k in name for k in _WEAR_KEYWORDS):
         return _DRAPED_GROUP_WEAR

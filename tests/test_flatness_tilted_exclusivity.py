@@ -422,23 +422,24 @@ class TestFlatnessTiltedExclusivity(unittest.TestCase):
 
         return b.build()
 
-    def test_near_ground_flat_material_stays_rigid_not_dropped(self):
+    def test_near_ground_flat_material_drapes_not_dropped(self):
         """The per-material near-ground-flat DETECTION (convert()'s
-        builder.is_near_ground_flat) is informational only: a non-"decal"-
-        named material that is individually ~100% flat AND close to the
-        file's own ground-level reference used to be DROPPED from the
-        output entirely, even though the file-wide verdict fails because
-        of the building's genuinely non-flat walls. Reverted per a
-        real-world comparison against another converter's output for the
-        same EGLC content (pavement/rail-ballast detail near the train):
-        its tool keeps this as ordinary rigid geometry instead of omitting
-        it, and that reads fine in-sim even if it ends up floating a
-        little proud of the ground -- unlike our old DROP, which removed
-        real content outright. Confirmed real case this pins: EGLC's
-        SmallTiles/ConcreteTile materials, baked ~1.5m off true ground
-        level -- this mechanism used to drape them, then dropped them;
-        now it leaves them rigid (not draped, not dropped, still eligible
-        for terrain_fit's vertical shift like any other rigid object)."""
+        builder.is_near_ground_flat): a non-"decal"-named material that is
+        individually ~100% flat AND close to the file's own ground-level
+        reference used to be DROPPED from the output entirely, even
+        though the file-wide verdict fails because of the building's
+        genuinely non-flat walls. Went DROPPED -> rigid-with-a-vertical-
+        snap -> DRAPED (this test's current form), each step fixing a
+        confirmed real symptom the previous one left behind -- dropping
+        removed real content outright; a rigid snap kept the material
+        perfectly flat, but real X-Plane terrain under any sizeable
+        footprint has its own small undulation, so the flat slab
+        inevitably clipped through it in spots (confirmed via a real
+        EGLC screenshot: a scattered "shredded" gap pattern across the
+        pavement). Draping re-projects onto X-Plane's own compiled
+        terrain mesh at every point, which actually conforms instead of
+        approximating with one number. Confirmed real case this pins:
+        EGLC's SmallTiles/ConcreteTile materials."""
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             glb_path = td / "ground_layer.glb"
@@ -460,10 +461,21 @@ class TestFlatnessTiltedExclusivity(unittest.TestCase):
                                   "a non-decal material that only qualifies via the near-ground-flat "
                                   "fallback must still be written to the output, not dropped")
             paver_text = paver_obj.read_text(encoding="utf-8")
-            self.assertNotIn("ATTR_draped", paver_text,
-                              "it must stay rigid (not draped), since MSFS's own stacking order "
-                              "for this content can't be recovered")
-            self.assertTrue(paver_text.strip())
+            self.assertIn("ATTR_draped", paver_text,
+                           "it must drape -- only ATTR_draped conforms to real terrain's own small "
+                           "undulation across the whole footprint, instead of clipping through it")
+
+            # ATTR_draped builders get their authored Y unconditionally
+            # zeroed (see convert()'s own comment on that) -- X-Plane
+            # discards it at render time regardless, and zeroing it here
+            # removes the only other place PaverMat's baked 1.5m offset
+            # (see the fixture's own docstring) could still leak into an
+            # engine pass that doesn't get the same terrain-conforming
+            # treatment (X-Plane 12's shadow pass).
+            paver_ys = [float(line.split()[2]) for line in paver_text.splitlines() if line.startswith("VT")]
+            self.assertTrue(paver_ys)
+            for y in paver_ys:
+                self.assertEqual(y, 0.0)
 
     def test_elevated_flat_material_stays_rigid_not_dropped(self):
         """The near-ground-flat DETECTION must NOT fire for a flat
