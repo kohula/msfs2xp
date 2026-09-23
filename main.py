@@ -849,11 +849,31 @@ def set_app_icon_and_taskbar(root, icon_filename="iconfin.ico"):
     icon_path = get_resource_path(icon_filename)
 
     if os.path.exists(icon_path):
-        try:
-            root.iconbitmap(icon_path)
-        except Exception:
+        # wm iconbitmap only understands the native .ico format on Windows.
+        # On X11 it can misparse the file's raw bytes and hand Xlib an
+        # oversized icon-pixmap request directly -- a BadLength protocol
+        # error that bypasses Tcl/Python exception handling entirely and
+        # kills the process, so only try it on win32; everywhere else go
+        # straight to the PIL-decoded iconphoto path, which uses real pixel
+        # data and works cross-platform.
+        icon_set = False
+        if sys.platform == "win32":
+            try:
+                root.iconbitmap(icon_path)
+                icon_set = True
+            except Exception:
+                icon_set = False
+        if not icon_set:
             try:
                 img = Image.open(icon_path)
+                # iconfin.ico only embeds a single 2048x2048 master frame.
+                # Handing that straight to iconphoto sends an X11
+                # _NET_WM_ICON property update that big-requests-unaware
+                # servers (e.g. Xvfb) reject as BadLength -- a protocol
+                # error that bypasses Tcl/Python's own exception handling,
+                # so downscale to a normal icon size first.
+                if max(img.size) > 256:
+                    img = img.resize((256, 256), Image.LANCZOS)
                 photo = ImageTk.PhotoImage(img)
                 root.iconphoto(True, photo)
             except Exception:
@@ -1761,7 +1781,12 @@ class ModularPythonConverterApp:
             widget.bind("<B1-Motion>", self._do_drag)
             widget.bind("<Double-Button-1>", lambda e: self.toggle_maximize())
 
-        self.grip = tk.Label(self.main_container, text="◢", bg=self.bg_dark, fg="#33333e", cursor="size_nw_se")
+        # "size_nw_se" is a Windows-only Tk cursor name; X11 (Linux) has no
+        # such cursor and raises TclError on it, crashing the app at
+        # startup. "bottom_right_corner" is the standard X cursor-font
+        # glyph for the same NW-SE resize affordance.
+        _grip_cursor = "size_nw_se" if sys.platform == "win32" else "bottom_right_corner"
+        self.grip = tk.Label(self.main_container, text="◢", bg=self.bg_dark, fg="#33333e", cursor=_grip_cursor)
         self.grip.place(relx=1.0, rely=1.0, anchor="se")
         self.grip.bind("<Button-1>", self._start_resize)
         self.grip.bind("<B1-Motion>", self._do_resize)
