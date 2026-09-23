@@ -38,8 +38,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-import numpy as np
-
 try:
     import py7zr
     _HAVE_PY7ZR = True
@@ -95,7 +93,7 @@ class DemLayer:
     the whole grid into a Python list -- tiles can be 1000+ posts per
     side)."""
 
-    __slots__ = ("width", "height", "scale", "offset", "bpp", "is_float", "is_signed", "data", "_decoded_grid")
+    __slots__ = ("width", "height", "scale", "offset", "bpp", "is_float", "is_signed", "data")
 
     def __init__(self, width, height, scale, offset, bpp, is_float, is_signed, data):
         self.width = width
@@ -106,7 +104,6 @@ class DemLayer:
         self.is_float = is_float
         self.is_signed = is_signed
         self.data = data
-        self._decoded_grid = None  # lazy full-grid numpy decode -- see _grid()/bilinear_batch()
 
     def _fmt_char(self):
         if self.is_float:
@@ -154,64 +151,6 @@ class DemLayer:
         v11 = self.value_at(row0 + 1, col0 + 1)
         if v00 is None or v10 is None or v01 is None or v11 is None:
             return None
-        top = v00 + (v10 - v00) * tx
-        bottom = v01 + (v11 - v01) * tx
-        return top + (bottom - top) * ty
-
-    def _grid(self):
-        """Lazily decodes the WHOLE raster into one numpy array (real
-        values, NODATA posts as np.nan), cached on this instance (itself
-        already cached per DSF tile via _get_cached_layers, so this only
-        ever runs once per tile actually sampled). CONFIRMED REAL BUG
-        this exists to fix: bilinear()/value_at()'s own per-post struct.
-        unpack_from design (deliberately lazy -- see the class docstring
-        -- to avoid materializing a 1000+-post-per-side grid for the
-        common case of a handful of samples) becomes the dominant cost
-        once callers need MANY samples per tile -- confirmed on real
-        data: propagating a per-vertex terrain warp to every member of an
-        anchor-linked group (main.py's anchor-clustering pass) can need
-        many thousands of individual samples, at which point millions of
-        individual Python-level struct.unpack calls (one per surrounding
-        post, four per sample) dominates real wall-clock time. One
-        vectorized numpy decode amortizes that over every sample the tile
-        will ever be asked for instead."""
-        if self._decoded_grid is not None:
-            return self._decoded_grid
-        dtype_map = {
-            (1, False): "<i1", (1, True): "<u1",
-            (2, False): "<i2", (2, True): "<u2",
-            (4, False): "<i4", (4, True): "<u4",
-        }
-        dtype = "<f4" if self.is_float else dtype_map[(self.bpp, not self.is_signed)]
-        n = self.width * self.height
-        raw = np.frombuffer(self.data, dtype=dtype, count=n).reshape(self.height, self.width)
-        grid = raw.astype(np.float64) * self.scale + self.offset
-        if not self.is_float:
-            nodata = _NODATA_RAW.get(self.bpp)
-            if nodata is not None:
-                grid[raw == nodata] = np.nan
-        self._decoded_grid = grid
-        return grid
-
-    def bilinear_batch(self, frac_rows, frac_cols):
-        """Vectorized equivalent of bilinear() for many samples at once --
-        frac_rows/frac_cols: 1-D numpy arrays, same convention (each in
-        [0, 1] across the whole tile). Returns a 1-D numpy array of the
-        same length, with np.nan wherever any of that sample's 4
-        surrounding posts is NODATA (matching bilinear()'s own None)."""
-        grid = self._grid()
-        frac_rows = np.asarray(frac_rows, dtype=np.float64)
-        frac_cols = np.asarray(frac_cols, dtype=np.float64)
-        row_f = frac_rows * (self.height - 1)
-        col_f = frac_cols * (self.width - 1)
-        row0 = np.clip(np.floor(row_f).astype(np.int64), 0, self.height - 2)
-        col0 = np.clip(np.floor(col_f).astype(np.int64), 0, self.width - 2)
-        ty = row_f - row0
-        tx = col_f - col0
-        v00 = grid[row0, col0]
-        v10 = grid[row0, col0 + 1]
-        v01 = grid[row0 + 1, col0]
-        v11 = grid[row0 + 1, col0 + 1]
         top = v00 + (v10 - v00) * tx
         bottom = v01 + (v11 - v01) * tx
         return top + (bottom - top) * ty
@@ -381,46 +320,3 @@ def get_elevation(xplane_root, lat, lon, layer_name="elevation"):
     frac_lon = lon - tile_lon
     frac_lat = lat - tile_lat
     return layer.bilinear(frac_lat, frac_lon)
-
-
-def get_elevations_batch(xplane_root, lats, lons, layer_name="elevation"):
-    """Vectorized equivalent of calling get_elevation() once per (lat, lon)
-    pair -- lats/lons: equal-length sequences, same units/convention.
-    Returns a list of the same length, each entry a float or None
-    (matching get_elevation's own per-call contract exactly, including
-    None for an unavailable tile/layer/NODATA post). CONFIRMED REAL BUG
-    this exists to fix: a per-vertex terrain warp propagated across many
-    stems (main.py's anchor-clustering pass, once it has to keep every
-    member of a shared real-world anchor in sync -- see terrain_fit.py's
-    own comment) can need many thousands of individual samples, and
-    get_elevation()'s own per-call path -- reasonable for the handful of
-    corner samples terrain_fit's OWN qualifying-gate needs -- becomes the
-    dominant real wall-clock cost at that volume, mostly from DemLayer's
-    deliberately-lazy per-post struct.unpack (see its own docstring).
-    Groups samples by DSF tile (almost always just one tile for a single
-    placement's own footprint) and layer, and asks DemLayer.bilinear_
-    batch for one vectorized numpy pass per group instead."""
-    n = len(lats)
-    result = [None] * n
-    if xplane_root is None or n == 0:
-        return result
-    by_tile = {}
-    for i in range(n):
-        tile_lat = math.floor(lats[i])
-        tile_lon = math.floor(lons[i])
-        by_tile.setdefault((tile_lat, tile_lon), []).append(i)
-    for (tile_lat, tile_lon), idxs in by_tile.items():
-        dsf_path = find_dsf_for_latlon(xplane_root, lats[idxs[0]], lons[idxs[0]])
-        if dsf_path is None:
-            continue
-        layers = _get_cached_layers(dsf_path)
-        layer = layers.get(layer_name)
-        if layer is None:
-            continue
-        frac_lats = np.array([lats[i] - tile_lat for i in idxs], dtype=np.float64)
-        frac_lons = np.array([lons[i] - tile_lon for i in idxs], dtype=np.float64)
-        values = layer.bilinear_batch(frac_lats, frac_lons)
-        for j, i in enumerate(idxs):
-            v = values[j]
-            result[i] = None if np.isnan(v) else float(v)
-    return result

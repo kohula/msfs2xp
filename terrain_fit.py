@@ -45,49 +45,42 @@ real float64 numpy arrays from convert()'s own in-memory data, not a
 reparse of the .obj text. A stem with no sidecar (animated/blink
 objects) is treated as disqualified.
 
-RIGID (non-draped) siblings: independently shearing every closely-packed
-vertex of architectural detail (window mullions, cornices) reads as
-visibly warped/jagged geometry, not a clean tilt, for a LARGE footprint
-under gentle/normal terrain -- so those still get ONE uniform vertical
-shift, a pure translation that preserves shape and normals exactly (see
-_robust_vertical_shift). CONFIRMED REAL REGRESSION a plain uniform shift
-has, though: it's one averaged number, so it can only ever be exactly
-right for the group's own AVERAGE terrain delta -- a large footprint that
-sits on a genuine slope (not just sampling noise) still comes out with
-one end floating and the other sunk, no matter how robust the average
-is; a rotation-only correction (an earlier version of this module) has
-the same blind spot for the anchor's own offset, see below. So a group
-gets the SAME per-vertex warp draped content gets instead of a shift
-when EITHER its own footprint is small (_RIGID_WARP_MAX_SIDE_M) -- shear
-risk is negligible at that scale, since real terrain barely varies
-across a few metres anyway, so this is strictly more accurate than an
-averaged shift with no real downside -- OR the sampled terrain across
-the footprint genuinely slopes past _RIGID_WARP_SLOPE_THRESHOLD_M, where
-a real user confirmed large buildings ending up partially underground
-under the old shift-only approach: some visible shear on a big building
-is the accepted trade-off there, since the alternative (part of the
-building buried) is worse. Only draped siblings, the "_lights" sibling's
-point positions, and now qualifying rigid ones get the per-vertex warp;
-a large, gently-sloped rigid group still gets the shift.
+RIGID (non-draped) siblings are never per-vertex-warped: independently
+shearing every closely-packed vertex of architectural detail (window
+mullions, cornices) reads as visibly warped/jagged geometry, not a clean
+tilt, even for a gentle real slope. Only draped siblings (and the
+"_lights" sibling's point positions) get the per-vertex warp.
 
-TILTING (a single rigid rotation, X-Plane's own runtime TILTED directive
-or an earlier version of this module's own better-sampled equivalent)
-only ever corrects a genuine slope, never a uniform height-offset error
--- a rotation around the object's own origin can't move that origin
-itself, so if the anchor's own real elevation differs from what the
-object assumes, every part of it stays wrong by that same amount no
-matter how well the tilt is fit. mesh_convert.convert() no longer emits
-TILTED at all, and this module no longer rotates either -- every rigid
-group gets the shift or the warp instead, chosen by the rule above,
+Rigid siblings instead get ONE uniform vertical shift -- every vertex
+moves by the exact same amount, a pure translation that preserves shape
+and normals exactly (no rotation at all). This replaced an earlier
+rotation-based correction (fit a plane to terrain samples, rotate the
+whole rigid object to match it): rotation only corrects a genuine TILT,
+never a uniform height-offset error -- a rotation around the object's
+own origin can't move that origin itself, so if the anchor's own real
+elevation differs from what the object assumes, every part of it stays
+wrong by that same amount no matter how well the tilt is fit.
+
+No size gate: mesh_convert.convert() used to leave small/medium objects
+to X-Plane's own runtime TILTED directive instead of this module's
+shift, on the theory that a small footprint's single sampled point is
+"representative enough" for a rotation to work with. CONFIRMED REAL
+REGRESSION: TILTED is a rotation, so it inherits the same "can't fix an
+anchor-offset" blind spot regardless of object size -- an object whose
+own anchor elevation just doesn't match X-Plane's real terrain sat
+wrong at ANY size, and TILTED being the only correction for anything
+under the old ~300m2 gate meant that case silently never got fixed for
+most objects. mesh_convert.convert() no longer emits TILTED at all;
+every rigid group that reaches this module gets the shift instead,
 regardless of footprint size.
 
 The shift itself is a ROBUST estimate, not a single point: several real
 terrain samples are taken across the group's shared footprint (the same
-grid used for the qualifying negligible-check and the warp/shift
-decision above), a median-absolute-deviation outlier rejection throws
-out any sample that disagrees sharply with the rest (a lone DSF
-triangulation seam or DEM spike under one corner), and the mean of what's
-left is the one number applied to every rigid vertex in the group.
+grid used for the qualifying negligible-check), a median-absolute-
+deviation outlier rejection throws out any sample that disagrees sharply
+with the rest (a lone DSF triangulation seam or DEM spike under one
+corner), and the mean of what's left is the one number applied to every
+rigid vertex in the group.
 
 Terrain sampling failures degrade gracefully: no X-Plane install/py7zr/
 origin elevation skips the whole group (no reference, no correction);
@@ -108,8 +101,6 @@ from mesh_convert import mesh_ir
 
 _NOISE_FLOOR_M = 0.10  # skip a group whose sampled corners all correct by less than this
 _SHIFT_OUTLIER_MAD_K = 3.0  # modified-z-score cutoff (see _robust_vertical_shift) for rejecting a spiky sample
-_RIGID_WARP_MAX_SIDE_M = 10.0  # footprint this small or smaller: per-vertex warp, not a shift (see module docstring)
-_RIGID_WARP_SLOPE_THRESHOLD_M = 1.0  # sampled corner spread past this: warp even a large footprint
 
 _ir_cache = {}       # obj_stem -> loaded MeshIR, or None if no sidecar / TILTED / no geometry+lights
 _group_cache = {}     # (tuple(sorted(obj_stems)), lat_r, lon_r, hdg_r) -> {obj_stem: (result_stem, applied, reason)}
@@ -150,46 +141,6 @@ def _point_elevation_delta(base_lat, base_lon, heading_deg, local_x, local_z, xp
     delta = None if elev is None else (elev - origin_elev)
     cache[key] = delta
     return delta
-
-
-def _warp_positions_batch(positions, base_lat, base_lon, heading_deg, xplane_root, origin_elev, cache):
-    """Vectorized equivalent of calling _point_elevation_delta once per
-    vertex and adding the result to positions[:, 1] -- CONFIRMED REAL
-    PERFORMANCE BUG this fixes: propagating a per-vertex warp to every
-    member of an anchor-linked group (main.py's own anchor-clustering
-    pass, which now must keep every member of a shared real-world anchor
-    in sync -- see the module docstring) can need many thousands of
-    individual samples across many stems, and a plain Python for-loop
-    calling terrain_dem.get_elevation once per vertex became the
-    dominant real wall-clock cost at that volume. Same cache (keyed by
-    (local_x, local_z) rounded to the centimetre) and exact same
-    per-point result as the scalar path -- this only batches the actual
-    terrain_dem call via DemLayer.bilinear_batch, nothing about which
-    points get sampled or how NODATA is handled changes. Returns a NEW
-    positions array; does not mutate the input."""
-    warped = positions.copy()
-    n = len(warped)
-    keys = [(round(float(warped[i, 0]), 2), round(float(warped[i, 2]), 2)) for i in range(n)]
-    to_query_idx = [i for i, k in enumerate(keys) if k not in cache]
-    if to_query_idx:
-        uncached_keys = [keys[i] for i in to_query_idx]
-        # de-dupe within this batch too -- many vertices (across siblings,
-        # or a shared mesh edge) commonly land on the exact same local
-        # point, same reasoning as the scalar cache.
-        unique_keys = list(dict.fromkeys(uncached_keys))
-        lats, lons = [], []
-        for kx, kz in unique_keys:
-            la, lo = local_offset_to_latlon(base_lat, base_lon, heading_deg, kx, kz)
-            lats.append(la)
-            lons.append(lo)
-        elevs = terrain_dem.get_elevations_batch(xplane_root, lats, lons)
-        for (kx, kz), elev in zip(unique_keys, elevs):
-            cache[(kx, kz)] = None if elev is None else (elev - origin_elev)
-    for i in range(n):
-        d = cache[keys[i]]
-        if d is not None:
-            warped[i, 1] += d
-    return warped
 
 
 def _robust_vertical_shift(corner_samples, mad_k=_SHIFT_OUTLIER_MAD_K):
@@ -235,73 +186,41 @@ def _apply_vertical_shift(ir, vertical_shift):
 
 def get_cached_transform(group_key):
     """Returns the {'vertical_shift','base_lat','base_lon','heading_deg',
-    'origin_elev','footprint_area_m2','uses_rigid_warp'} dict
-    get_or_create_fitted_group computed for group_key (vertical_shift is
-    None if that group had no usable samples), or None if that group_key
-    was never processed far enough to have one (disqualified/terrain_
-    unavailable/no_xplane_root -- nothing usable either way). Lets a
-    caller (main.py's anchor-clustering pass) find a shift computed for
-    ONE placement and apply it to a DIFFERENT placement anchored at the
-    same real-world point -- see apply_shared_shift_to_group. Note that
-    apply_shared_shift_to_group only ever borrows vertical_shift, never
-    warps -- a group whose OWN uses_rigid_warp is True computed its warp
-    from its own real per-vertex samples already, so main.py must not
-    override that result with a borrowed sibling's shift (see its own
-    anchor-clustering comment)."""
+    'origin_elev'} dict get_or_create_fitted_group computed for group_key
+    (vertical_shift is None if that group had no usable samples), or None
+    if that group_key was never processed far enough to have one
+    (disqualified/terrain_unavailable/no_xplane_root -- nothing usable
+    either way). Lets a caller (main.py's anchor-clustering pass) find a
+    shift computed for ONE placement and apply it to a DIFFERENT
+    placement anchored at the same real-world point -- see
+    apply_shared_shift_to_group."""
     return _group_transform_cache.get(group_key)
 
 
 def apply_shared_shift_to_group(obj_dir, obj_stems, transform, xplane_root):
-    """Retroactively applies an already-computed correction (from a
+    """Retroactively applies an already-computed vertical shift (from a
     different group_key's terrain-fit result at the same real-world
-    anchor -- see main.py's anchor-clustering pass) to every stem in
-    obj_stems, UNCONDITIONALLY overriding any correction they may already
-    have computed independently.
+    anchor -- see main.py's anchor-clustering pass) to stems that came
+    back disqualified/rigid_skip/negligible on their own.
 
     Fixes one real-world building split across multiple placements from
     different source files, which never reach the same group_key since
     they don't share a model stem (e.g. LHBP's ATC tower: an SPB-attached
-    shell and a plain-BGL-placed interior at the same anchor; or a
-    building's shell alongside the people/props placed inside it).
-    CONFIRMED REAL BUG this always-override behavior fixes: this used to
-    only patch up stems that came back disqualified/rigid_skip/negligible
-    on their own, leaving alone any stem that had already independently
-    computed its OWN correction (on the reasoning that an independent
-    per-vertex warp is more accurate than a borrowed shift) -- but a
-    shared real-world anchor is one physical thing, and letting different
-    members use DIFFERENT correction mechanisms (one shifted, one warped)
-    computed independently means they generally do NOT agree at their
-    shared boundary even when each is individually reasonable, producing
-    a visible vertical seam between them. Every member at a shared anchor
-    must move as the canonical member did, full stop.
-
-    Branches on transform["uses_rigid_warp"] (see get_or_create_fitted_
-    group) to match whichever mechanism the CANONICAL member itself used
-    -- a uniform shift needs no anchor-delta bookkeeping at all (the
-    shift is a property of the shared real-world anchor point, not of
+    shell and a plain-BGL-placed interior at the same anchor). Unlike the
+    rotation this replaced, no anchor-delta bookkeeping is needed here:
+    the shift is a property of the shared real-world anchor point (how
+    much real terrain differs from assumed, AT THAT LAT/LON), not of
     either object's own local coordinate convention, so the identical
     number applies correctly regardless of the two objects' respective
-    local origins, recenter offsets, or non-AGL height conventions); a
-    warp samples each of THIS stem's own vertices' own real (lat, lon)
-    directly, so it's likewise unaffected by either object's local-frame
-    convention -- only the shared base_lat/base_lon/heading_deg/
-    origin_elev (the anchor's own real elevation, which every member's
-    delta is measured against) needs to come from the canonical
-    transform, not be recomputed per member.
+    local origins, recenter offsets, or (non-AGL) height conventions.
 
-    Skips draped geometry (never shifted/warped this way) and anything
-    with no real position data (lights are corrected independently,
-    regardless of rigid-correction eligibility)."""
+    Skips draped geometry (never shifted this way) and anything with no
+    real position data (lights are corrected independently, regardless
+    of rigid-shift eligibility)."""
     obj_dir = Path(obj_dir)
-    if not transform:
-        return {stem: (stem, False, "not_applicable") for stem in obj_stems}
-    vertical_shift = transform.get("vertical_shift")
+    vertical_shift = transform.get("vertical_shift") if transform else None
     if vertical_shift is None:
         return {stem: (stem, False, "not_applicable") for stem in obj_stems}
-    uses_rigid_warp = transform.get("uses_rigid_warp", False)
-    base_lat, base_lon = transform["base_lat"], transform["base_lon"]
-    heading_deg, origin_elev = transform["heading_deg"], transform["origin_elev"]
-    point_cache = {}
 
     result = {}
     for stem in obj_stems:
@@ -310,25 +229,21 @@ def apply_shared_shift_to_group(obj_dir, obj_stems, transform, xplane_root):
             result[stem] = (stem, False, "not_applicable")
             continue
 
-        if uses_rigid_warp:
-            corrected_positions = _warp_positions_batch(
-                ir.positions, base_lat, base_lon, heading_deg, xplane_root, origin_elev, point_cache)
-        else:
-            corrected_positions = _apply_vertical_shift(ir, vertical_shift)
+        shifted = _apply_vertical_shift(ir, vertical_shift)
 
-        digest = hashlib.md5(f"{vertical_shift}_{uses_rigid_warp}_{stem}".encode("utf-8")).hexdigest()[:10]
+        digest = hashlib.md5(f"{vertical_shift}_{stem}".encode("utf-8")).hexdigest()[:10]
         corrected = mesh_ir.MeshIR(
             name=f"{stem}_tfitlink_{digest}", texture=ir.texture, tilted=False,
             draped=ir.draped, draped_layer_offset=ir.draped_layer_offset,
             double_sided=ir.double_sided, alpha_mode=ir.alpha_mode, alpha_cutoff=ir.alpha_cutoff,
             footprint_area_m2=ir.footprint_area_m2, proximity_dataref=ir.proximity_dataref,
-            positions=corrected_positions, normals=ir.normals, uvs=ir.uvs, indices=ir.indices,
+            positions=shifted, normals=ir.normals, uvs=ir.uvs, indices=ir.indices,
         )
         fitted_path = obj_dir / f"{corrected.name}.obj"
         if not fitted_path.exists():
             mesh_ir.write_obj8(corrected, fitted_path)
             mesh_ir.save(corrected, mesh_ir.sidecar_path_for(fitted_path))
-        result[stem] = (corrected.name, True, "applied_shared_warp" if uses_rigid_warp else "applied_shared_shift")
+        result[stem] = (corrected.name, True, "applied_shared_shift")
 
     return result
 
@@ -370,7 +285,6 @@ def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_d
     x_max = max(float(loaded[s].positions[:, 0].max()) for s in geo_stems)
     z_min = min(float(loaded[s].positions[:, 2].min()) for s in geo_stems)
     z_max = max(float(loaded[s].positions[:, 2].max()) for s in geo_stems)
-    max_side = max(x_max - x_min, z_max - z_min)
 
     origin_elev = terrain_dem.get_elevation(xplane_root, base_lat, base_lon)
     if origin_elev is None:
@@ -400,29 +314,14 @@ def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_d
 
     vertical_shift = _robust_vertical_shift(corner_samples)
 
-    # See the module docstring: warp per-vertex instead of one averaged
-    # shift when the footprint is small enough that shear risk is
-    # negligible, or when the sampled terrain genuinely slopes more than
-    # a shift could represent with one number.
-    slope_spread = (max(d for _, _, d in corner_samples) - min(d for _, _, d in corner_samples)
-                     ) if len(corner_samples) >= 2 else 0.0
-    group_uses_rigid_warp = max_side <= _RIGID_WARP_MAX_SIDE_M or slope_spread > _RIGID_WARP_SLOPE_THRESHOLD_M
-
     # Cached regardless of whether vertical_shift ended up None (an
     # explicit "this group has no correction to offer" is as useful to a
     # cross-group lookup as a real one) -- see get_cached_transform /
-    # apply_shared_shift_to_group. footprint_area_m2 lets main.py's
-    # anchor-clustering pass pick the most reliable member of a same-
-    # anchor bucket (see its own comment) -- a wider footprint spreads
-    # the sampling grid over more real ground, so its robust mean is
-    # less exposed to a single DEM/DSF-triangulation noise spike than a
-    # small one's.
+    # apply_shared_shift_to_group.
     _group_transform_cache[group_key] = {
         "vertical_shift": vertical_shift,
         "base_lat": base_lat, "base_lon": base_lon, "heading_deg": heading_deg,
         "origin_elev": origin_elev,
-        "footprint_area_m2": (x_max - x_min) * (z_max - z_min),
-        "uses_rigid_warp": group_uses_rigid_warp,
     }
 
     digest = hashlib.md5(f"{lat_r}_{lon_r}_{hdg_r}".encode("utf-8")).hexdigest()[:10]
@@ -453,22 +352,18 @@ def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_d
         # own at all, and draped_merge._triangles_to_polygons never reads
         # Y when serializing, so the warp's output would be silently
         # discarded downstream anyway in that mode.
-        # RIGID geometry gets the SAME per-vertex warp as draped content
-        # when the group's own footprint qualifies (group_uses_rigid_warp,
-        # see the module docstring), otherwise ONE uniform vertical shift
-        # -- a rotation-only correction can't fix a uniform height-offset
-        # error, and per-vertex warping shears rigid architectural detail
-        # for a large footprint under normal terrain, which is why the
-        # shift stays the default there. Light positions are corrected
-        # regardless of the sibling's draped flag -- each LIGHT_SPILL_
-        # CUSTOM is an independent point, not mesh topology, so moving it
-        # carries none of the shear/re-drape concerns above.
+        # RIGID geometry gets ONE uniform vertical shift, the same number
+        # for every vertex (see module docstring for why a rotation-only
+        # correction can't fix a uniform height-offset error, and why
+        # per-vertex warping would shear rigid architectural detail).
+        # Light positions are corrected regardless of the sibling's
+        # draped flag -- each LIGHT_SPILL_CUSTOM is an independent point,
+        # not mesh topology, so moving it carries none of the shear/
+        # re-drape concerns above.
         warp_positions = bool(len(ir.positions)) and ir.draped and not skip_draped_positions
-        rigid_warp = bool(len(ir.positions)) and not ir.draped and group_uses_rigid_warp
-        rigid_shift = (bool(len(ir.positions)) and not ir.draped and not group_uses_rigid_warp
-                       and vertical_shift is not None)
+        rigid_shift = bool(len(ir.positions)) and not ir.draped and vertical_shift is not None
         warp_lights = bool(ir.lights)
-        if not warp_positions and not rigid_warp and not rigid_shift and not warp_lights:
+        if not warp_positions and not rigid_shift and not warp_lights:
             if ir.draped and skip_draped_positions and len(ir.positions):
                 result[stem] = (stem, False, "skipped_for_polygon_mode")
             else:
@@ -481,14 +376,21 @@ def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_d
             # than stacking with it. A sibling reaching here only for its
             # lights keeps its original tilted flag untouched.
             name=f"{stem}_tfit_{digest}", texture=ir.texture,
-            tilted=False if (warp_positions or rigid_warp or rigid_shift) else ir.tilted, draped=ir.draped,
+            tilted=False if (warp_positions or rigid_shift) else ir.tilted, draped=ir.draped,
             draped_layer_offset=ir.draped_layer_offset, double_sided=ir.double_sided,
             alpha_mode=ir.alpha_mode, alpha_cutoff=ir.alpha_cutoff,
             footprint_area_m2=ir.footprint_area_m2, proximity_dataref=ir.proximity_dataref,
         )
-        if warp_positions or rigid_warp:
-            corrected.positions = _warp_positions_batch(
-                ir.positions, base_lat, base_lon, heading_deg, xplane_root, origin_elev, point_cache)
+        if warp_positions:
+            warped = ir.positions.copy()
+            for i in range(len(warped)):
+                d = _point_elevation_delta(
+                    base_lat, base_lon, heading_deg,
+                    float(ir.positions[i, 0]), float(ir.positions[i, 2]),
+                    xplane_root, origin_elev, point_cache)
+                if d is not None:
+                    warped[i, 1] += d
+            corrected.positions = warped
             corrected.normals = ir.normals
             corrected.uvs = ir.uvs
             corrected.indices = ir.indices
@@ -527,10 +429,8 @@ def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_d
             # never the .obj text, so a corrected draped stem without one
             # silently falls back to passthrough (never welded/deduped).
             mesh_ir.save(corrected, mesh_ir.sidecar_path_for(fitted_path))
-        if rigid_shift:
+        if rigid_shift and not warp_positions:
             _reason = "applied_vertical_shift"
-        elif rigid_warp and not warp_positions:
-            _reason = "applied_rigid_warp"
         else:
             _reason = "applied"
         result[stem] = (corrected.name, True, _reason)

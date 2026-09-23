@@ -235,22 +235,16 @@ class TestTerrainFit(unittest.TestCase):
             self.assertEqual(results[walls_stem], (walls_stem, False, "skipped_for_polygon_mode"))
             self.assertTrue(results[lights_stem][1], "lights companion is still corrected")
 
-    def test_large_building_on_steep_terrain_gets_the_precise_warp(self):
-        """CONFIRMED REAL BUG this pins: a large rigid building on
-        genuinely sloped terrain used to get ONE uniform shift (every
-        vertex moves by the same amount) -- correct for a bump/dip that
-        shifts the whole footprint's average elevation, but for a REAL
-        SLOPE across a large footprint, one averaged number necessarily
-        leaves one end of the building floating and the other sunk/
-        underground, no matter how robust the average is (confirmed real
-        symptom: large buildings partially underground). Past
-        _RIGID_WARP_SLOPE_THRESHOLD_M of real sampled slope, a rigid
-        group now gets the SAME per-vertex warp draped content gets
-        instead -- some shear risk to architectural detail is an accepted
-        trade-off there, since the alternative (part of the building
-        buried) is worse. Not TILTED/a rotation (a rotation only fixes a
-        genuine tilt, never a uniform anchor-offset error -- see the
-        module's own docstring)."""
+    def test_large_tilted_building_gets_a_uniform_shift_not_a_shear_or_rotation(self):
+        """A large TILTED building on sloped terrain used to be stuck with
+        X-Plane's own crude single-point TILTED rotation -- the "one side
+        floating" symptom this module exists to fix. It's now corrected
+        with a single UNIFORM vertical shift (every vertex moves by the
+        identical amount), replacing TILTED rather than stacking with it.
+        Not a rotation (a rotation only fixes a genuine tilt, never a
+        uniform height-offset error -- see the module's own docstring for
+        why that was replaced) and not a per-vertex shear (which would
+        distort architectural detail)."""
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             xplane_root = td / "XPlaneRoot"
@@ -272,37 +266,35 @@ class TestTerrainFit(unittest.TestCase):
             results = terrain_fit.get_or_create_fitted_group(obj_dir, [stem], 47.5, 8.5, 0.0, xplane_root)
             result_stem, applied, reason = results[stem]
             self.assertTrue(applied, f"a large rigid building on meaningfully sloped terrain must be corrected (reason={reason})")
-            self.assertEqual(reason, "applied_rigid_warp")
+            self.assertEqual(reason, "applied_vertical_shift")
             self.assertNotEqual(result_stem, stem, "a corrected copy should have been written")
 
             corrected_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{result_stem}.obj"))
             self.assertFalse(
                 np.allclose(original_ir.positions, corrected_ir.positions, atol=1e-6),
-                "expected the warp to actually move the geometry, not be a no-op"
+                "expected the shift to actually move the geometry, not be a no-op"
             )
 
-            # X/Z entirely unchanged (only Y moves) -- unlike a uniform
-            # shift, different (x, z) columns are free to move by
-            # DIFFERENT amounts, each following the real terrain sampled
-            # directly under it (this fixture's own box happens to sit
-            # exactly at the radially-symmetric bump's own center, so its
-            # 4 equidistant corners coincidentally warp by the identical
-            # amount here -- see test_oversized_footprint_on_real_slope_
-            # gets_the_warp_not_left_partially_underground, on a LINEAR
-            # slope instead, for a real per-vertex-varies assertion).
+            # X/Z entirely unchanged, and every vertex's Y moved by the
+            # SAME amount -- the core "uniform translation" guarantee. If
+            # this were a rotation or a per-vertex shear, different
+            # vertices would move by different (or nonzero X/Z) amounts.
             np.testing.assert_allclose(corrected_ir.positions[:, [0, 2]], original_ir.positions[:, [0, 2]], atol=1e-9)
+            dy = corrected_ir.positions[:, 1] - original_ir.positions[:, 1]
+            self.assertAlmostEqual(float(dy.max() - dy.min()), 0.0, places=6,
+                                    msg="every vertex must move by the identical Y amount (a uniform shift)")
 
-    def test_tall_building_gets_the_same_warp_as_a_short_one(self):
-        """Neither a uniform shift nor this module's per-vertex warp has
-        a rotation's "implied displacement scales with distance from the
-        pivot" problem (the old "excessive implied roof displacement"
-        guard existed only for the rotation this module no longer uses at
-        all) -- both key strictly off each vertex's own (x, z), never its
-        Y, so a roof directly above its own base moves by the identical
-        amount as that base regardless of how tall the building is. This
-        tower (150m instead of the passing 6m box's height, otherwise
-        identical fixture/terrain, both routed to applied_rigid_warp by
-        the real slope) proves that still holds under the warp too."""
+    def test_tall_building_gets_the_same_uniform_shift_as_a_short_one(self):
+        """A rotation-based correction used to need special-casing for a
+        TALL building (a rotation's implied displacement scales with
+        distance from the pivot, so a tower's roof would swing far more
+        than its base for the same angle -- the old "excessive implied
+        roof displacement" guard existed only because of that). A uniform
+        shift has no such scaling concern at all: roof and base both move
+        by the exact same amount, so there's nothing to special-case --
+        this tower (150m instead of the passing 6m box's height, otherwise
+        identical fixture/terrain) must get ordinary applied_vertical_shift,
+        not a different code path."""
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             xplane_root = td / "XPlaneRoot"
@@ -321,7 +313,7 @@ class TestTerrainFit(unittest.TestCase):
             results = terrain_fit.get_or_create_fitted_group(obj_dir, [stem], 47.5, 8.5, 0.0, xplane_root)
             result_stem, applied, reason = results[stem]
             self.assertTrue(applied)
-            self.assertEqual(reason, "applied_rigid_warp")
+            self.assertEqual(reason, "applied_vertical_shift")
 
             corrected_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{result_stem}.obj"))
             roof_mask = original_ir.positions[:, 1] > 100.0
@@ -330,26 +322,20 @@ class TestTerrainFit(unittest.TestCase):
             roof_dy = corrected_ir.positions[roof_mask, 1] - original_ir.positions[roof_mask, 1]
             base_dy = corrected_ir.positions[base_mask, 1] - original_ir.positions[base_mask, 1]
             self.assertAlmostEqual(float(roof_dy.mean()), float(base_dy.mean()), places=5,
-                                    msg="roof and base share the same (x, z) columns, so the warp must move "
-                                        "them by the identical amount -- no rotation-scaling concern")
+                                    msg="roof and base must move by the identical amount -- no rotation-scaling concern")
 
-    def test_oversized_footprint_on_real_slope_gets_the_warp_not_left_partially_underground(self):
+    def test_oversized_footprint_still_gets_the_ordinary_uniform_shift(self):
         """CONFIRMED REAL BUG this pins: a genuinely large SINGLE building
         (not bundled-unrelated-content -- a real continuous terminal
         structure) can have a large footprint (EGLC's own terminal
-        measured 380m wide). Giving an oversized footprint on real sloped
-        terrain ONE uniform shift (an earlier version of this test's own
-        expectation) has exactly the failure mode a real user reported:
-        one averaged number can only ever be exactly right for the
-        group's own AVERAGE terrain delta, so a 600m-wide building on a
-        genuine slope still comes out with one end floating and the other
-        sunk/underground -- worse the larger the footprint, not better.
-        Past _RIGID_WARP_SLOPE_THRESHOLD_M of real sampled slope, size
-        alone no longer exempts a group from the precise per-vertex warp
-        -- unlike the old rotation this replaced, a warp can't "swing" a
-        separately-anchored sibling (each vertex samples its own real
-        position independently), so there's no oversized-footprint risk
-        to guard against here at all."""
+        measured 380m wide). The old rotation-based mechanism rejected a
+        rotation for any oversized footprint (risk of swinging a
+        separately-anchored sibling that stays too small to qualify on
+        its own), which left large buildings like this with NO correction
+        at all, or only a partial "ground skirt". A uniform shift has none
+        of that risk -- it can't swing anything relative to anything else,
+        so an oversized footprint now just gets the SAME ordinary
+        correction as any other qualifying group, no special-casing."""
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             xplane_root = td / "XPlaneRoot"
@@ -370,7 +356,7 @@ class TestTerrainFit(unittest.TestCase):
             results = terrain_fit.get_or_create_fitted_group(obj_dir, [stem], 47.5, 8.5, 0.0, xplane_root)
             result_stem, applied, reason = results[stem]
             self.assertTrue(applied, "an oversized footprint must still be corrected, not left floating")
-            self.assertEqual(reason, "applied_rigid_warp")
+            self.assertEqual(reason, "applied_vertical_shift")
             self.assertNotEqual(result_stem, stem, "a corrected copy should have been written")
 
             corrected_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{result_stem}.obj"))
@@ -380,30 +366,19 @@ class TestTerrainFit(unittest.TestCase):
             roof_dy = corrected_ir.positions[roof_mask, 1] - original_ir.positions[roof_mask, 1]
             base_dy = corrected_ir.positions[base_mask, 1] - original_ir.positions[base_mask, 1]
             self.assertAlmostEqual(float(roof_dy.mean()), float(base_dy.mean()), places=5,
-                                    msg="roof and base share the same (x, z) columns, so still move together")
-            # The whole point: on a REAL slope this large, the warp must
-            # actually vary across the footprint (unlike a shift) -- one
-            # side of a 600m building sits measurably higher than the
-            # other on this fixture's slope.
-            dy = corrected_ir.positions[:, 1] - original_ir.positions[:, 1]
-            self.assertGreater(float(dy.max() - dy.min()), 1.0,
-                                msg="expected a real, footprint-scale variation in the correction on a 600m slope")
+                                    msg="an oversized footprint still gets ONE uniform shift, not a partial/rejected correction")
 
-    def test_small_object_gets_the_precise_warp_no_size_disqualification(self):
-        """CONFIRMED REAL BUG this pins: terrain_fit's own correction used
-        to be gated to objects with a footprint >=300m2/10m-per-side, with
+    def test_small_object_gets_the_shift_too_no_size_gate(self):
+        """CONFIRMED REAL BUG this pins: terrain_fit's own shift used to
+        be gated to objects with a footprint >=300m2/10m-per-side, with
         X-Plane's own TILTED rotation left as the ONLY correction for
         anything smaller -- but TILTED can only ever fix a genuine local
         SLOPE, never a flat-out wrong anchor elevation (a rotation can't
         move its own origin). That left small/medium objects silently
         uncorrected for exactly the more common real problem. There is no
-        disqualification gate any more: this 8m-wide box (small enough to
-        have failed the old 10m-per-side gate) on genuinely uneven terrain
-        must now be corrected too -- and, being this small, with the
-        precise per-vertex warp rather than an averaged shift (see
-        _RIGID_WARP_MAX_SIDE_M in the module docstring: real terrain
-        barely varies at all across a footprint this size, so the warp
-        carries no meaningful shear risk and is strictly more accurate).
+        size gate any more: this 8m-wide box (small enough to have failed
+        the old 10m-per-side gate) on genuinely uneven terrain must now
+        get the exact same ordinary uniform shift as a large building.
         Bumpy, not linearly-sloped, terrain: a symmetric footprint on a
         pure linear slope averages to zero by construction (that's a
         tilt, not an offset -- see _write_bumpy_terrain's own docstring)."""
@@ -427,12 +402,12 @@ class TestTerrainFit(unittest.TestCase):
             results = terrain_fit.get_or_create_fitted_group(obj_dir, [stem], 47.5, 8.5, 0.0, xplane_root)
             result_stem, applied, reason = results[stem]
             self.assertTrue(applied, f"a small object on meaningfully sloped terrain must now be corrected too (reason={reason})")
-            self.assertEqual(reason, "applied_rigid_warp")
+            self.assertEqual(reason, "applied_vertical_shift")
             self.assertNotEqual(result_stem, stem, "a corrected copy should have been written")
 
             corrected_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{result_stem}.obj"))
             self.assertFalse(np.allclose(original_ir.positions, corrected_ir.positions, atol=1e-6),
-                              "expected the warp to actually move the geometry, not be a no-op")
+                              "expected the shift to actually move the geometry, not be a no-op")
 
     def test_shared_shift_links_a_disqualified_sibling_at_the_same_anchor(self):
         """Universal fix for: one real-world building instance split into
@@ -440,24 +415,18 @@ class TestTerrainFit(unittest.TestCase):
         LHBP's ATC tower -- an SPB-attached exterior shell + a plain-BGL-
         placed interior, at the same real-world anchor, that never share a
         model stem so never reach the same terrain_fit group_key). Both
-        the shell and the (now, with no size/slope gate) small interior
-        qualify independently, but each samples its OWN (differently-
-        sized) footprint, so on genuinely uneven (not just linearly sloped
-        -- see _write_bumpy_terrain) terrain their independently-computed
-        corrections can legitimately differ. apply_shared_shift_to_group,
-        fed the shell's cached transform via get_cached_transform, must
-        override the interior with the shell's exact mechanism instead --
-        UNCONDITIONALLY, even though the interior already qualified for a
-        correction of its own (CONFIRMED REAL BUG: skipping an already-
-        corrected member here used to let it keep a DIFFERENT mechanism
-        than its sibling, producing a visible seam between them -- a
-        shared anchor is one physical object, it must move as one). This
-        30m shell, on this bumpy terrain, itself warps (see
-        test_large_building_on_steep_terrain_gets_the_precise_warp with
-        the identical fixture) -- so the linked interior must get that
-        SAME per-vertex warp too, not a shift, proving the mechanism
-        itself (not just a single number) propagates from the canonical
-        member."""
+        the shell and the (now, with no size gate) small interior qualify
+        independently, but each samples its OWN (differently-sized)
+        footprint, so on genuinely uneven (not just linearly sloped --
+        see _write_bumpy_terrain) terrain their independently-computed
+        shifts can legitimately differ. apply_shared_shift_to_group, fed
+        the shell's cached transform via get_cached_transform, must
+        override the interior with the shell's EXACT shift value instead
+        -- no anchor-delta bookkeeping needed (unlike the rotation this
+        replaced): the shift is a property of the shared real-world
+        anchor, not of either object's own local-frame convention or its
+        own footprint, so it applies directly regardless of the
+        interior's own (different) recenter offset or AGL height."""
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             xplane_root = td / "XPlaneRoot"
@@ -502,29 +471,21 @@ class TestTerrainFit(unittest.TestCase):
             self.assertIsNotNone(transform)
             self.assertIsNotNone(transform["vertical_shift"])
 
-            self.assertTrue(transform["uses_rigid_warp"],
-                             "test setup issue: expected this 30m shell, on this bumpy terrain, to itself warp")
-
             linked_results = terrain_fit.apply_shared_shift_to_group(obj_dir, [interior_stem], transform, xplane_root)
             linked_stem, linked_applied, linked_reason = linked_results[interior_stem]
-            self.assertTrue(linked_applied, "the interior must be corrected once linked to the shell's transform")
-            self.assertEqual(linked_reason, "applied_shared_warp")
+            self.assertTrue(linked_applied, "the interior must be corrected once linked to the shell's shift")
+            self.assertEqual(linked_reason, "applied_shared_shift")
             self.assertNotEqual(linked_stem, interior_stem)
 
             linked_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{linked_stem}.obj"))
-            # X/Z entirely unchanged; Y moves by each vertex's own real
-            # elevation delta (sampled at the SHELL's anchor/origin_elev,
-            # not recomputed from the interior's own) -- proves the warp
-            # mechanism itself was shared, not just a single number. (This
-            # fixture's own box is symmetric around the radially-symmetric
-            # bump's own center, so its 4 equidistant corners happen to
-            # warp by the identical amount here -- see test_large_
-            # building_on_steep_terrain_gets_the_precise_warp's own note
-            # on the same coincidence -- so a real, non-zero correction is
-            # what this checks, not per-vertex variation.)
+            # X/Z entirely unchanged, every vertex's Y moved by the exact
+            # shift value the shell got -- proves it was linked to the
+            # shell's own value, overriding whatever the interior's own
+            # independent computation (checked above) would have used.
             np.testing.assert_allclose(linked_ir.positions[:, [0, 2]], original_interior_positions[:, [0, 2]], atol=1e-9)
             dy = linked_ir.positions[:, 1] - original_interior_positions[:, 1]
-            self.assertGreater(float(np.abs(dy).max()), 1e-3, "expected a real, non-zero correction")
+            np.testing.assert_allclose(dy, transform["vertical_shift"], atol=1e-6,
+                                        err_msg="every vertex must move by exactly the shell's own shift amount")
 
     def test_shared_shift_is_a_noop_when_the_source_group_had_no_shift_to_offer(self):
         """get_cached_transform on a group whose cached transform has
@@ -546,14 +507,10 @@ class TestTerrainFit(unittest.TestCase):
         self.assertIsNone(terrain_fit.get_cached_transform((("nonexistent_stem",), 1.0, 2.0, 3.0, False)))
 
     def test_qualifying_group_on_gentle_real_slope_gets_the_ordinary_shift(self):
-        """A plain integration check that a large, qualifying group on
-        genuinely bumpy but GENTLE real terrain (its sampled corner
-        spread stays under _RIGID_WARP_SLOPE_THRESHOLD_M) gets
-        applied_vertical_shift with a real, non-zero, consistent
-        correction -- confirming the ordinary shift path is still very
-        much alive for the large-and-relatively-flat case, not replaced
-        outright by the warp. Outlier-rejection math itself is unit-
-        tested directly against synthetic samples in
+        """A plain integration check that a qualifying group on genuinely
+        bumpy real terrain gets applied_vertical_shift with a real,
+        non-zero, consistent correction -- outlier-rejection math itself
+        is unit-tested directly against synthetic samples in
         TestRobustVerticalShift below, where exact DSF-grid/real-world
         post alignment doesn't need to be reasoned about. (A pure linear
         SLOPE, symmetric around the object's own anchor, averages to
@@ -563,7 +520,7 @@ class TestTerrainFit(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             xplane_root = td / "XPlaneRoot"
-            self._write_bumpy_terrain(xplane_root, 47, 8, bump_scale=20.0)
+            self._write_bumpy_terrain(xplane_root, 47, 8, bump_scale=1500.0)
             obj_dir = td / "objects"
             obj_dir.mkdir()
 

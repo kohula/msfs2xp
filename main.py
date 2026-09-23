@@ -8,7 +8,6 @@ import struct
 import json
 import io
 import hashlib
-import logging
 import threading
 import multiprocessing
 import pickle
@@ -34,25 +33,6 @@ import pick_replacements
 import scenery_viewer
 import geo_transform
 from mesh_convert import mesh_ir
-from mesh_convert.convert import flag_stray_vertices
-
-# CONFIRMED REAL BUG this fixes: mesh_convert/convert.py (and any other
-# module using logging.getLogger(__name__)) calls logger.info/warning
-# throughout, but nothing in the real app ever configured a handler for
-# the standard logging module -- Python's logging defaults to WARNING
-# with no handler at all, so every info-level message (including ones
-# describing exactly why a piece of content was dropped or reclassified)
-# was silently discarded, in every real run, GUI or headless. Module-
-# level (not inside a function) so it also re-runs in every
-# ProcessPoolExecutor worker: Windows multiprocessing always uses
-# "spawn", which re-imports this module fresh in each worker process
-# before calling into cached_convert/mesh_convert.convert() there, so
-# each worker independently gets its own configured handler too --
-# without this, a handler set up only in the main process would still
-# never see logger calls made inside a worker. Level and format match
-# the one place this was already done, convert.py's own standalone
-# __main__ block, so behavior there doesn't change.
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 CONFIG_FILE = Path("msfs2xp_config.json")
 
@@ -531,68 +511,7 @@ def _rasterize_footprint_mask(xz, tris, cell_m, max_cells=2_000_000):
     return mask, x_min, z_min, _cell
 
 
-_ELONGATED_RECT_MAX_ASPECT = 2.5  # split a local grid rect into near-square segments past this long/short ratio --
-                                   # CONFIRMED REAL BUG a too-aggressive 1.5 threshold caused: it triggers on any
-                                   # even moderately-rectangular room/segment, not just genuinely elongated arms,
-                                   # which measured an 8.3x total exclusion-rect count increase on a real EGLC
-                                   # conversion (18507 -> 152909) and made a real LHBP conversion (already ~5x
-                                   # more placements) unworkably slow. 2.5 still comfortably catches the
-                                   # motivating real case (a building arm/wing, 5:1+ aspect) while leaving
-                                   # moderately-shaped rects alone.
-_ELONGATED_RECT_MIN_OFF_CARDINAL_DEG = 2.0  # skip splitting when heading is this close to axis-aligned (no waste to fix)
-_ELONGATED_RECT_MAX_SEGMENTS = 12  # hard cap -- a pathologically long/thin rect (a fence, a boundary wall) still
-                                    # gets SOME benefit from a bounded number of coarser segments rather than
-                                    # exploding into hundreds of tiny ones (real placement counts already run into
-                                    # the tens of thousands per airport; an unbounded per-rect multiplier risks a
-                                    # severe compile-time/rect-count blowup for one extreme outlier shape)
-
-
-def _split_elongated_rect_for_rotation(lx_min, lx_max, lz_min, lz_max, heading_deg,
-                                        max_aspect=_ELONGATED_RECT_MAX_ASPECT):
-    """Splits a local-frame (pre-rotation) rectangle into near-square
-    segments along its own longer axis. CONFIRMED REAL BUG this fixes:
-    _per_object_exclusion_rects rotates each LOCAL grid rectangle into
-    real-world lat/lon and then reduces it to an axis-aligned west/south/
-    east/north box THERE (X-Plane's exclusion-zone format has no rotated-
-    rectangle primitive at all) -- fine for a roughly-square rect, but a
-    LONG, THIN one (a long building wing/arm) at any heading that isn't
-    axis-aligned needs a world-space box far larger than the rect's own
-    real area to contain it: a 40x8m arm at 45 degrees needs a ~34x34m
-    box, over 3.5x its real 320m2 area, and that waste keeps growing the
-    more elongated the rect is. Confirmed against a real user report
-    describing exactly this shape (a rotated cross/"X"-shaped building):
-    each long arm needs to be its own SEVERAL near-square segments (their
-    own report: two rectangles per outer arm, one for the shared middle)
-    instead of one rectangle for the whole arm, so each segment's own
-    rotation waste stays bounded to what a square needs (~41% at 45
-    degrees) instead of accumulating over the whole arm's length.
-
-    No-op (yields the input rect unchanged) when the heading is close
-    enough to a cardinal direction that an axis-aligned box already fits
-    exactly (splitting there would only add rects for no benefit), or
-    when the rect isn't elongated enough (aspect ratio under max_aspect)
-    for the waste to be worth the extra rect count."""
-    span_x = lx_max - lx_min
-    span_z = lz_max - lz_min
-    long_span = max(span_x, span_z)
-    short_span = max(min(span_x, span_z), 1e-6)
-    off_cardinal = heading_deg % 90.0
-    off_cardinal = min(off_cardinal, 90.0 - off_cardinal)
-    if off_cardinal < _ELONGATED_RECT_MIN_OFF_CARDINAL_DEG or long_span / short_span < max_aspect:
-        yield (lx_min, lx_max, lz_min, lz_max)
-        return
-    n = min(_ELONGATED_RECT_MAX_SEGMENTS, max(1, math.ceil(long_span / short_span)))
-    if span_x >= span_z:
-        step = span_x / n
-        for i in range(n):
-            yield (lx_min + i * step, lx_min + (i + 1) * step, lz_min, lz_max)
-    else:
-        step = span_z / n
-        for i in range(n):
-            yield (lx_min, lx_max, lz_min + i * step, lz_min + (i + 1) * step)
-
-
-def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=0.5, cell_m=1.0):
+def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=2.0, cell_m=1.0):
     """Exclusion rectangles that cover each converted object's OWN
     footprint using close to the MINIMUM real area needed -- not one
     shared airport-wide set, not one bounding box per object, and not even
@@ -613,21 +532,11 @@ def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=0.5, cell_m
     while the WHOLE run stays identically occupied on the next line, so
     two parts that diverge (an X's arms) split into separate rectangles
     right where they stop lining up, while a uniform strip merges into one
-    rectangle instead of fragmenting. Each grid rectangle's own corners are
-    rotated into real-world lat/lon FIRST (geo_transform.local_offset_to_
-    latlon, same convention used everywhere else in this pipeline), and
-    only THEN is the resulting real-world west/east/south/north box padded
-    by pad_m -- CONFIRMED REAL BUG this order fixes: X-Plane's exclusion-
-    zone format is itself always an axis-aligned lat/lon box (there's no
-    rotated-rectangle exclusion primitive to emit), so for any placement
-    heading that isn't a multiple of 90 degrees, the box has to grow
-    somewhat just to cover a rotated footprint's corners at all -- but
-    padding the LOCAL rectangle before that rotation let the pad amount
-    get diagonally amplified by the same rotation (up to ~1.4x at 45
-    degrees) on top of that unavoidable growth, silently covering more
-    real ground than pad_m the more an object was rotated. Padding the
-    already-rotated real-world box instead adds exactly pad_m of margin
-    in every cardinal direction regardless of heading.
+    rectangle instead of fragmenting. Each resulting rectangle is padded by
+    pad_m on every side (in local metres, within the requested 1-3m growth
+    range) before being rotated into real-world lat/lon by the placement's
+    own heading (geo_transform.local_offset_to_latlon, same convention
+    used everywhere else in this pipeline).
 
     footprint_candidates: [(generated_stems, base_lat, base_lon,
     heading_deg), ...] -- one entry per real placement (base_lat/base_lon
@@ -648,68 +557,10 @@ def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=0.5, cell_m
     only objects have no footprint to exclude). Returns [] if nothing
     produced a usable footprint at all, so the caller can fall back to
     the airport-wide shape.
-
-    Rasterization + greedy-rect decomposition is cached per unique sorted
-    generated_stems tuple (raster_cache below) -- CONFIRMED REAL BUG this
-    fixes: a real airport places the same fixture (a light, a bollard, a
-    barrier segment, a sign) hundreds of times, and every placement was
-    re-rasterizing the IDENTICAL local geometry from scratch even though
-    the local mask depends only on the stems' own combined triangles,
-    never on the placement's own lat/lon/heading. Measured on real EGLC/
-    LHBP data: this is what turned an otherwise-cheap change (padding/
-    elongated-rect splitting) into an apparent multi-minute stall, by
-    tipping an already just-barely-acceptable per-airport aggregate
-    rasterization cost over some visible threshold.
     """
     rects = []
     sidecar_cache = {}
-    # CONFIRMED REAL BUG this cache fixes: a real airport places the same
-    # fixture (a light, a bollard, a barrier segment, a sign) hundreds of
-    # times, and every placement was re-rasterizing the IDENTICAL local
-    # geometry from scratch -- the local mask/grid-rects depend only on
-    # generated_stems' own combined triangles (via sidecar_cache, which
-    # already guarantees the same stem always yields the same positions/
-    # indices), never on base_lat/base_lon/heading_deg, so every repeat
-    # placement of one model was pure wasted work. Measured on real EGLC/
-    # LHBP data: rasterization alone (PIL's own per-triangle polygon
-    # fill, already efficient in isolation -- ~2us/triangle) accumulates
-    # to minutes once aggregated across an entire airport's placement
-    # count, which is what turned a real elongated-rect-splitting change
-    # (itself cheap) into an apparent multi-minute stall once it tipped
-    # already-marginal per-airport totals over some visible threshold.
-    # Keyed on the sorted stem tuple, which is exactly what determines
-    # the combined local mask.
-    raster_cache = {}
     for generated_stems, base_lat, base_lon, heading_deg in footprint_candidates:
-        raster_key = tuple(sorted(generated_stems))
-        if raster_key in raster_cache:
-            grid_rects, x_min, z_min, cell = raster_cache[raster_key]
-            if grid_rects is None:
-                continue
-            m_lat, m_lon = geo_transform.metres_per_degree(base_lat)
-            pad_lat_deg = pad_m / m_lat
-            pad_lon_deg = pad_m / m_lon
-            for (gy0, gx0, gy1, gx1) in grid_rects:
-                lx_min = x_min + gx0 * cell
-                lx_max = x_min + (gx1 + 1) * cell
-                lz_min = z_min + gy0 * cell
-                lz_max = z_min + (gy1 + 1) * cell
-                for slx_min, slx_max, slz_min, slz_max in _split_elongated_rect_for_rotation(
-                        lx_min, lx_max, lz_min, lz_max, heading_deg):
-                    corners = [(slx_min, slz_min), (slx_max, slz_min), (slx_max, slz_max), (slx_min, slz_max)]
-                    lats, lons = [], []
-                    for cx, cz in corners:
-                        la, lo = geo_transform.local_offset_to_latlon(base_lat, base_lon, heading_deg, cx, cz)
-                        lats.append(la)
-                        lons.append(lo)
-                    rects.append({
-                        "west": min(lons) - pad_lon_deg,
-                        "east": max(lons) + pad_lon_deg,
-                        "south": min(lats) - pad_lat_deg,
-                        "north": max(lats) + pad_lat_deg,
-                    })
-            continue
-
         xz_parts = []
         tri_parts = []
         offset = 0
@@ -723,37 +574,8 @@ def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=0.5, cell_m
                     try:
                         ir = mesh_ir.load(sidecar)
                         if len(ir.positions):
-                            # CONFIRMED REAL BUG this filter fixes: a
-                            # single corrupted/leftover stray vertex (the
-                            # exact same failure mode compute_file_
-                            # flatness_and_reference's own max_radius had
-                            # to guard against, see flag_stray_vertices'
-                            # docstring) sitting hundreds of meters outside
-                            # a primitive's real bulk extent used to blow
-                            # up this stem's own x_min/x_max/z_min/z_max
-                            # unfiltered -- producing a wildly oversized
-                            # exclusion rectangle for that one object while
-                            # every other, unaffected object stayed tight.
-                            # Whole triangles referencing a stray vertex
-                            # are dropped (not just the vertex itself, to
-                            # keep index buffers consistent), same as
-                            # convert()'s own equivalent filter.
-                            not_stray = ~flag_stray_vertices(ir.positions)
-                            if not_stray.all():
-                                positions = ir.positions[:, [0, 2]]
-                                indices = ir.indices
-                            elif not_stray.any():
-                                positions = ir.positions[not_stray][:, [0, 2]]
-                                new_index = np.cumsum(not_stray) - 1
-                                kept_tris = []
-                                for tri in np.asarray(ir.indices, dtype=np.int64).reshape(-1, 3):
-                                    a, b, c = tri
-                                    if not_stray[a] and not_stray[b] and not_stray[c]:
-                                        kept_tris.append((new_index[a], new_index[b], new_index[c]))
-                                indices = [i for tri in kept_tris for i in tri]
-                            # else: every vertex flagged stray (degenerate
-                            # sidecar) -- positions/indices stay None,
-                            # same as "no usable geometry" below.
+                            positions = ir.positions[:, [0, 2]]
+                            indices = ir.indices
                     except (OSError, EOFError, pickle.UnpicklingError):
                         positions, indices = None, None
                 sidecar_cache[stem] = (positions, indices)
@@ -764,43 +586,34 @@ def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=0.5, cell_m
                 tri_parts.append(np.asarray(indices, dtype=np.int64).reshape(-1, 3) + offset)
             offset += len(positions)
         if not xz_parts:
-            raster_cache[raster_key] = (None, None, None, None)
             continue
         xz = np.concatenate(xz_parts, axis=0)
         tris = np.concatenate(tri_parts, axis=0) if tri_parts else None
 
         mask, x_min, z_min, cell = _rasterize_footprint_mask(xz, tris, cell_m)
         if mask is None:
-            raster_cache[raster_key] = (None, None, None, None)
             continue
         grid_rects = _greedy_rects_from_mask(mask)
         if not grid_rects:
-            raster_cache[raster_key] = (None, None, None, None)
             continue
-        raster_cache[raster_key] = (grid_rects, x_min, z_min, cell)
 
-        m_lat, m_lon = geo_transform.metres_per_degree(base_lat)
-        pad_lat_deg = pad_m / m_lat
-        pad_lon_deg = pad_m / m_lon
         for (gy0, gx0, gy1, gx1) in grid_rects:
-            lx_min = x_min + gx0 * cell
-            lx_max = x_min + (gx1 + 1) * cell
-            lz_min = z_min + gy0 * cell
-            lz_max = z_min + (gy1 + 1) * cell
-            for slx_min, slx_max, slz_min, slz_max in _split_elongated_rect_for_rotation(
-                    lx_min, lx_max, lz_min, lz_max, heading_deg):
-                corners = [(slx_min, slz_min), (slx_max, slz_min), (slx_max, slz_max), (slx_min, slz_max)]
-                lats, lons = [], []
-                for cx, cz in corners:
-                    la, lo = geo_transform.local_offset_to_latlon(base_lat, base_lon, heading_deg, cx, cz)
-                    lats.append(la)
-                    lons.append(lo)
-                rects.append({
-                    "west": min(lons) - pad_lon_deg,
-                    "east": max(lons) + pad_lon_deg,
-                    "south": min(lats) - pad_lat_deg,
-                    "north": max(lats) + pad_lat_deg,
-                })
+            lx_min = x_min + gx0 * cell - pad_m
+            lx_max = x_min + (gx1 + 1) * cell + pad_m
+            lz_min = z_min + gy0 * cell - pad_m
+            lz_max = z_min + (gy1 + 1) * cell + pad_m
+            corners = [(lx_min, lz_min), (lx_max, lz_min), (lx_max, lz_max), (lx_min, lz_max)]
+            lats, lons = [], []
+            for cx, cz in corners:
+                la, lo = geo_transform.local_offset_to_latlon(base_lat, base_lon, heading_deg, cx, cz)
+                lats.append(la)
+                lons.append(lo)
+            rects.append({
+                "west": min(lons),
+                "east": max(lons),
+                "south": min(lats),
+                "north": max(lats),
+            })
     return rects
 
 
@@ -2885,7 +2698,7 @@ class ModularPythonConverterApp:
                         dataref = proximity_sidecars.get(obj_stem)
                         if dataref:
                             proximity_objects.append({"dataref": dataref, "lat": abs_lat, "lon": abs_lon})
-                        _stem_entries[obj_stem] = (entry, fit_applied, part_is_draped, fit_reason)
+                        _stem_entries[obj_stem] = (entry, fit_applied, part_is_draped)
 
                     _anchor_cluster_candidates.append({
                         "group_key": _fit_gk, "raw_lat": p["lat"], "raw_lon": p["lon"], "hdg": p["hdg"],
@@ -2976,91 +2789,35 @@ class ModularPythonConverterApp:
                          f"2+ differently-named placements ({_with_ref} of them have at least one member with "
                          f"an applied terrain-fit shift to share with the others).", "info")
             for bucket in _anchor_buckets.values():
-                distinct_gks = {c["group_key"] for c in bucket}
-                if len(distinct_gks) < 2:
+                if len({c["group_key"] for c in bucket}) < 2:
                     continue
-                # CONFIRMED REAL REGRESSION: picking "whichever member
-                # happened to independently qualify first" as the
-                # reference, then only overwriting members that came back
-                # disqualified, was correct back when a small sibling part
-                # (glass shell, interior, attached canopy) could never
-                # independently qualify at all -- terrain_fit's own former
-                # footprint size gate guaranteed only the genuinely large
-                # part of a split building ever got its own shift, so
-                # every other part always fell through to share it. Now
-                # that gate is gone (see terrain_fit.py's own docstring),
-                # a small sibling routinely qualifies on its own too --
-                # from a much smaller, noisier sample grid than its
-                # sibling's -- and the old "already applied -> never
-                # touch it" rule let that noisy number stand uncontested,
-                # producing two parts of ONE real building moving by two
-                # different amounts (the reported "half the building
-                # underground, like it's tilted" symptom). Fix: always
-                # pick the member with the LARGEST sampled footprint as
-                # the anchor's one canonical shift (more ground sampled
-                # -> less exposed to a single DEM/DSF spike), and apply
-                # that same number to EVERY member at this anchor,
-                # overriding even ones that already applied their own --
-                # a shared real-world anchor is one physical object; it
-                # must move as one rigid body, not each decoded part
-                # trusting its own independent estimate.
-                best_gk, best_transform, best_area = None, None, -1.0
-                for gk in distinct_gks:
-                    t = terrain_fit.get_cached_transform(gk)
-                    if t is None or t.get("vertical_shift") is None:
-                        continue
-                    area = t.get("footprint_area_m2", 0.0)
-                    if area > best_area:
-                        best_gk, best_transform, best_area = gk, t, area
-                if best_transform is None:
+                applied_cand = next((c for c in bucket if c["any_applied"]), None)
+                if applied_cand is None:
+                    continue
+                transform = terrain_fit.get_cached_transform(applied_cand["group_key"])
+                if transform is None or transform.get("vertical_shift") is None:
                     continue
 
                 for cand in bucket:
-                    if cand["group_key"] == best_gk:
+                    if cand["any_applied"] or cand["group_key"] == applied_cand["group_key"]:
                         continue
-                    # CONFIRMED REAL BUG this reverts: exempting a member
-                    # that already got its own "applied_rigid_warp" from
-                    # being overridden here (on the reasoning that its own
-                    # per-vertex sampling was already more accurate than a
-                    # borrowed shift) broke exactly what this whole pass
-                    # exists for -- a shared real-world anchor IS one
-                    # physical thing (e.g. a building's shell + the people/
-                    # props placed inside it), and letting one member use a
-                    # SHIFT while another independently uses a WARP means
-                    # they're corrected by two different mechanisms that
-                    # don't compute the same number at their shared
-                    # boundary, even when each is individually "accurate"
-                    # -- confirmed real symptom (user): a vertical seam
-                    # between a building and the people/objects inside it.
-                    # Every member at a shared anchor now always gets the
-                    # SAME correction as the canonical member -- shift or
-                    # warp, whichever the canonical one itself used (see
-                    # apply_shared_shift_to_group, which now branches on
-                    # best_transform["uses_rigid_warp"]) -- so the whole
-                    # group moves as one, cohesion taking priority over a
-                    # theoretically-more-accurate independent estimate.
-                    linkable_stems = [
-                        stem for stem, (entry, fit_applied, part_is_draped, fit_reason) in cand["stem_entries"].items()
-                        if not part_is_draped
+                    unresolved_stems = [
+                        stem for stem, (entry, fit_applied, part_is_draped) in cand["stem_entries"].items()
+                        if not fit_applied and not part_is_draped
                     ]
-                    if not linkable_stems:
+                    if not unresolved_stems:
                         continue
                     # No anchor-delta bookkeeping needed here (unlike the
                     # rotation this replaced): the shift is a property of
                     # the shared real-world anchor point, not of either
                     # candidate's own local-frame convention -- see
-                    # apply_shared_shift_to_group's own docstring. Always
-                    # starts from each stem's ORIGINAL unwarped geometry
-                    # (_load_ir there is keyed by the original obj_stem,
-                    # not any prior per-group correction), so overriding
-                    # an already-applied member replaces its shift rather
-                    # than stacking a second one on top.
+                    # apply_shared_shift_to_group's own docstring.
                     linked_results = terrain_fit.apply_shared_shift_to_group(
-                        obj_dir, linkable_stems, best_transform, xplane_root)
-                    for stem in linkable_stems:
+                        obj_dir, unresolved_stems, transform, xplane_root)
+                    for stem in unresolved_stems:
                         new_name, linked_applied, _linked_reason = linked_results[stem]
                         if linked_applied:
-                            entry, _, _, _ = cand["stem_entries"][stem]
+                            entry, _, _ = cand["stem_entries"][stem]
                             entry["name"] = new_name
                             _linked_count += 1
 
@@ -3411,7 +3168,7 @@ class ModularPythonConverterApp:
                     all_exclusions = [reference_bbox]
                 source_parts = []
                 if _used_per_object_rects:
-                    source_parts.append("each converted object's own footprint edges (per-object, +0.5m each)")
+                    source_parts.append("each converted object's own footprint edges (per-object, +2m each)")
                 else:
                     if boundary_points and shaped_rects:
                         source_parts.append(f"{matched_apt_ident}'s default boundary shape ({len(boundary_points)} point(s))")

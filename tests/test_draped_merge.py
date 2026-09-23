@@ -1633,39 +1633,5 @@ class TestDrapedMerge(unittest.TestCase):
                              "markings-band layers must never be pavement-gap-filled")
 
 
-class TestDrapedGroupForTexture(unittest.TestCase):
-    """draped_merge._draped_group_for_texture -- CONFIRMED REAL BUG this
-    pins: a real MSFS ground-poly texture name that glues "tile" straight
-    onto another word with no underscore (ini_GP_GEN_SmallTiles_4m_01)
-    matched none of this module's own keyword lists at all, silently
-    falling through to the _DRAPED_GROUP_LINES default (the "markings"
-    band, meant for painted lines/text/signage) instead of the "taxiways"
-    base-pavement band it actually belongs in -- once mesh_convert.
-    convert() started draping this near-ground-flat content (see
-    mesh_convert.convert's own is_near_ground_flat comment), that put real
-    tile/paver/ballast ground detail in direct draw-order competition with
-    genuine painted line markings for the same narrow ranking tier,
-    reported as pavement pieces flickering/z-fighting against each other
-    in-sim."""
-
-    def test_small_tiles_is_base_not_markings(self):
-        self.assertEqual(
-            draped_merge._draped_group_for_texture("ini_GP_GEN_SmallTiles_4m_01_albd.dds"),
-            draped_merge._DRAPED_GROUP_BASE)
-
-    def test_ballast_is_base_not_markings(self):
-        self.assertEqual(
-            draped_merge._draped_group_for_texture("rail_ballast_01_albd.png"),
-            draped_merge._DRAPED_GROUP_BASE)
-
-    def test_tileseam_still_wins_as_wear(self):
-        """The new bare "tile" keyword must not shadow the existing, more
-        specific "tileseam" (dirt/grout-line) classification -- see the
-        guard in _draped_group_for_texture."""
-        self.assertEqual(
-            draped_merge._draped_group_for_texture("concrete_tileseam_dirt_albd.png"),
-            draped_merge._DRAPED_GROUP_WEAR)
-
-
 if __name__ == "__main__":
     unittest.main()
