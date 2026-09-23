@@ -129,7 +129,7 @@ class MatBuilder:
         self.double_sided = False
         self.is_glass = False
         self.is_decal = False
-        self.is_near_ground_flat = False  # per-material ground-level detection -- DROPS the builder, doesn't drape it -- see convert()
+        self.is_near_ground_flat = False  # per-material ground-level detection -- currently informational only, see convert()
         self.all_source_nodes_flat = True  # AND-reduced across every contributing node -- see convert()
         self.block_footprint_areas = []  # per-node-block XZ bbox area, m^2 -- see convert()'s footprint write-up
 
@@ -435,6 +435,22 @@ def compute_file_flatness_and_reference(gltf, buffers, world_transforms, flat_ep
         the whole rigid object around) to any (non-stray, see
         flag_stray_vertices) vertex in the file.
 
+      - min_height: the lowest (non-stray) vertex Y anywhere in the file,
+        flat or not. CONFIRMED REAL BUG this exists to fix: convert() used
+        to gate the "decal" name-match (builder.is_decal) on proximity to
+        reference_height (the flat band with the MOST vertex support) --
+        but that band is easily dominated by a large flat ROOF, not
+        ground, for a building with little explicit ground-contact flat
+        geometry of its own. Confirmed against a real LHBP building: its
+        "roof_decal" material (alpha_mode BLEND, authored at genuine roof
+        height) sat close enough to that roof-biased reference_height to
+        still pass the proximity check and stay draped onto the ground.
+        min_height doesn't have that failure mode -- a building's own
+        foundation/wall base is, by construction, always its lowest
+        point, roof included, so it's a reliable ground reference no
+        matter how the file's flat-triangle count happens to be
+        distributed.
+
       - max_horizontal_radius: the same, but measured only in the
         horizontal (X/Z) plane, ignoring height. This is the one that
         actually matters for TILTED: rotating the whole object to match a
@@ -489,17 +505,30 @@ def compute_file_flatness_and_reference(gltf, buffers, world_transforms, flat_ep
         level, and must stay rigid (this is exactly the failure mode an
         earlier, more aggressive per-material attempt hit this session:
         it had no ground-proximity check at all). A material detected this
-        way is DROPPED from the output entirely, not draped with a
-        guessed layer rank -- MSFS's own intended stacking order for this
-        kind of small patch/paver detail can't be recovered from the
-        source data, per explicit instruction, so omitting it is
-        preferred over risking another wrong-looking render.
+        way stays RIGID (is_near_ground_flat is informational only, not a
+        drape/drop decision) instead of being draped with a guessed layer
+        rank -- MSFS's own intended stacking order for this kind of small
+        patch/paver detail can't be recovered from the source data, so
+        it's left at its own authored position rather than guessing where
+        in the draw order it belongs. Used to be DROPPED from the output
+        entirely instead; reverted per a real-world comparison against
+        another converter's output for the same content (see convert()'s
+        own is_near_ground_flat comment), which showed dropping it was
+        worse than leaving it rigid.
     """
     total_tris = 0
     flat_tris = 0
     flat_y_values = []
     max_radius = 0.0
     max_horizontal_radius = 0.0
+    # Lowest clean (non-stray) vertex anywhere in the file, flat or not --
+    # a real building's foundation/wall base is always its lowest point,
+    # so this is a far more reliable "true ground level" reference than
+    # file_reference_height below (the MOST VERTEX-HEAVY flat band, which
+    # a large flat roof can easily dominate over whatever sparse ground-
+    # contact geometry the file actually has -- see min_height's own
+    # docstring entry for the confirmed real case this exists for).
+    min_height = None
 
     # Per-node breakdown of the exact same tallies as the file-wide ones
     # above -- used by convert() to decide flattening/draping PER NODE
@@ -554,6 +583,8 @@ def compute_file_flatness_and_reference(gltf, buffers, world_transforms, flat_ep
                 if len(clean):
                     max_radius = max(max_radius, float(np.linalg.norm(clean, axis=1).max()))
                     max_horizontal_radius = max(max_horizontal_radius, float(np.linalg.norm(clean[:, [0, 2]], axis=1).max()))
+                    clean_min_y = float(clean[:, 1].min())
+                    min_height = clean_min_y if min_height is None else min(min_height, clean_min_y)
 
             if idx_acc not in indices_cache:
                 indices_cache[idx_acc] = read_accessor(gltf, buffers, idx_acc).astype(np.int64).reshape(-1)
@@ -647,7 +678,7 @@ def compute_file_flatness_and_reference(gltf, buffers, world_transforms, flat_ep
         all_y = np.concatenate(flat_y_values)
         _, _, reference_height, _ = _cluster_height_bands(all_y, merge_gap=merge_gap)
 
-    return flat_fraction, reference_height, max_radius, max_horizontal_radius, node_stats, material_stats
+    return flat_fraction, reference_height, max_radius, max_horizontal_radius, node_stats, material_stats, min_height
 
 
 def _cluster_height_bands(y_values, merge_gap=0.05):
@@ -1908,7 +1939,7 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
     # long comment where this is consumed (builder.is_near_ground_flat)
     # for the real measured numbers this was picked from.
     _NEAR_GROUND_FLAT_FRACTION_THRESHOLD = 0.90
-    file_flat_fraction, file_reference_height, file_max_radius, file_max_horizontal_radius, node_flatness_stats, material_flatness_stats = compute_file_flatness_and_reference(gltf, buffers, world_transforms)
+    file_flat_fraction, file_reference_height, file_max_radius, file_max_horizontal_radius, node_flatness_stats, material_flatness_stats, file_min_height = compute_file_flatness_and_reference(gltf, buffers, world_transforms)
     file_is_flat_only = file_flat_fraction >= flat_fraction_threshold and file_reference_height is not None
 
     # TILTED rotates the WHOLE rigid object around its local origin to
@@ -2192,19 +2223,50 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                         builder.alpha_cutoff = mat.get("alphaCutoff", 0.5)
                         builder.double_sided = bool(mat.get("doubleSided", False))
 
-                        builder.is_decal = "decal" in raw_mat_name.lower() or "ASOBO_material_decal" in exts
+                        # Name-based signal only here -- the real verdict
+                        # (builder.is_decal) is finalized a bit further
+                        # down, once material_flatness_stats' per-material
+                        # reference height is available, so it can be
+                        # gated on ground-proximity the same way
+                        # is_near_ground_flat is (see that assignment's own
+                        # comment for why: a "decal"-named/ASOBO_material_
+                        # decal-tagged material isn't always a GROUND
+                        # decal -- MSFS also uses that same material type
+                        # for a rooftop weathering/grime overlay meant to
+                        # stay coincident with its own rigid roof, not get
+                        # globally reprojected onto real terrain. CONFIRMED
+                        # REAL BUG this fixes: a real LHBP building's
+                        # "roof_decal" material -- alpha_mode BLEND,
+                        # authored at genuine roof height -- was draped
+                        # unconditionally on name alone, with no elevation
+                        # check at all (unlike is_near_ground_flat's own
+                        # check just below), landing it flat on the ground
+                        # far below the roof it was meant to sit on.
+                        _decal_name_matched = "decal" in raw_mat_name.lower() or "ASOBO_material_decal" in exts
 
-                        # Narrow DETECTION (not draping -- see
-                        # builder_is_dropped_map below, where a material
-                        # that only qualifies here gets DROPPED from the
-                        # output entirely, not drape-and-ranked) for
-                        # materials the file-wide verdict rejects (see
+                        # Narrow DETECTION only -- this used to gate a DROP
+                        # (see the removed builder_is_dropped_map below),
+                        # discarding a material that only qualified here
+                        # entirely rather than guessing a drape rank for it.
+                        # Reverted: the real-world comparison against another
+                        # converter's output for the same EGLC content
+                        # (pavement/rail-ballast detail near the train) showed
+                        # its tool just leaves this content as ordinary rigid
+                        # (non-draped) geometry -- floating a little proud of
+                        # the ground in the worst case -- which reads as fine
+                        # in-sim, unlike our DROP which removed it outright.
+                        # is_near_ground_flat is now informational only (kept
+                        # for material_stats/debugging); the material falls
+                        # through to the normal rigid path, so it renders and
+                        # -- like every other rigid object since TILTED was
+                        # removed -- is eligible for terrain_fit's vertical
+                        # shift if its group qualifies. For
                         # material_stats in compute_file_flatness_and_
                         # reference's own docstring for the full real-world
                         # case this covers -- ground-layer models with one
                         # non-flat sibling material vetoing ATTR_draped for
                         # every OTHER, individually-flat material in the
-                        # same file). Two conditions, both required:
+                        # same file. Two conditions, both required:
                         #   1. This material's OWN geometry passes a strict
                         #      per-triangle flatness test, at
                         #      _NEAR_GROUND_FLAT_FRACTION_THRESHOLD (0.90,
@@ -2225,14 +2287,15 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                         #      3D ramp Slope_01, plus Concrete_01/
                         #      Grunge_01/Colour_01) sits at 0.89 or well
                         #      below, comfortably clear of 0.90. The outcome
-                        #      here is DROP, not drape (see
-                        #      builder_is_dropped_map below) -- a false
-                        #      positive loses one small patch-scale detail
-                        #      object, a false negative just leaves the
-                        #      original rigid/floating symptom in place;
-                        #      neither is as costly as it would be if the
-                        #      outcome were still "drape with a guessed
-                        #      rank", which is why this can stay lenient.
+                        #      of qualifying here is just "stay rigid instead
+                        #      of draped" -- a false positive costs one
+                        #      small patch-scale object an unnecessary rigid
+                        #      placement (still rendered, just not draped), a
+                        #      false negative just leaves the original
+                        #      rigid/floating symptom in place; neither is as
+                        #      costly as it would be if the outcome were
+                        #      still "drape with a guessed rank", which is
+                        #      why this can stay lenient.
                         #   2. Its own flat elevation is close to the
                         #      file's overall ground-level reference. Flatness
                         #      alone isn't enough: a building's flat ROOF or a
@@ -2250,6 +2313,43 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                             and _mat_ref_height is not None
                             and file_reference_height is not None
                             and abs(_mat_ref_height - file_reference_height) <= _NEAR_GROUND_FLAT_TOLERANCE_M
+                        )
+
+                        # Finalizing is_decal here (see _decal_name_matched
+                        # above): only exclude a decal-named material from
+                        # draping when there's POSITIVE evidence it sits
+                        # away from the file's own ground level -- an
+                        # unknown reference height (None, e.g. non-planar
+                        # decal geometry) keeps the permissive, historical
+                        # behavior (still draped) rather than guessing,
+                        # same asymmetric-default reasoning as is_near_
+                        # ground_flat's own tolerance check just above,
+                        # just inverted: that one defaults to NOT
+                        # qualifying unless proven near ground, this one
+                        # defaults to qualifying unless proven far from it,
+                        # since the name/extension signal is already a
+                        # much stronger positive indicator than mere
+                        # flatness is.
+                        #
+                        # Deliberately compared against file_min_height
+                        # here, NOT file_reference_height (the near-ground-
+                        # flat check above still uses that one -- see its
+                        # own docstring, it degrades safely either way).
+                        # CONFIRMED REAL BUG comparing against
+                        # file_reference_height caused: that reference is
+                        # the flat band with the MOST vertex support, which
+                        # a large flat ROOF easily dominates for a building
+                        # with little explicit ground-contact flat geometry
+                        # of its own -- a real LHBP "roof_decal" material,
+                        # genuinely at roof height, sat close enough to
+                        # that roof-biased reference to still pass and stay
+                        # draped onto the ground. file_min_height (the
+                        # file's own lowest vertex, flat or not) doesn't
+                        # have that failure mode -- see its own docstring
+                        # entry on compute_file_flatness_and_reference.
+                        builder.is_decal = _decal_name_matched and (
+                            _mat_ref_height is None or file_min_height is None
+                            or abs(_mat_ref_height - file_min_height) <= _NEAR_GROUND_FLAT_TOLERANCE_M
                         )
 
                         # MSFS has shipped several glass extension names
@@ -3076,27 +3176,24 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
     # texture assignment) is safe.
     draped_areas = {}
     builder_is_draped_map = {}
-    builder_is_dropped_map = {}
     for builder_key, builder in builders.items():
         num_verts = len(builder.vertices)
         file_wide_flat = bool(num_verts) and builder.all_source_nodes_flat
         is_decal = getattr(builder, 'is_decal', False)
-        # DROPPED, not draped: a material that ONLY qualifies through the
-        # near-ground-flat fallback (not the file-wide verdict, not the
-        # explicit "decal"-named path) gets OMITTED from the output
-        # entirely rather than draped with a guessed layer rank. Per
-        # explicit instruction: MSFS's own intended stacking order for
-        # these small patch/paver-style materials can't be recovered from
-        # the source data, so a wrong guess (floating OR wrongly stacked)
-        # is worse than simply not including them -- the confirmed real
-        # cases (EGLC's SmallTiles/ConcreteTile materials) are individually
-        # small texture-atlas details, not load-bearing geometry, so
-        # dropping them is an acceptable trade against risking another
-        # wrong-looking render.
-        is_dropped = (not file_wide_flat and not is_decal
-                      and bool(num_verts) and getattr(builder, 'is_near_ground_flat', False))
-        builder_is_dropped_map[builder_key] = is_dropped
-        is_draped = (not is_dropped) and (file_wide_flat or is_decal)
+        # A material that ONLY qualifies through the near-ground-flat
+        # fallback (not the file-wide verdict, not the explicit
+        # "decal"-named path) used to be DROPPED from the output entirely
+        # here. Reverted per real-world comparison against another
+        # converter's output for the same EGLC content (pavement/
+        # rail-ballast detail near the train): its tool keeps this content
+        # as ordinary rigid (non-draped) geometry instead of guessing a
+        # drape rank OR omitting it, and that reads fine in-sim even when
+        # it ends up floating a little proud of the ground -- unlike our
+        # DROP, which removed real content outright. So it now just stays
+        # rigid: not draped, not dropped, and (like every other rigid
+        # object since TILTED was removed) eligible for terrain_fit's
+        # vertical shift if its group qualifies.
+        is_draped = file_wide_flat or is_decal
         builder_is_draped_map[builder_key] = is_draped
         if is_draped and builder.block_footprint_areas:
             draped_areas[builder_key] = float(np.median(builder.block_footprint_areas))
@@ -3104,14 +3201,6 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
 
     obj_paths = []
     for builder_key, builder in builders.items():
-        if builder_is_dropped_map.get(builder_key):
-            logger.info(
-                f"{glb_path.name}: dropping '{builder.name}' -- only qualifies as ground-level "
-                f"via the near-ground-flat fallback (not file-wide flat, not decal-named); MSFS's "
-                f"own intended stacking order for this content can't be recovered, so it's omitted "
-                f"rather than rendered with a guessed layer rank."
-            )
-            continue
         if not builder.texture_name:
             # A BLEND material (glass, tinted panels, etc.) with no texture
             # of its own MUST get a texture whose alpha channel actually

@@ -109,6 +109,77 @@ class TestFlatnessTiltedExclusivity(unittest.TestCase):
                               "the flat decal must never get TILTED -- the exact combination that made "
                               "a real converted object disappear entirely in X-Plane")
 
+    def test_elevated_decal_material_stays_rigid_not_draped(self):
+        """CONFIRMED REAL BUG this pins: a "decal"-named/ASOBO_material_
+        decal-tagged material used to be draped unconditionally on name
+        alone, with no elevation check at all (unlike is_near_ground_flat's
+        own check on the same kind of material one call below). MSFS uses
+        that same BLEND-mode decal material type for more than ground-
+        level stains/markings -- a rooftop weathering/grime overlay meant
+        to stay coincident with its own rigid roof is authored the same
+        way. Confirmed against a real converted LHBP building: a
+        "roof_decal" material at genuine roof height was draped flat onto
+        the ground, far below the roof it was meant to sit on. This
+        fixture mirrors that: a decal-named quad sitting AT the building's
+        own roof height (not at its ground level) must stay rigid.
+
+        Deliberately NO explicit ground-level floor geometry here -- the
+        building's only flat triangles are its roof (2 tris @ y=6), same
+        as the decal. This is what makes the fixture actually discriminate
+        the real fix (comparing against file_min_height, the lowest CLEAN
+        VERTEX in the file -- found here from the walls' own non-flat
+        bottom edge, still @ y=0) from the superseded, buggier approach
+        (comparing against file_reference_height, the most vertex-heavy
+        FLAT band -- which without a ground-level floor would itself
+        resolve to y=6, the roof, making the roof_decal wrongly look
+        "close to ground" and stay draped)."""
+        b = GltfBuilder()
+        tex = b.add_image_data_uri((150, 150, 150, 255))
+        texi = b.add_texture(tex)
+        building_mat = b.add_material("BuildingMat", base_color_texture_index=texi)
+        decal_mat = b.add_material("roof_decal", base_color_texture_index=texi)
+
+        bx = [(-5, 0, -5), (5, 0, -5), (5, 0, 5), (-5, 0, 5), (-5, 6, -5), (5, 6, -5), (5, 6, 5), (-5, 6, 5)]
+        wall_tris = []
+        for a, c, d, e in [(0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)]:
+            wall_tris += [(a, c, d), (a, d, e)]
+        roof_tris = [(4, 5, 6), (4, 6, 7)]
+        building_indices = [i for tri in (wall_tris + roof_tris) for i in tri]
+        building_mesh = b.add_mesh(
+            bx, building_indices,
+            normals=[(0.0, 1.0, 0.0)] * len(bx), uvs=[(0.0, 0.0)] * len(bx), material_index=building_mat,
+        )
+        b.add_node(mesh_index=building_mesh, name="Building")
+
+        # A "roof_decal" quad sitting AT the roof's own height (y=6, same
+        # as the building's roof triangles above -- not at the file's
+        # ground level, y=0) -- the real-world case this fix targets.
+        decal_verts = [(-4.0, 6.0, -4.0), (4.0, 6.0, -4.0), (4.0, 6.0, 4.0), (-4.0, 6.0, 4.0)]
+        decal_indices = [0, 1, 2, 0, 2, 3]
+        decal_mesh = b.add_mesh(
+            decal_verts, decal_indices,
+            normals=[(0.0, 1.0, 0.0)] * 4, uvs=[(0.0, 0.0)] * 4, material_index=decal_mat,
+        )
+        b.add_node(mesh_index=decal_mesh, name="RoofDecal")
+
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            glb_path = td / "building_with_roof_decal.glb"
+            glb_path.write_bytes(b.build())
+            obj_dir = td / "objects"
+            tex_dir = td / "textures"
+            obj_dir.mkdir()
+            tex_dir.mkdir()
+
+            result = mesh_convert.convert(glb_path, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
+            self.assertTrue(result)
+
+            decal_obj = next(p for p in result if "roof_decal" in p.name)
+            decal_text = decal_obj.read_text(encoding="utf-8")
+            self.assertNotIn("ATTR_draped", decal_text,
+                              "a decal at genuine roof height must stay rigid, not get projected onto "
+                              "the ground far below its authored position")
+
     def test_mostly_flat_node_with_minor_embossing_still_drapes(self):
         """Flatness/draping is a FILE-WIDE verdict: a node with a small
         amount of embossed/raised detail (here, 10 flat tris + 1 near-
@@ -351,19 +422,23 @@ class TestFlatnessTiltedExclusivity(unittest.TestCase):
 
         return b.build()
 
-    def test_near_ground_flat_material_is_dropped_not_draped(self):
+    def test_near_ground_flat_material_stays_rigid_not_dropped(self):
         """The per-material near-ground-flat DETECTION (convert()'s
-        builder.is_near_ground_flat): a non-"decal"-named material that is
-        individually ~100% flat AND close to the file's own ground-level
-        reference is DROPPED from the output entirely (not written), even
-        though the file-wide verdict fails because of the building's
-        genuinely non-flat walls -- per explicit instruction: MSFS's own
-        intended stacking order for this kind of small patch/paver detail
-        can't be recovered from the source data, so it's safer to omit it
-        than render it wrong (floating, or drape-ranked in a guessed
-        position). Confirmed real case this pins: EGLC's SmallTiles/
-        ConcreteTile materials, baked ~1.5m off true ground level -- this
-        mechanism used to drape them; now it drops them instead."""
+        builder.is_near_ground_flat) is informational only: a non-"decal"-
+        named material that is individually ~100% flat AND close to the
+        file's own ground-level reference used to be DROPPED from the
+        output entirely, even though the file-wide verdict fails because
+        of the building's genuinely non-flat walls. Reverted per a
+        real-world comparison against another converter's output for the
+        same EGLC content (pavement/rail-ballast detail near the train):
+        its tool keeps this as ordinary rigid geometry instead of omitting
+        it, and that reads fine in-sim even if it ends up floating a
+        little proud of the ground -- unlike our old DROP, which removed
+        real content outright. Confirmed real case this pins: EGLC's
+        SmallTiles/ConcreteTile materials, baked ~1.5m off true ground
+        level -- this mechanism used to drape them, then dropped them;
+        now it leaves them rigid (not draped, not dropped, still eligible
+        for terrain_fit's vertical shift like any other rigid object)."""
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             glb_path = td / "ground_layer.glb"
@@ -380,10 +455,15 @@ class TestFlatnessTiltedExclusivity(unittest.TestCase):
             building_text = building_obj.read_text(encoding="utf-8")
             self.assertNotIn("ATTR_draped", building_text, "the rigid building must not be draped")
 
-            paver_matches = [p for p in result if "PaverMat" in p.name]
-            self.assertEqual(paver_matches, [],
-                              "a non-decal material that only qualifies via the near-ground-flat "
-                              "fallback must be dropped from the output, not written at all")
+            paver_obj = next((p for p in result if "PaverMat" in p.name), None)
+            self.assertIsNotNone(paver_obj,
+                                  "a non-decal material that only qualifies via the near-ground-flat "
+                                  "fallback must still be written to the output, not dropped")
+            paver_text = paver_obj.read_text(encoding="utf-8")
+            self.assertNotIn("ATTR_draped", paver_text,
+                              "it must stay rigid (not draped), since MSFS's own stacking order "
+                              "for this content can't be recovered")
+            self.assertTrue(paver_text.strip())
 
     def test_elevated_flat_material_stays_rigid_not_dropped(self):
         """The near-ground-flat DETECTION must NOT fire for a flat
@@ -395,9 +475,9 @@ class TestFlatnessTiltedExclusivity(unittest.TestCase):
         aggressive per-material attempt hit this session (no ground-
         proximity check at all, wrongly flattened chairs/glass/rooftops)
         -- this test pins that it can't happen again via this narrower
-        mechanism. Unlike a true near-ground-flat match, this must stay
-        present in the output (rigid), not get dropped -- dropping is
-        only for the ground-level case."""
+        mechanism. This must stay present in the output (rigid) either
+        way -- a true near-ground-flat match no longer gets dropped
+        either, see test_near_ground_flat_material_stays_rigid_not_dropped."""
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             glb_path = td / "ground_layer.glb"

@@ -511,7 +511,7 @@ def _rasterize_footprint_mask(xz, tris, cell_m, max_cells=2_000_000):
     return mask, x_min, z_min, _cell
 
 
-def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=2.0, cell_m=1.0):
+def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=0.5, cell_m=1.0):
     """Exclusion rectangles that cover each converted object's OWN
     footprint using close to the MINIMUM real area needed -- not one
     shared airport-wide set, not one bounding box per object, and not even
@@ -532,11 +532,21 @@ def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=2.0, cell_m
     while the WHOLE run stays identically occupied on the next line, so
     two parts that diverge (an X's arms) split into separate rectangles
     right where they stop lining up, while a uniform strip merges into one
-    rectangle instead of fragmenting. Each resulting rectangle is padded by
-    pad_m on every side (in local metres, within the requested 1-3m growth
-    range) before being rotated into real-world lat/lon by the placement's
-    own heading (geo_transform.local_offset_to_latlon, same convention
-    used everywhere else in this pipeline).
+    rectangle instead of fragmenting. Each grid rectangle's own corners are
+    rotated into real-world lat/lon FIRST (geo_transform.local_offset_to_
+    latlon, same convention used everywhere else in this pipeline), and
+    only THEN is the resulting real-world west/east/south/north box padded
+    by pad_m -- CONFIRMED REAL BUG this order fixes: X-Plane's exclusion-
+    zone format is itself always an axis-aligned lat/lon box (there's no
+    rotated-rectangle exclusion primitive to emit), so for any placement
+    heading that isn't a multiple of 90 degrees, the box has to grow
+    somewhat just to cover a rotated footprint's corners at all -- but
+    padding the LOCAL rectangle before that rotation let the pad amount
+    get diagonally amplified by the same rotation (up to ~1.4x at 45
+    degrees) on top of that unavoidable growth, silently covering more
+    real ground than pad_m the more an object was rotated. Padding the
+    already-rotated real-world box instead adds exactly pad_m of margin
+    in every cardinal direction regardless of heading.
 
     footprint_candidates: [(generated_stems, base_lat, base_lon,
     heading_deg), ...] -- one entry per real placement (base_lat/base_lon
@@ -597,11 +607,14 @@ def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=2.0, cell_m
         if not grid_rects:
             continue
 
+        m_lat, m_lon = geo_transform.metres_per_degree(base_lat)
+        pad_lat_deg = pad_m / m_lat
+        pad_lon_deg = pad_m / m_lon
         for (gy0, gx0, gy1, gx1) in grid_rects:
-            lx_min = x_min + gx0 * cell - pad_m
-            lx_max = x_min + (gx1 + 1) * cell + pad_m
-            lz_min = z_min + gy0 * cell - pad_m
-            lz_max = z_min + (gy1 + 1) * cell + pad_m
+            lx_min = x_min + gx0 * cell
+            lx_max = x_min + (gx1 + 1) * cell
+            lz_min = z_min + gy0 * cell
+            lz_max = z_min + (gy1 + 1) * cell
             corners = [(lx_min, lz_min), (lx_max, lz_min), (lx_max, lz_max), (lx_min, lz_max)]
             lats, lons = [], []
             for cx, cz in corners:
@@ -609,10 +622,10 @@ def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=2.0, cell_m
                 lats.append(la)
                 lons.append(lo)
             rects.append({
-                "west": min(lons),
-                "east": max(lons),
-                "south": min(lats),
-                "north": max(lats),
+                "west": min(lons) - pad_lon_deg,
+                "east": max(lons) + pad_lon_deg,
+                "south": min(lats) - pad_lat_deg,
+                "north": max(lats) + pad_lat_deg,
             })
     return rects
 
@@ -2789,32 +2802,67 @@ class ModularPythonConverterApp:
                          f"2+ differently-named placements ({_with_ref} of them have at least one member with "
                          f"an applied terrain-fit shift to share with the others).", "info")
             for bucket in _anchor_buckets.values():
-                if len({c["group_key"] for c in bucket}) < 2:
+                distinct_gks = {c["group_key"] for c in bucket}
+                if len(distinct_gks) < 2:
                     continue
-                applied_cand = next((c for c in bucket if c["any_applied"]), None)
-                if applied_cand is None:
-                    continue
-                transform = terrain_fit.get_cached_transform(applied_cand["group_key"])
-                if transform is None or transform.get("vertical_shift") is None:
+                # CONFIRMED REAL REGRESSION: picking "whichever member
+                # happened to independently qualify first" as the
+                # reference, then only overwriting members that came back
+                # disqualified, was correct back when a small sibling part
+                # (glass shell, interior, attached canopy) could never
+                # independently qualify at all -- terrain_fit's own former
+                # footprint size gate guaranteed only the genuinely large
+                # part of a split building ever got its own shift, so
+                # every other part always fell through to share it. Now
+                # that gate is gone (see terrain_fit.py's own docstring),
+                # a small sibling routinely qualifies on its own too --
+                # from a much smaller, noisier sample grid than its
+                # sibling's -- and the old "already applied -> never
+                # touch it" rule let that noisy number stand uncontested,
+                # producing two parts of ONE real building moving by two
+                # different amounts (the reported "half the building
+                # underground, like it's tilted" symptom). Fix: always
+                # pick the member with the LARGEST sampled footprint as
+                # the anchor's one canonical shift (more ground sampled
+                # -> less exposed to a single DEM/DSF spike), and apply
+                # that same number to EVERY member at this anchor,
+                # overriding even ones that already applied their own --
+                # a shared real-world anchor is one physical object; it
+                # must move as one rigid body, not each decoded part
+                # trusting its own independent estimate.
+                best_gk, best_transform, best_area = None, None, -1.0
+                for gk in distinct_gks:
+                    t = terrain_fit.get_cached_transform(gk)
+                    if t is None or t.get("vertical_shift") is None:
+                        continue
+                    area = t.get("footprint_area_m2", 0.0)
+                    if area > best_area:
+                        best_gk, best_transform, best_area = gk, t, area
+                if best_transform is None:
                     continue
 
                 for cand in bucket:
-                    if cand["any_applied"] or cand["group_key"] == applied_cand["group_key"]:
+                    if cand["group_key"] == best_gk:
                         continue
-                    unresolved_stems = [
+                    linkable_stems = [
                         stem for stem, (entry, fit_applied, part_is_draped) in cand["stem_entries"].items()
-                        if not fit_applied and not part_is_draped
+                        if not part_is_draped
                     ]
-                    if not unresolved_stems:
+                    if not linkable_stems:
                         continue
                     # No anchor-delta bookkeeping needed here (unlike the
                     # rotation this replaced): the shift is a property of
                     # the shared real-world anchor point, not of either
                     # candidate's own local-frame convention -- see
-                    # apply_shared_shift_to_group's own docstring.
+                    # apply_shared_shift_to_group's own docstring. Always
+                    # starts from each stem's ORIGINAL unwarped geometry
+                    # (_load_ir there is keyed by the original obj_stem,
+                    # not any prior per-group correction), so overriding
+                    # an already-applied member replaces its shift rather
+                    # than stacking a second one on top.
                     linked_results = terrain_fit.apply_shared_shift_to_group(
-                        obj_dir, unresolved_stems, transform, xplane_root)
-                    for stem in unresolved_stems:
+                        obj_dir, linkable_stems, best_transform, xplane_root)
+                    for stem in linkable_stems:
                         new_name, linked_applied, _linked_reason = linked_results[stem]
                         if linked_applied:
                             entry, _, _ = cand["stem_entries"][stem]
@@ -3168,7 +3216,7 @@ class ModularPythonConverterApp:
                     all_exclusions = [reference_bbox]
                 source_parts = []
                 if _used_per_object_rects:
-                    source_parts.append("each converted object's own footprint edges (per-object, +2m each)")
+                    source_parts.append("each converted object's own footprint edges (per-object, +0.5m each)")
                 else:
                     if boundary_points and shaped_rects:
                         source_parts.append(f"{matched_apt_ident}'s default boundary shape ({len(boundary_points)} point(s))")
