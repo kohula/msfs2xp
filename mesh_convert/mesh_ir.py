@@ -82,6 +82,8 @@ class MeshIR:
     texture_normal: str | None = None
     normal_metalness: bool = False
     is_glass: bool = False
+    # Draw distance (ATTR_LOD 0 <lod_far>) for small props; None = always drawn.
+    lod_far: float | None = None
     footprint_area_m2: float | None = None
     proximity_dataref: str | None = None
 
@@ -138,6 +140,8 @@ def write_obj8(ir: MeshIR, obj_path: Path) -> None:
             lines.append(f"IDX {int(i)}\n")
         lines.append("\n")
 
+        if ir.lod_far and not ir.draped:
+            lines.append(f"ATTR_LOD 0 {ir.lod_far:.0f}\n")
         if ir.double_sided:
             lines.append("ATTR_no_cull\n")
         if ir.alpha_mode == "BLEND":

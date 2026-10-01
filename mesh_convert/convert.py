@@ -1910,6 +1910,26 @@ def _vertex_positions_are_subset(small_verts, big_verts, eps=0.05):
     return True
 
 
+def draw_distance_m(builders):
+    """How far away a model stays drawn, from its size: 400 radii (it spans
+    a few pixels there), 300 m to 20 km. Models 50 m and larger (half
+    diagonal) are always drawn -- returns None for them."""
+    lo, hi = [math.inf] * 3, [-math.inf] * 3
+    for b in builders:
+        for v in getattr(b, "vertices", ()) or ():
+            for k in range(3):
+                if v[k] < lo[k]:
+                    lo[k] = v[k]
+                if v[k] > hi[k]:
+                    hi[k] = v[k]
+    if lo[0] == math.inf:
+        return None
+    radius = math.dist(lo, hi) / 2.0
+    if radius >= 50.0:
+        return None
+    return round(min(max(radius * 400.0, 300.0), 20000.0))
+
+
 def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.0, yaw=0.0, roll=0.0,
             disable_proximity_animation=False, glass_opacity=DEFAULT_GLASS_OPACITY):
     global _EXPORTED_COUNT
@@ -3446,6 +3466,7 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
             f"against each other in-sim."
         )
     draped_layer_offsets = rank_draped_layer_offsets(draped_areas)
+    model_draw_distance = draw_distance_m(builders.values())
 
     obj_paths = []
     for builder_key, builder in builders.items():
@@ -3577,6 +3598,11 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
             f.write("".join(idx_lines))
 
             f.write("\n")
+            # Small props fade out the way MSFS drops them by screen size;
+            # ATTR_LOD must be the first command. Draped ground and large
+            # buildings are always drawn.
+            if model_draw_distance and not builder_is_draped:
+                f.write(f"ATTR_LOD 0 {model_draw_distance:.0f}\n")
             if builder.double_sided:
                 f.write("ATTR_no_cull\n")
 
@@ -3720,6 +3746,7 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                 texture_normal=(f"../textures/{builder.normal_texture_name}" if builder.normal_texture_name else None),
                 is_glass=bool(getattr(builder, "is_glass", False)),
                 normal_metalness=bool(getattr(builder, "normal_metalness", False)),
+                lod_far=(model_draw_distance if model_draw_distance and not builder_is_draped else None),
             )
             mesh_ir_module.save(ir, mesh_ir_module.sidecar_path_for(obj_path))
 

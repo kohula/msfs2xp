@@ -750,34 +750,225 @@ def parse_exclusion_rectangles(data: bytes, start: int, size: int):
         pos += 20
     return rects
 
-def extract_riff_model(data: bytes, container_off: int, container_size: int):
-    tag, riff_size, form = struct.unpack_from("<4sI4s", data, container_off)
-    if tag != b"RIFF" or form != b"GLTF": return None, None
-    subpos = container_off + 12
-    container_end = container_off + 8 + riff_size
-    name, glb_bytes = None, None
+def _decode_lod_chunk(cc, body):
+    """One GLBD sub-chunk -> GLB bytes, or None. GLBZ is a u32 inflated
+    length then a zstd frame; anything starting with glTF is a plain GLB."""
+    if cc == b"GLBZ":
+        if zstd is None or len(body) < 4:
+            return None
+        try:
+            declared = struct.unpack_from("<I", body, 0)[0]
+            return zstd.ZstdDecompressor().decompress(body[4:], max_output_size=declared)
+        except Exception:
+            return None
+    return body if body[:4] == GLB_MAGIC else None
 
+
+def extract_riff_model_lods(data: bytes, container_off: int, container_size: int):
+    """(name, model-info xml, [lod chunk (id, body), ...]) of a ModelData
+    RIFF container, most detailed level first. The GLBD chunk holds one
+    sub-chunk per level of detail, in the order the GXML's <LOD> list
+    names them."""
+    tag, riff_size, form = struct.unpack_from("<4sI4s", data, container_off)
+    if tag != b"RIFF" or form != b"GLTF":
+        return None, "", []
+    subpos = container_off + 12
+    container_end = min(container_off + 8 + riff_size, len(data))
+    name, xml, lods = None, "", []
     while subpos + 8 <= container_end:
         cc, csz = struct.unpack_from("<4sI", data, subpos)
         cdata_start = subpos + 8
-
+        body = data[cdata_start:cdata_start + csz]
         if cc == b"GXML":
-            xml = data[cdata_start:cdata_start + csz].decode("utf-8", errors="ignore")
+            xml = body.decode("utf-8", errors="ignore")
             m_name = re.search(r'name="([^"]*)"', xml)
             name = m_name.group(1) if m_name else None
         elif cc == b"GLBD":
-            if cdata_start + 4 <= container_end:
-                magic_check = data[cdata_start:cdata_start + 4]
-                if magic_check == b"GLB\x00":
-                    _ncc, ncsz = struct.unpack_from("<4sI", data, cdata_start)
-                    glb_bytes = data[cdata_start + 8:cdata_start + 8 + ncsz]
-                else:
-                    glb_bytes = data[cdata_start:cdata_start + csz]
-
+            if body[:4] == GLB_MAGIC:
+                lods.append((b"GLB\x00", body))  # a bare GLB: one level
+            else:
+                pos = 0
+                while pos + 8 <= len(body):
+                    lcc, lsz = struct.unpack_from("<4sI", body, pos)
+                    lods.append((lcc, body[pos + 8:pos + 8 + lsz]))
+                    pos += 8 + lsz + (lsz & 1)
         subpos += 8 + csz
-        if csz % 2 == 1: subpos += 1
+        if csz % 2 == 1:
+            subpos += 1
+    return name, xml, lods
 
-    return name, glb_bytes
+
+def extract_riff_model(data: bytes, container_off: int, container_size: int):
+    """(name, GLB bytes of the most detailed level) -- see
+    extract_riff_model_lods for every level."""
+    name, _xml, lods = extract_riff_model_lods(data, container_off, container_size)
+    glb = _decode_lod_chunk(*lods[0]) if lods else None
+    return name, glb
+
+
+# --- level-of-detail choice ----------------------------------------------------
+# MSFS models carry several levels of detail; LOD0 of a landmark can run to
+# millions of triangles and a single person to ~50,000. Every placed object's
+# geometry stays in video memory in X-Plane, so each model is converted at
+# the most detailed level that fits a triangle budget scaled to its size: a
+# ~1 m person gets ~8,000, the budget grows as radius^1.5 up to the cap, and
+# models of 50 m+ keep their full budget.
+
+MAX_MODEL_TRIANGLES = 500_000
+_MIN_MODEL_TRIANGLES = 3_000
+# A level MSFS only draws far away (minSize 0) keeping less than this share
+# of LOD0's triangles is never stepped into, whatever the budget.
+_FAR_ONLY_MIN_SHARE = 0.05
+
+
+def _glb_json(glb):
+    if len(glb) < 20 or glb[:4] != GLB_MAGIC:
+        return None
+    length, ctype = struct.unpack_from("<I4s", glb, 12)
+    if ctype != b"JSON":
+        return None
+    try:
+        return json.loads(glb[20:20 + length].decode("utf-8", errors="replace"))
+    except ValueError:
+        return None
+
+
+def _mat_mul(a, b):
+    return [[sum(a[i][k] * b[k][j] for k in range(4)) for j in range(4)] for i in range(4)]
+
+
+def _node_matrix(node):
+    m = node.get("matrix")
+    if m and len(m) == 16:
+        return [[m[c * 4 + r] for c in range(4)] for r in range(4)]
+    tx, ty, tz = (node.get("translation") or [0, 0, 0])[:3]
+    x, y, z, w = (node.get("rotation") or [0, 0, 0, 1])[:4]
+    sx, sy, sz = (node.get("scale") or [1, 1, 1])[:3]
+    r = [[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+         [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+         [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]]
+    return [[r[0][0] * sx, r[0][1] * sy, r[0][2] * sz, tx],
+            [r[1][0] * sx, r[1][1] * sy, r[1][2] * sz, ty],
+            [r[2][0] * sx, r[2][1] * sy, r[2][2] * sz, tz],
+            [0, 0, 0, 1]]
+
+
+def glb_lod_stats(glb):
+    """(triangles, radius_m, textured material keys, untextured material
+    keys) of a GLB, from its JSON alone: index counts per primitive times
+    the nodes instancing each mesh, and the bounding box of every mesh's
+    POSITION min/max carried through its node's world transform."""
+    js = _glb_json(glb)
+    if js is None:
+        return None
+    accessors = js.get("accessors", [])
+    meshes = js.get("meshes", [])
+    nodes = js.get("nodes", [])
+
+    def mat_key(name):
+        return "".join(c for c in (name or "").lower() if c.isalnum())
+
+    textured, untextured = set(), set()
+    for m in js.get("materials", []):
+        pbr = m.get("pbrMetallicRoughness") or {}
+        (textured if "baseColorTexture" in pbr else untextured).add(mat_key(m.get("name")))
+
+    mesh_tris = []
+    for mesh in meshes:
+        tris = 0
+        for prim in mesh.get("primitives", []):
+            if prim.get("mode", 4) != 4:
+                continue
+            acc_i = prim.get("indices", prim.get("attributes", {}).get("POSITION"))
+            if isinstance(acc_i, int) and acc_i < len(accessors):
+                tris += accessors[acc_i].get("count", 0) // 3
+        mesh_tris.append(tris)
+
+    total = 0
+    lo, hi = [math.inf] * 3, [-math.inf] * 3
+    roots = js.get("scenes", [{}])[js.get("scene", 0)].get("nodes") if js.get("scenes") else None
+    stack = [(i, None) for i in (roots if roots is not None else range(len(nodes)))]
+    seen = 0
+    while stack and seen < 100_000:
+        seen += 1
+        idx, parent = stack.pop()
+        if not isinstance(idx, int) or idx >= len(nodes):
+            continue
+        node = nodes[idx]
+        world = _node_matrix(node) if parent is None else _mat_mul(parent, _node_matrix(node))
+        mi = node.get("mesh")
+        if isinstance(mi, int) and mi < len(meshes):
+            total += mesh_tris[mi]
+            for prim in meshes[mi].get("primitives", []):
+                pos = prim.get("attributes", {}).get("POSITION")
+                acc = accessors[pos] if isinstance(pos, int) and pos < len(accessors) else {}
+                amin, amax = acc.get("min"), acc.get("max")
+                if not (amin and amax and len(amin) >= 3 and len(amax) >= 3):
+                    continue
+                for cx in (amin[0], amax[0]):
+                    for cy in (amin[1], amax[1]):
+                        for cz in (amin[2], amax[2]):
+                            p = [world[r][0] * cx + world[r][1] * cy + world[r][2] * cz + world[r][3] for r in range(3)]
+                            for k in range(3):
+                                lo[k], hi[k] = min(lo[k], p[k]), max(hi[k], p[k])
+        for c in node.get("children", []):
+            stack.append((c, world))
+    radius = math.dist(lo, hi) / 2.0 if lo[0] != math.inf else 1.0
+    return total, radius, textured, untextured
+
+
+def triangle_budget(radius, max_triangles=MAX_MODEL_TRIANGLES):
+    return int(max(min(_MIN_MODEL_TRIANGLES, max_triangles),
+                   min(max_triangles, 8000.0 * max(radius, 0.1) ** 1.5)))
+
+
+def _lod_min_sizes(xml):
+    out = []
+    for m in re.finditer(r"<LOD\b([^>]*)>", xml or "", re.IGNORECASE):
+        ms = re.search(r'minSize="([^"]*)"', m.group(1), re.IGNORECASE)
+        try:
+            out.append(float(ms.group(1)) if ms else None)
+        except ValueError:
+            out.append(None)
+    return out
+
+
+def choose_lod(lods, xml="", name=None, max_triangles=MAX_MODEL_TRIANGLES):
+    """(GLB bytes, level index) of the level to convert: step down from
+    LOD0 while it's over its budget, but never into a level that loses
+    LOD0's textures (some packs' coarse levels are untextured
+    placeholders) nor into a far-only level keeping almost none of the
+    detail. Terminal interiors and clutter, seen only through glass, get a
+    quarter of the budget."""
+    first = _decode_lod_chunk(*lods[0]) if lods else None
+    if first is None:
+        return None, 0
+    stats = glb_lod_stats(first)
+    if stats is None or len(lods) == 1:
+        return first, 0
+    tris0, radius, textured0, _ = stats
+    lname = (name or "").lower()
+    if "interior" in lname or "clutter" in lname:
+        max_triangles //= 4
+    budget = triangle_budget(radius, max_triangles)
+    min_sizes = _lod_min_sizes(xml)
+    chosen, level, tris = first, 0, tris0
+    while tris > budget and level + 1 < len(lods):
+        nxt = _decode_lod_chunk(*lods[level + 1])
+        nstats = glb_lod_stats(nxt) if nxt else None
+        if nstats is None:
+            break
+        ntris, _r, _t, nuntextured = nstats
+        if nuntextured & textured0:
+            break
+        last = level + 1 == len(lods) - 1
+        known = len(min_sizes) == len(lods) and all(s is not None for s in min_sizes)
+        far_only = (min_sizes[level + 1] is not None and min_sizes[level + 1] <= 0) if known else last
+        if far_only and ntris < tris0 * _FAR_ONLY_MIN_SHARE:
+            break
+        chosen, level, tris = nxt, level + 1, ntris
+    return chosen, level
+
 
 def _decompress_and_write_riff_model(data: bytes, container_off: int, container_size: int, guid: bytes, out_dir: Path):
     """Shared by extract_models_from_modeldata (a scenery package's own
@@ -788,27 +979,13 @@ def _decompress_and_write_riff_model(data: bytes, container_off: int, container_
     format regardless of which .bgl the container came from. Returns
     (guid_hex, file_stem, name, out_path) or None if this container
     isn't a usable GLB/GLBZ model."""
-    name, glb_bytes = extract_riff_model(data, container_off, container_size)
+    name, xml, lods = extract_riff_model_lods(data, container_off, container_size)
+    glb_bytes, _level = choose_lod(lods, xml, name)
     if not glb_bytes:
         return None
 
     guid_hex = guid.hex().lower()
     guid_display = format_guid(guid)
-    magic = glb_bytes[:4]
-
-    if magic == GLB_MAGIC:
-        pass
-    elif magic == b"GLBZ":
-        if zstd is None:
-            return None
-        try:
-            decomp_size = struct.unpack_from("<I", glb_bytes, 8)[0]
-            dctx = zstd.ZstdDecompressor()
-            glb_bytes = dctx.decompress(glb_bytes[12:], max_output_size=decomp_size)
-        except Exception:
-            return None
-    else:
-        return None
 
     base = re.sub(r'[^A-Za-z0-9_-]+', '_', name) if name else guid_display.replace('-', '')
     # Full 32-hex-char GUID, not just its first dash-delimited segment (8
