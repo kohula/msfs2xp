@@ -4,11 +4,12 @@ Every caller imports these functions instead of re-deriving the rotation.
 
 Convention (matches OBJ8/MSFS and every placement record this project
 reads): heading is degrees clockwise from north; local +X = east and
-local -Z = forward/north at heading 0. Real-world coordinates use the
-flat-earth approximation (111139.0 m/degree latitude, longitude scaled by
-cos(latitude)) that's accurate enough at airport-footprint scale (a few
-km at most) -- the same approximation the whole rest of this project's
-placement/DSF-tile math already relies on.
+local -Z = forward/north at heading 0. Metres <-> degrees use the WGS84
+local scale at the base latitude (metres_per_degree), the same scale
+X-Plane itself and draped_merge use. The old flat 111139 m/degree
+constant was 0.3-0.4% off east-west at European latitudes -- ~1.8 m at a
+500 m offset -- which put recentered models and SimProp children visibly
+off the draped ground merged with WGS84.
 """
 
 import math
@@ -61,8 +62,9 @@ def local_offset_to_latlon(base_lat: float, base_lon: float, heading_deg: float,
     """Real-world (lat, lon) of a point local_x/local_z meters from
     (base_lat, base_lon), in heading-rotated local space."""
     rot_x, rot_z = rotate_xz(local_x, local_z, heading_deg)
-    lat = base_lat - (rot_z / EARTH_M_PER_DEG)
-    lon = base_lon + (rot_x / (EARTH_M_PER_DEG * math.cos(math.radians(base_lat))))
+    m_lat, m_lon = metres_per_degree(base_lat)
+    lat = base_lat - (rot_z / m_lat)
+    lon = base_lon + (rot_x / m_lon)
     return lat, lon
 
 
@@ -73,8 +75,9 @@ def latlon_offset_to_local(base_lat: float, base_lon: float, heading_deg: float,
     by heading_deg."""
     dlat = point_lat - base_lat
     dlon = point_lon - base_lon
-    rot_z = -dlat * EARTH_M_PER_DEG
-    rot_x = dlon * EARTH_M_PER_DEG * math.cos(math.radians(base_lat))
+    m_lat, m_lon = metres_per_degree(base_lat)
+    rot_z = -dlat * m_lat
+    rot_x = dlon * m_lon
     if heading_deg == 0.0:
         return rot_x, rot_z
     return rotate_xz(rot_x, rot_z, -heading_deg)

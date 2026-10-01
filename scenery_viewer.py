@@ -276,13 +276,8 @@ def parse_obj8(path: Path):
 
 
 def _local_xz_to_latlon(lat0, lon0, heading_deg, x, z):
-    import math
-    hdg = math.radians(heading_deg)
-    rx = x * math.cos(hdg) - z * math.sin(hdg)
-    rz = x * math.sin(hdg) + z * math.cos(hdg)
-    lat = lat0 - (rz / 111139.0)
-    lon = lon0 + (rx / (111139.0 * math.cos(math.radians(lat0))))
-    return lat, lon
+    import geo_transform
+    return geo_transform.local_offset_to_latlon(lat0, lon0, heading_deg, x, z)
 
 
 def build_scene(pack_dir: Path):

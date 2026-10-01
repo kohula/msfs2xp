@@ -19,8 +19,9 @@ _GPU_DIR = Path(__file__).resolve().parent.parent.parent / "msfs2xp_v0813_2" / "
 class TestGeoTransform(unittest.TestCase):
     def test_heading_zero_matches_hand_derivation(self):
         lat, lon = geo_transform.local_offset_to_latlon(47.5, 8.5, 0.0, 100.0, -50.0)
-        expected_lat = 47.5 - (-50.0 / geo_transform.EARTH_M_PER_DEG)
-        expected_lon = 8.5 + (100.0 / (geo_transform.EARTH_M_PER_DEG * math.cos(math.radians(47.5))))
+        m_lat, m_lon = geo_transform.metres_per_degree(47.5)
+        expected_lat = 47.5 - (-50.0 / m_lat)
+        expected_lon = 8.5 + (100.0 / m_lon)
         self.assertAlmostEqual(lat, expected_lat, places=12)
         self.assertAlmostEqual(lon, expected_lon, places=12)
 

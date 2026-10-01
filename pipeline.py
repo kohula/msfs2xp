@@ -326,8 +326,8 @@ def _built_up_exclusion_rects(lats, lons, cell_m=200.0, dilate=1, min_points=5, 
     arr = np.asarray(pts, dtype=np.float64)
     lat0, lon0 = float(arr[:, 0].min()), float(arr[:, 1].min())
     ref_lat = float(arr[:, 0].mean())
-    m_per_deg_lat = 111320.0
-    m_per_deg_lon = 111320.0 * max(math.cos(math.radians(ref_lat)), 1e-6)
+    m_per_deg_lat, m_per_deg_lon = geo_transform.metres_per_degree(ref_lat)
+    m_per_deg_lon = max(m_per_deg_lon, 1e-6)
 
     chosen = None
     for _cell in (cell_m, cell_m * 2, cell_m * 4, cell_m * 8, cell_m * 16):
@@ -408,8 +408,8 @@ def _polygon_interior_exclusion_rects(boundary_points, cell_m=100.0, max_rects=8
     lats, lons = arr[:, 0], arr[:, 1]
     lat0, lon0 = float(lats.min()), float(lons.min())
     ref_lat = float(lats.mean())
-    m_per_deg_lat = 111320.0
-    m_per_deg_lon = 111320.0 * max(math.cos(math.radians(ref_lat)), 1e-6)
+    m_per_deg_lat, m_per_deg_lon = geo_transform.metres_per_degree(ref_lat)
+    m_per_deg_lon = max(m_per_deg_lon, 1e-6)
 
     poly_x = (lons - lon0) * m_per_deg_lon
     poly_y = (lats - lat0) * m_per_deg_lat
