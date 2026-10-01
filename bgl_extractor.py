@@ -2593,11 +2593,11 @@ def extract(target_path: Path, out_dir: Path, log_callback=None, msfs_install_ro
 
         if attached:
             named = [s["name"] for s in attached if s["name"]]
-            type_name = SCENERY_OBJECT_TYPE_NAMES
             _log(f"      {len(attached)} AttachedObject(s) (beacons/effects/library "
-                 f"objects hung off a parent object) were NOT placed -- their position "
-                 f"is a bias relative to the parent, not an absolute coordinate, which "
-                 f"this script does not yet resolve.", "warning")
+                 f"objects hung off a parent object) found -- their position is a bias "
+                 f"relative to the parent that isn't decoded, so the ones whose model "
+                 f"resolves are placed AT their parent (approximate); the rest are left out.",
+                 "warning")
             for name in named[:25]:
                 _log(f"        - {name}", "info")
             if len(named) > 25:
@@ -2608,10 +2608,10 @@ def extract(target_path: Path, out_dir: Path, log_callback=None, msfs_install_ro
 
         if signs:
             total_signs = sum(s["num_signs"] or 0 for s in signs)
-            _log(f"      {len(signs)} TaxiwaySign record(s) ({total_signs} individual "
-                 f"sign(s) total) were NOT placed -- they're a per-airport array of "
-                 f"label + offset-from-anchor entries with no model/GUID, not a single "
-                 f"placement.", "info")
+            _log(f"      {len(signs)} legacy TaxiwaySign scenery record(s) ({total_signs} "
+                 f"individual sign(s) total) were not placed -- a per-airport array of "
+                 f"label + offset entries with no model. (MSFS airport-record signs are "
+                 f"written to apt.dat as taxiway signs.)", "info")
 
     # ASOBO/stock-library objects: some placements reference a GUID never
     # defined anywhere in this package's own BGLs -- one of MSFS's own
