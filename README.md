@@ -91,8 +91,9 @@ exe.bat
 
 which produces `dist/MSFS2XP.exe` (see that script's own comments for
 what it bundles and why). On Linux, `packaging/build_appimage.sh` builds
-`dist/MSFS2XP-x86_64.AppImage`. Pushing a `v*` tag builds both on GitHub
-Actions and publishes them as a release (`.github/workflows/release.yml`).
+`dist/MSFS2XP-x86_64.AppImage`. Pushing a `v*` tag -- or changing the version in
+`packaging/VERSION` -- builds both on GitHub Actions and publishes them as
+a release (`.github/workflows/release.yml`).
 
 The cache, scratch space and settings live next to the program -- next to
 the `.exe`, or next to the `.AppImage` file (the AppImage itself is

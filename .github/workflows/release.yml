@@ -1,11 +1,17 @@
 # Builds the Windows .exe and the Linux AppImage and publishes them as a
-# GitHub release. Runs when a version tag (v*) is pushed, or by hand from
-# the Actions tab for an existing tag.
+# GitHub release. Starts when:
+#   - a version tag (v*) is pushed, or
+#   - packaging/VERSION changes on any branch (the release is then tagged
+#     v<VERSION> at that commit; skipped if that release already exists, so
+#     merging the change elsewhere doesn't publish it twice), or
+#   - by hand from the Actions tab, for an existing tag.
 name: Release
 
 on:
   push:
     tags: ["v*"]
+    branches: ["**"]
+    paths: ["packaging/VERSION"]
   workflow_dispatch:
     inputs:
       tag:
@@ -15,16 +21,47 @@ on:
 permissions:
   contents: write
 
-env:
-  TAG: ${{ github.event.inputs.tag || github.ref_name }}
-
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      ref: ${{ steps.v.outputs.ref }}
+      skip: ${{ steps.v.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.sha }}
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"; ref="$INPUT_TAG"
+          elif [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            tag="$GITHUB_REF_NAME"; ref="$GITHUB_SHA"
+          else
+            tag="v$(tr -d '[:space:]' < packaging/VERSION)"; ref="$GITHUB_SHA"
+          fi
+          skip=false
+          if [ "$GITHUB_REF_TYPE" = "branch" ] && [ -z "$INPUT_TAG" ] \
+             && gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            skip=true
+            echo "Release $tag already exists -- nothing to do."
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+
   test:
+    needs: version
+    if: needs.version.outputs.skip != 'true'
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ env.TAG }}
+          ref: ${{ needs.version.outputs.ref }}
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -35,12 +72,12 @@ jobs:
         run: .venv/bin/python tests/run_tests.py
 
   windows:
-    needs: test
+    needs: [version, test]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ env.TAG }}
+          ref: ${{ needs.version.outputs.ref }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -55,14 +92,14 @@ jobs:
           path: dist/MSFS2XP.exe
 
   linux:
-    needs: test
+    needs: [version, test]
     # The AppImage runs on systems with at least the build machine's glibc,
     # so it's built on the oldest supported runner.
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ env.TAG }}
+          ref: ${{ needs.version.outputs.ref }}
           fetch-depth: 0
       - name: Build MSFS2XP-x86_64.AppImage
         run: |
@@ -70,26 +107,27 @@ jobs:
           sudo apt-get install -y python3-tk python3-venv
           python3 -m venv .venv
           .venv/bin/pip install -r requirements.txt pyinstaller
-          VERSION="$TAG" PYTHON=.venv/bin/python packaging/build_appimage.sh
+          VERSION="${{ needs.version.outputs.tag }}" PYTHON=.venv/bin/python packaging/build_appimage.sh
       - uses: actions/upload-artifact@v4
         with:
           name: linux
           path: dist/MSFS2XP-x86_64.AppImage
 
   publish:
-    needs: [windows, linux]
+    needs: [version, windows, linux]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ env.TAG }}
+          ref: ${{ needs.version.outputs.ref }}
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.TAG }}
-          name: ${{ env.TAG }}
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: ${{ needs.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           body_path: packaging/RELEASE_NOTES.md
           files: |
             artifacts/windows/MSFS2XP.exe
