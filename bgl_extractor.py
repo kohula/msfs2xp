@@ -1282,11 +1282,10 @@ def _resolve_propdefs_dir(explicit, spb2xml_dir, _log):
                     return cand
             except OSError:
                 continue
-    _log("      [SPB] No Propdefs folder configured or found -- SimPropContainer-based "
-         "placements (many apron lights/lamps, jetways, animated doors, building "
-         "interiors) can't be decoded without it. These are Microsoft/Asobo's own MSFS "
-         "SDK data files, not shipped with this tool -- point Settings -> \"Propdefs "
-         "folder (optional)\" at your own MSFS install/SDK's Propdefs folder.", "warning")
+    _log("      [SPB] No Propdefs folder configured or found -- reading SimPropContainers from "
+         "their own property tables instead (spb_native). Children referenced only by title "
+         "need the MSFS SDK Propdefs: point Settings -> \"Propdefs folder (optional)\" at your "
+         "own copy to resolve those too.", "info")
     return None
 
 
@@ -1352,10 +1351,91 @@ def _dedupe_near_identical_anchors(anchors):
     return kept
 
 
+def _spb_children_from_xml(root, name_map):
+    """Children of a decompiled (spb2xml) container: [(model guid hex,
+    (x, y, z), (pitch, roll, hdg), scale, title)]."""
+    import uuid
+    out = []
+    for attach in root.findall(".//SimPropAttach"):
+        offset_node = attach.find(".//OffsetXYZ")
+        guid_node = attach.find(".//WorldBase.MDLGuid")
+        hdg_node = attach.find(".//Orientation")
+
+        # offset_node is legitimately allowed to be missing: MSFS's binary
+        # .spb format omits a property entirely when it equals its default,
+        # and OffsetXYZ defaults to (0,0,0) -- a model glued directly to
+        # its parent (common) has WorldBase.MDLGuid but no OffsetXYZ
+        # element. Only WorldBase.MDLGuid is actually required.
+        attach_guid_hex = None
+        if guid_node is not None and guid_node.text:
+            try:
+                attach_guid_hex = uuid.UUID(guid_node.text.strip("{}")).bytes_le.hex().lower()
+            except Exception:
+                attach_guid_hex = None
+        else:
+            # A second, fairly common attach shape has no WorldBase.MDLGuid
+            # at all, instead a SimContain.Container/WorldBase.ContainerTitle
+            # referencing another SimObject by title. Resolved the same way
+            # regular title-based SceneryObject placements are resolved
+            # elsewhere in this module: scan name_map (keyed by GUID, valued
+            # by title) for a case-insensitive title match.
+            title_node = attach.find(".//WorldBase.ContainerTitle")
+            if title_node is not None and title_node.text:
+                title = title_node.text.strip()
+                for g, nm in name_map.items():
+                    if nm.lower() == title.lower():
+                        attach_guid_hex = g
+                        break
+        if not attach_guid_hex:
+            continue
+        try:
+            if offset_node is not None and offset_node.text:
+                parts = offset_node.text.split(",")
+                xyz = (float(parts[0]), float(parts[1]), float(parts[2]))
+            else:
+                xyz = (0.0, 0.0, 0.0)
+            pbh = (0.0, 0.0, 0.0)
+            if hdg_node is not None and hdg_node.text:
+                h_parts = hdg_node.text.split(",")
+                if len(h_parts) >= 3:
+                    pbh = (float(h_parts[0]), float(h_parts[1]), float(h_parts[2]))
+        except ValueError:
+            continue
+        child_scale = 1.0
+        for node in attach.iter():
+            if node.tag.endswith("Scale") and "UV" not in node.tag and node.text:
+                try:
+                    child_scale = float(node.text.split(",")[0])
+                except ValueError:
+                    pass
+                break
+        out.append((attach_guid_hex, xyz, pbh, child_scale, attach.get("DisplayName")))
+    return out
+
+
+_SPB_INDEX_CACHE = {}
+
+
+def _spb_container_guid_by_path(spb_path):
+    """Container GUID (hex of on-disk bytes) of an .spb, from its package's
+    simPropContainers.json. The package root is the nearest folder above
+    the file holding a manifest.json (else the file's grandparent)."""
+    import spb_native
+    spb_path = Path(spb_path).resolve()
+    root = next((d for d in list(spb_path.parents)[:6] if (d / "manifest.json").is_file()), None)
+    if root is None:
+        root = spb_path.parent.parent
+    key = str(root)
+    if key not in _SPB_INDEX_CACHE:
+        _SPB_INDEX_CACHE[key] = {str(Path(v).resolve()): k for k, v in spb_native.container_index(root).items()}
+    return _SPB_INDEX_CACHE[key].get(str(spb_path))
+
+
 def extract_spb_placements(spb_path: Path, airport_lat: float, airport_lon: float, airport_alt: float, existing_placements: list, _log, name_map: dict = None, propdefs_dir: str = None, allow_fallback: bool = True):
     import sys
     import uuid
 
+    name_map = name_map or {}
     cwd = Path.cwd()
     spb2xml_dir = cwd / "spb2xml"
     if not spb2xml_dir.exists():
@@ -1364,42 +1444,44 @@ def extract_spb_placements(spb_path: Path, airport_lat: float, airport_lon: floa
     if spb2xml_dir.exists() and str(spb2xml_dir) not in sys.path:
         sys.path.insert(0, str(spb2xml_dir))
 
-    try:
-        from decompiler import Decompiler
-        from propdefs import load_propdefs
-    except ImportError:
-        _log(f"      [SPB] Could not import 'decompiler' from {spb2xml_dir}. Ensure spb2xml is present.", "warning")
-        return []
-
     propdefs_dir = _resolve_propdefs_dir(propdefs_dir, spb2xml_dir, _log)
-    if propdefs_dir is None:
-        return []
-
-    try:
-        # load_propdefs re-parses every property-definition XML under
-        # propdefs_dir from scratch each call, and this function runs
-        # once per .spb file -- cached by directory path since they're
-        # identical for the whole lifetime of this process.
-        cache_key = str(propdefs_dir)
-        bank = _PROPDEFS_CACHE.get(cache_key)
-        if bank is None:
-            bank = load_propdefs(cache_key)
-            _PROPDEFS_CACHE[cache_key] = bank
-        dec = Decompiler(str(spb_path), bank)
-        root = dec.decompile()
-    except Exception as e:
-        _log(f"      [SPB] Failed to parse {spb_path.name}: {e}", "error")
-        return []
-        
     container_guid_hex = None
-    container_guid_node = root.find(".//SimBase.GUID")
-    
-    if container_guid_node is not None and container_guid_node.text:
+    if propdefs_dir is not None:
         try:
-            raw_guid = container_guid_node.text.strip("{}")
-            container_guid_hex = uuid.UUID(raw_guid).bytes_le.hex().lower()
-        except Exception:
-            pass
+            from decompiler import Decompiler
+            from propdefs import load_propdefs
+            # load_propdefs re-parses every property-definition XML under
+            # propdefs_dir from scratch each call, and this function runs
+            # once per .spb file -- cached by directory path since they're
+            # identical for the whole lifetime of this process.
+            cache_key = str(propdefs_dir)
+            bank = _PROPDEFS_CACHE.get(cache_key)
+            if bank is None:
+                bank = load_propdefs(cache_key)
+                _PROPDEFS_CACHE[cache_key] = bank
+            root = Decompiler(str(spb_path), bank).decompile()
+        except Exception as e:
+            _log(f"      [SPB] Failed to parse {spb_path.name}: {e}", "error")
+            return []
+        container_guid_node = root.find(".//SimBase.GUID")
+        if container_guid_node is not None and container_guid_node.text:
+            try:
+                container_guid_hex = uuid.UUID(container_guid_node.text.strip("{}")).bytes_le.hex().lower()
+            except Exception:
+                pass
+        children = _spb_children_from_xml(root, name_map)
+    else:
+        # No Propdefs: read the file's own property table (spb_native) and
+        # identify the container from simPropContainers.json.
+        import spb_native
+        try:
+            parsed = spb_native.parse_container(Path(spb_path).read_bytes())
+        except (OSError, ValueError) as e:
+            _log(f"      [SPB] Failed to parse {spb_path.name}: {e}", "error")
+            return []
+        container_guid_hex = _spb_container_guid_by_path(spb_path)
+        children = [(c["guid"], c["offset"], (c["pitch"] % 360.0, c["bank"] % 360.0, c["heading"]),
+                     c["scale"], None) for c in parsed]
 
     # A SimPropContainer's GUID is placed once per real-world instance in
     # the scenery BGL (an apron light/lamp fixture can repeat 50+ times).
@@ -1437,9 +1519,6 @@ def extract_spb_placements(spb_path: Path, airport_lat: float, airport_lon: floa
                     "pitch": 0.0, "roll": 0.0, "hdg": 0.0, "is_agl": True}]
 
     found = []
-    name_map = name_map or {}
-    _attaches = root.findall(".//SimPropAttach")
-
     for _anchor in anchors:
       anchor_lat = _anchor["lat"]
       anchor_lon = _anchor["lon"]
@@ -1449,107 +1528,49 @@ def extract_spb_placements(spb_path: Path, airport_lat: float, airport_lon: floa
       anchor_hdg = _anchor.get("hdg", 0.0)
       anchor_is_agl = _anchor.get("is_agl", True)
       anchor_scale = float(_anchor.get("scale", 1.0) or 1.0)
-      for attach in _attaches:
-        offset_node = attach.find(".//OffsetXYZ")
-        guid_node = attach.find(".//WorldBase.MDLGuid")
-        hdg_node = attach.find(".//Orientation")
-
-        # offset_node is legitimately allowed to be missing: MSFS's binary
-        # .spb format omits a property entirely when it equals its default,
-        # and OffsetXYZ defaults to (0,0,0) -- a model glued directly to
-        # its parent (common) has WorldBase.MDLGuid but no OffsetXYZ
-        # element. Only WorldBase.MDLGuid is actually required.
-        attach_guid_hex = None
-        if guid_node is not None and guid_node.text:
-            try:
-                attach_guid_str = guid_node.text.strip("{}")
-                attach_guid_hex = uuid.UUID(attach_guid_str).bytes_le.hex().lower()
-            except Exception:
-                attach_guid_hex = None
-        else:
-            # A second, fairly common attach shape has no WorldBase.MDLGuid
-            # at all, instead a SimContain.Container/WorldBase.ContainerTitle
-            # referencing another SimObject by title. Resolved the same way
-            # regular title-based SceneryObject placements are resolved
-            # elsewhere in this module: scan name_map (keyed by GUID, valued
-            # by title) for a case-insensitive title match.
-            title_node = attach.find(".//WorldBase.ContainerTitle")
-            if title_node is not None and title_node.text:
-                title = title_node.text.strip()
-                for g, nm in name_map.items():
-                    if nm.lower() == title.lower():
-                        attach_guid_hex = g
-                        break
-
-        if attach_guid_hex:
-            try:
-                if offset_node is not None and offset_node.text:
-                    parts = offset_node.text.split(",")
-                    x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
-                else:
-                    x, y, z = 0.0, 0.0, 0.0
-
-                # A scaled container scales its children's offsets and
-                # sizes with it.
-                x, y, z = x * anchor_scale, y * anchor_scale, z * anchor_scale
-                lat, lon, dy = resolve_attach_offset(x, y, z, anchor_lat, anchor_lon,
-                                                      anchor_pitch, anchor_roll, anchor_hdg)
-                alt = anchor_alt + dy
-                # height_offset must be "alt" (anchor_alt + dy), not dy
-                # alone: dy is only the offset from the parent
-                # SimPropContainer's own contact point, and silently
-                # drops anchor_alt (the parent's own height above real
-                # terrain contact) when the container is itself elevated
-                # -- desyncing this object from anything else placed at
-                # the same real-world point via a different path. X-Plane's
-                # DSF OBJECT point pool has no vertical/AGL field of its
-                # own, so this full accumulated alt is what has to be
-                # baked into the exported .obj geometry downstream.
-
-                c_pitch, c_roll, c_hdg = 0.0, 0.0, 0.0
-                if hdg_node is not None and hdg_node.text:
-                    h_parts = hdg_node.text.split(",")
-                    if len(h_parts) >= 3:
-                        c_pitch, c_roll, c_hdg = float(h_parts[0]), float(h_parts[1]), float(h_parts[2])
-                
+      for attach_guid_hex, (x, y, z), (c_pitch, c_roll, c_hdg), child_scale, title in children:
+        try:
+            # A scaled container scales its children's offsets and
+            # sizes with it.
+            x, y, z = x * anchor_scale, y * anchor_scale, z * anchor_scale
+            lat, lon, dy = resolve_attach_offset(x, y, z, anchor_lat, anchor_lon,
+                                                  anchor_pitch, anchor_roll, anchor_hdg)
+            # height_offset must be "alt" (anchor_alt + dy), not dy
+            # alone: dy is only the offset from the parent
+            # SimPropContainer's own contact point, and silently
+            # drops anchor_alt (the parent's own height above real
+            # terrain contact) when the container is itself elevated
+            # -- desyncing this object from anything else placed at
+            # the same real-world point via a different path. X-Plane's
+            # DSF OBJECT point pool has no vertical/AGL field of its
+            # own, so this full accumulated alt is what has to be
+            # baked into the exported .obj geometry downstream.
+            alt = anchor_alt + dy
+            if not (0.001 < child_scale < 1000.0):
                 child_scale = 1.0
-                for node in attach.iter():
-                    if node.tag.endswith("Scale") and "UV" not in node.tag and node.text:
-                        try:
-                            child_scale = float(node.text.split(",")[0])
-                        except ValueError:
-                            pass
-                        break
-                if not (0.001 < child_scale < 1000.0):
-                    child_scale = 1.0
-
-                final_pitch = (anchor_pitch + c_pitch) % 360.0
-                final_roll = (anchor_roll + c_roll) % 360.0
-                final_hdg = (anchor_hdg + c_hdg) % 360.0
-                        
-                found.append({
-                    "guid": attach_guid_hex,
-                    "title": attach.get("DisplayName"),
-                    "livery": None,
-                    "lat": lat,
-                    "lon": lon,
-                    "alt": alt,
-                    "height_offset": alt,
-                    "pitch": final_pitch,
-                    "roll": final_roll,
-                    "hdg": final_hdg,
-                    "scale": anchor_scale * child_scale,
-                    "is_agl": anchor_is_agl,
-                    "qmid1": 0,
-                    "qmid2": 0,
-                    # the wrapping SimPropContainer's GUID -- lets extract()
-                    # drop the now-redundant raw container placements so
-                    # they don't get re-reported as unresolved
-                    "container_guid": container_guid_hex,
-                    "source": f"SPB-SimPropContainer{' (Fallback)' if used_fallback else ''}"
-                })
-            except Exception as e:
-                _log(f"      [SPB] Error parsing offsets in {spb_path.name}: {e}", "warning")
+            found.append({
+                "guid": attach_guid_hex,
+                "title": title,
+                "livery": None,
+                "lat": lat,
+                "lon": lon,
+                "alt": alt,
+                "height_offset": alt,
+                "pitch": (anchor_pitch + c_pitch) % 360.0,
+                "roll": (anchor_roll + c_roll) % 360.0,
+                "hdg": (anchor_hdg + c_hdg) % 360.0,
+                "scale": anchor_scale * child_scale,
+                "is_agl": anchor_is_agl,
+                "qmid1": 0,
+                "qmid2": 0,
+                # the wrapping SimPropContainer's GUID -- lets extract()
+                # drop the now-redundant raw container placements so
+                # they don't get re-reported as unresolved
+                "container_guid": container_guid_hex,
+                "source": f"SPB-SimPropContainer{' (Fallback)' if used_fallback else ''}"
+            })
+        except Exception as e:
+            _log(f"      [SPB] Error parsing offsets in {spb_path.name}: {e}", "warning")
 
     if not found:
         _log(f"      [SPB] No valid attached models found inside {spb_path.name}.", "warning")
