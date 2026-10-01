@@ -1,5 +1,5 @@
 """
-apt.dat generation.
+apt.dat helpers around X-Plane's own Global Airports data.
 
 X-Plane resolves duplicate ICAOs across scenery packs by taking the whole
 airport block from the single highest-priority pack, never merging fields
@@ -7,24 +7,13 @@ from two packs -- so a custom apt.dat must be a *complete* airport
 (runways, taxiways, ATC flow, ramps) or it silently loses whatever it
 omitted once it outranks the default.
 
-Base layer: the real-world airport's block from the user's installed
-X-Plane "Global Airports" pack, found by nearest-reference-point match
-(more robust than decoding an ICAO string out of the BGL).
-
-On top of that, `reposition_runways`, `replace_pavement_with_native` and
-`replace_taxi_network_and_starts` overlay a NATIVE layout decoded from
-the MSFS package's own BGL Airport record (see airport_layout.py) where
-available: runway positions shifted onto this package's coordinates,
-pavement/apron boundary rows replaced outright (so X-Plane's runtime
-terrain-flattening matches where the native layout actually is, not the
-stock real-world survey position -- a custom-rebuilt payware airport can
-legitimately differ from that by more than a trivial amount), and the
-ATC taxi-route network + ramp starts replaced with ones built from this
-airport's own taxiways/aprons.
-Painted-line/lighting rows stay on the stock block -- this project's
-draped-mesh pipeline already renders the real baked pavement art and
-painted markings, and there's no native replacement yet for the stock
-lighting fields.
+The airport itself is normally built from the package's own BGL airport
+record (apt_native.build_native_airport). This module supplies the
+matched stock block that build borrows from (ATC flows, metadata,
+beacon, ground-vehicle routes when MSFS has none), the airport boundary
+used for exclusion zones, and -- only when the package's airport record
+couldn't be decoded at all -- the fallback of writing the stock block
+with its visible pavement anonymized (write_apt_dat).
 """
 
 import math
@@ -478,185 +467,12 @@ def _dist_m(a, b):
     return math.hypot(dlat, dlon)
 
 
-def _runway_end_positions(parts):
-    return (float(parts[9]), float(parts[10])), (float(parts[18]), float(parts[19]))
-
-
-def reposition_runways(block_lines, native_runway_centers):
-    """Shift each stock row-100 runway's two endpoints by the delta between
-    its own stock-block center and the nearest natively-decoded MSFS
-    runway center (matched by proximity, each native center consumed at
-    most once), preserving every other field (width, surface, lighting,
-    markings, displaced thresholds) exactly. Deliberately NOT a full
-    native rebuild of row 100: the row's other ~20 fields have no
-    confirmed BGL decode (see airport_layout.py's docstring on what
-    wasn't decoded), and the stock block's real-world values for those are
-    a better bet than a guess. Position is the one thing confirmed wrong
-    today -- a custom-rebuilt package's runway can legitimately sit a few
-    meters from the real-world stock coordinates."""
-    if not native_runway_centers:
-        return block_lines
-
-    remaining = list(native_runway_centers)
-    out = []
-    for line in block_lines:
-        parts = line.split()
-        if parts[:1] == ["100"] and len(parts) >= 20 and remaining:
-            end1, end2 = _runway_end_positions(parts)
-            stock_center = ((end1[0] + end2[0]) / 2.0, (end1[1] + end2[1]) / 2.0)
-            nearest = min(remaining, key=lambda c: _dist_m(stock_center, c))
-            dlat, dlon = nearest[0] - stock_center[0], nearest[1] - stock_center[1]
-            remaining.remove(nearest)
-            parts[9] = f"{end1[0] + dlat:.8f}"
-            parts[10] = f"{end1[1] + dlon:.8f}"
-            parts[18] = f"{end2[0] + dlat:.8f}"
-            parts[19] = f"{end2[1] + dlon:.8f}"
-            out.append(" ".join(parts))
-            continue
-        out.append(line)
-    return out
-
-
-def replace_pavement_with_native(block_lines, layout):
-    """Strips the stock block's own pavement/apron boundary rows (110 +
-    its 111-116 node rows) and replaces them with ones built from this
-    package's own MSFS apron layout (airport_layout.py's native BGL
-    decode), so X-Plane's runtime terrain-flattening -- driven by these
-    boundary rows, not by the runway centerline alone -- matches where
-    this package's own converted draped-mesh pavement actually sits.
-
-    CONFIRMED REAL BUG this fixes: reposition_runways only shifts the
-    runway CENTERLINE (row 100) to the native position; the surrounding
-    pavement boundary was left at the stock block's own real-world
-    position. A custom-rebuilt payware airport's own layout can
-    legitimately differ from the real-world survey data by more than a
-    trivial amount, so X-Plane was flattening terrain around the OLD
-    (stock) boundary while this package's own MSFS-derived visual
-    pavement sits at the NEW (native) one -- reported in-sim as "the
-    runway is floating" (and per the user, "I don't want the native
-    X-Plane [pavement] ... however the MSFS texturized ones [should be
-    what's] exported").
-
-    Each native apron polygon becomes one row 110 (surface forced
-    transparent, matching anonymize_visual_pavement's own convention --
-    this package's own draped mesh is what should actually be visible,
-    same as the stock block's own pavement already gets anonymized to)
-    followed by one row 111 per vertex except the last, which closes the
-    loop as row 113. No curve/bezier data is available from the native
-    decode, so every edge is a straight segment (111/113 only, never
-    112/114). Runway (100), taxi network (1200s), ramp starts (1300s)
-    and painted-line (120) rows are untouched -- see reposition_runways/
-    replace_taxi_network_and_starts for those."""
-    if not layout.aprons:
-        return block_lines
-
-    out = []
-    i = 0
-    n = len(block_lines)
-    while i < n:
-        line = block_lines[i]
-        parts = line.split()
-        code = parts[0] if parts else ""
-        if code == "110":
-            j = i + 1
-            while j < n:
-                nxt_parts = block_lines[j].split()
-                if nxt_parts and nxt_parts[0] in _BOUNDARY_NODE_ROW_CODES:
-                    j += 1
-                    continue
-                break
-            i = j
-            continue
-        out.append(line)
-        i += 1
-
-    for poly in layout.aprons:
-        verts = poly.vertices
-        if len(verts) < 3:
-            continue
-        out.append(f"110 {_TRANSPARENT_SURFACE_CODE} 0.25 0.0")
-        for lat, lon in verts[:-1]:
-            out.append(f"111 {lat:.8f} {lon:.8f}")
-        last_lat, last_lon = verts[-1]
-        out.append(f"113 {last_lat:.8f} {last_lon:.8f}")
-
-    return out
-
-
-_TAXI_NETWORK_ROW_CODES = {"1200", "1201", "1202", "1204", "1206"}
-"""1206 ("<node1> <node2> <direction>", a truck/ground-vehicle-only taxi
-edge -- X-Plane's ground-service-vehicle AI routes over these separately
-from the aircraft 1202 network) references 1201 node IDs exactly like
-1202 does, so renumbering the 1201 nodes for a native layout leaves 1206
-rows dangling unless they're re-anchored too. No native BGL decode exists
-for truck-only edges, so they can't be rebuilt from scratch; instead
-they're RE-ANCHORED onto the new node numbering by nearest position (see
-_remap_truck_edges) rather than dropped, since dropping them silently
-disables ground-service-vehicle AI at this airport entirely."""
-_RAMP_START_ROW_CODES = {"1300", "1301", "1400", "1401"}
-
-_MAX_STAND_MATCH_M = 50.0
-"""Max distance to borrow a stock block's ramp-start heading/name for a
-native one -- generous enough for a custom-rebuilt stand to have moved a
-bit from the real-world stock position (matches reposition_runways'
-own tolerance-by-nearest-match philosophy), but tight enough not to
-borrow an unrelated stand's name/orientation from across the apron."""
-
-
-def _parse_stock_ramp_starts(block_lines):
-    """Row 1300: "1300 <lat> <lon> <heading> <type> <airplane_types>
-    <name>". Parsed here (before replace_taxi_network_and_starts strips
-    these rows) so a native ramp start with no confirmed heading/name of
-    its own (see that function's docstring) can borrow the closest real
-    stand's -- position is NOT borrowed; the native decode already gives
-    that directly, and more accurately, for this specific package."""
-    starts = []
-    for line in block_lines:
-        parts = line.split()
-        if parts[:1] != ["1300"] or len(parts) < 6:
-            continue
-        try:
-            lat, lon, hdg = float(parts[1]), float(parts[2]), float(parts[3])
-        except ValueError:
-            continue
-        name = " ".join(parts[6:])
-        starts.append((lat, lon, hdg, name))
-    return starts
-
-
-def _match_ramp_start_metadata(native_starts, stock_starts):
-    """Greedy nearest-match, each stock start consumed at most once (same
-    one-to-one philosophy as reposition_runways): for each native (lat,
-    lon), finds the closest not-yet-used stock 1300 row within
-    _MAX_STAND_MATCH_M and returns its (heading, name); (None, None) for
-    a native start with no close-enough stock match."""
-    available = list(range(len(stock_starts)))
-    results = []
-    for lat, lon in native_starts:
-        best_idx, best_dist = None, None
-        for idx in available:
-            s_lat, s_lon, _, _ = stock_starts[idx]
-            d = _dist_m((lat, lon), (s_lat, s_lon))
-            if best_dist is None or d < best_dist:
-                best_idx, best_dist = idx, d
-        if best_idx is not None and best_dist <= _MAX_STAND_MATCH_M:
-            _, _, hdg, name = stock_starts[best_idx]
-            results.append((hdg, name))
-            available.remove(best_idx)
-        else:
-            results.append((None, None))
-    return results
-
-
 def _parse_stock_taxi_nodes(block_lines):
-    """Row 1201: "1201 <lat> <lon> <usage> <node_id> <name>". Parsed here
-    (before replace_taxi_network_and_starts strips these rows) purely so
-    a stock 1206 ground-service-vehicle-only edge (see
-    _TAXI_NETWORK_ROW_CODES's own docstring -- no native BGL decode
-    exists for these) can be re-anchored onto the NEW native node
-    numbering by position instead of being dropped outright. Keyed by
-    the stock file's own node_id string, not assumed to be a plain
-    0..N-1 index."""
+    """Row 1201: "1201 <lat> <lon> <usage> <node_id> <name>". Parsed so a
+    stock 1206 ground-vehicle edge can be re-anchored onto the native
+    network's node numbering by position (apt_native does this when the
+    package defines no vehicle roads of its own). Keyed by the stock
+    file's own node_id string, not assumed to be a plain 0..N-1 index."""
     nodes = {}
     for line in block_lines:
         parts = line.split()
@@ -686,18 +502,15 @@ _MAX_TRUCK_NODE_MATCH_M = 50.0
 
 
 def _remap_truck_edges(stock_nodes, stock_truck_edges, native_nodes):
-    """Re-anchors the stock block's 1206 ground-service-vehicle-only taxi
-    edges onto the new native taxi-node numbering (native_nodes:
-    layout.taxi_nodes, index == its eventual 1201 node_id) by nearest
-    position, rather than dropping them: there's no BGL source at all for
-    which taxiways trucks specifically use, so this carries over the real
-    truck-routing topology onto the new node geometry instead.
+    """Re-anchors the stock block's 1206 ground-vehicle edges onto the
+    native network's node numbering (native_nodes: positions, index ==
+    the 1201 node_id) by nearest position, so a package without vehicle
+    roads still gets X-Plane's real truck-routing topology.
 
     Each stock node id is matched to its nearest native node ONCE and
-    cached (not consumed like reposition_runways/_match_ramp_start_
-    metadata do), since a stock node is typically shared by several
-    edges and they must all resolve to the same native node to stay
-    connected. An edge with no close-enough match (nothing within
+    cached (not consumed), since a stock node is typically shared by
+    several edges and they must all resolve to the same native node to
+    stay connected. An edge with no close-enough match (nothing within
     _MAX_TRUCK_NODE_MATCH_M) or that collapses to a self-loop is
     dropped."""
     if not stock_truck_edges or not native_nodes:
@@ -727,70 +540,21 @@ def _remap_truck_edges(stock_nodes, stock_truck_edges, native_nodes):
     return remapped
 
 
-def replace_taxi_network_and_starts(block_lines, layout, airport_name=""):
-    """Strip the stock block's ATC taxi-route network and ramp-start rows
-    and replace them with ones built from this package's own MSFS layout,
-    so ATC/AI ground routing and startup positions match this specific
-    airport rather than the real-world stock layout. Runway (100),
-    pavement (110-116, see replace_pavement_with_native) and painted-line
-    (120) rows are untouched here.
-
-    Heading/name on native ramp starts have no confirmed BGL decode, so
-    each borrows the closest stock stand's (see _match_ramp_start_
-    metadata) when one is within reach, falling back to a generic
-    placeholder otherwise. type/airplane_types stay "misc"/"all" and taxi
-    edges stay "twoway" since the source data doesn't confirm any
-    restriction and a wrong restriction would silently block routing.
-
-    Ground-service-vehicle routing (1206) has no native BGL decode at
-    all, so it's re-anchored from the stock block's own truck-route
-    topology instead -- see _remap_truck_edges."""
-    if not layout.taxi_nodes and not layout.ramp_starts:
-        return block_lines
-
-    stock_starts = _parse_stock_ramp_starts(block_lines)
-    stock_taxi_nodes = _parse_stock_taxi_nodes(block_lines)
-    stock_truck_edges = _parse_stock_truck_edges(block_lines)
-
-    drop_codes = _TAXI_NETWORK_ROW_CODES | _RAMP_START_ROW_CODES
-    out = []
-    for line in block_lines:
-        stripped = line.strip()
-        code = stripped.split(None, 1)[0] if stripped else ""
-        if code in drop_codes:
-            continue
-        out.append(line)
-
-    if layout.taxi_nodes:
-        out.append(f"1200 {airport_name}".rstrip())
-        for i, (lat, lon) in enumerate(layout.taxi_nodes):
-            out.append(f"1201 {lat:.8f} {lon:.8f} both {i} n{i}")
-        for node_a, node_b in layout.taxi_edges:
-            out.append(f"1202 {node_a} {node_b} twoway taxiway_F")
-        for new_a, new_b, direction in _remap_truck_edges(stock_taxi_nodes, stock_truck_edges, layout.taxi_nodes):
-            out.append(f"1206 {new_a} {new_b} {direction}")
-
-    matched_metadata = _match_ramp_start_metadata(layout.ramp_starts, stock_starts)
-    for i, ((lat, lon), (hdg, name)) in enumerate(zip(layout.ramp_starts, matched_metadata)):
-        hdg = hdg if hdg is not None else 0.0
-        name = name if name else f"Start {i + 1}"
-        out.append(f"1300 {lat:.8f} {lon:.8f} {hdg:.2f} misc all {name}")
-
-    return out
-
-
-def write_apt_dat(out_path: Path, block_lines, source_note: str, keep_lighting=True, native_layout=None, airport_name=""):
-    if native_layout is not None and not native_layout.is_empty():
-        block_lines = reposition_runways(block_lines, native_layout.runway_centers)
-        block_lines = replace_pavement_with_native(block_lines, native_layout)
-        block_lines = replace_taxi_network_and_starts(block_lines, native_layout, airport_name=airport_name)
+def write_apt_dat(out_path: Path, block_lines, source_note: str, keep_lighting=True):
+    """Stock-block path: the matched Global Airports block with its visible
+    pavement anonymized (see anonymize_visual_pavement). Used only when
+    the package's own airport record couldn't be decoded -- otherwise
+    apt_native builds the airport from the package itself."""
     block_lines = anonymize_visual_pavement(block_lines, keep_lighting=keep_lighting)
+    write_airport_lines(out_path, block_lines, source_note)
+
+
+def write_airport_lines(out_path: Path, block_lines, source_note: str):
+    """apt.dat plus an apt.dat.xp11 copy without jetway rows. Header version
+    1100: every row written is valid at 1100, and a 1200-header file was
+    observed NOT overriding the 1130 Global Airports block for the same
+    ICAO, unlike 1000/1100 (what every working custom-airport pack ships)."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    # Header version 1100: every surviving row code (anonymize_visual_
-    # pavement already drops anything needing a newer spec, e.g. 1500
-    # jetways) is valid at 1100, and a 1200-header file was observed NOT
-    # overriding the 1130 Global Airports block for the same ICAO, unlike
-    # 1000/1100 (what every working custom-airport pack ships).
     for path, lines in ((out_path, block_lines),
                         (out_path.with_name(out_path.name + ".xp11"), strip_jetway_rows(block_lines))):
         with open(path, "w", encoding="utf-8", newline="\n") as f:

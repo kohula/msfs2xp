@@ -363,6 +363,11 @@ class ModularPythonConverterApp:
         # those picks are applied to THIS run. Headless runners set this
         # False (there's no display / event loop to host the dialog).
         self.prompt_replacements_var = tk.BooleanVar(value=True)
+        # apt.dat from the package's own airport record: draw real X-Plane
+        # runways (instead of a transparent hard surface under the converted
+        # pavement), and paint the MSFS painted-line records.
+        self.native_runways_var = tk.BooleanVar(value=False)
+        self.native_painted_lines_var = tk.BooleanVar(value=False)
         self.is_maximized = False
         self._is_minimizing = False
         
@@ -525,6 +530,8 @@ class ModularPythonConverterApp:
                     self.approximate_substitution_var.set(data.get("approximate_substitution", False))
                     self.scan_terrain_vectors_var.set(data.get("scan_terrain_vectors", True))
                     self.pol_polygons_var.set(data.get("pol_polygons", False))
+                    self.native_runways_var.set(data.get("native_runways", False))
+                    self.native_painted_lines_var.set(data.get("native_painted_lines", False))
                     geom = data.get("geometry")
                     if geom:
                         self.root.geometry(geom)
@@ -546,6 +553,8 @@ class ModularPythonConverterApp:
                     "approximate_substitution": self.approximate_substitution_var.get(),
                     "scan_terrain_vectors": self.scan_terrain_vectors_var.get(),
                     "pol_polygons": self.pol_polygons_var.get(),
+                    "native_runways": self.native_runways_var.get(),
+                    "native_painted_lines": self.native_painted_lines_var.get(),
                     "geometry": self.root.geometry()
                 }, f)
         except Exception:
@@ -677,6 +686,14 @@ class ModularPythonConverterApp:
             options_inner, "Convert draped pavement/markings to real .pol DSF polygons (experimental)",
             self.pol_polygons_var
         ).grid(row=6, column=0, columnspan=4, sticky="w", pady=4)
+        _styled_checkbutton(
+            options_inner, "apt.dat: draw X-Plane runways with markings (for packages without runway models)",
+            self.native_runways_var
+        ).grid(row=7, column=0, columnspan=4, sticky="w", pady=4)
+        _styled_checkbutton(
+            options_inner, "apt.dat: paint the MSFS painted lines (if the draped models don't carry them)",
+            self.native_painted_lines_var
+        ).grid(row=8, column=0, columnspan=4, sticky="w", pady=4)
 
         # --- PROGRESS CARD ---
         prog_card = RoundedCard(left_col, bg_color=self.bg_dark, card_bg=self.card_bg, radius=12, height=210)
@@ -815,6 +832,8 @@ class ModularPythonConverterApp:
             scan_terrain_vectors=self.scan_terrain_vectors_var.get(),
             pol_polygons=self.pol_polygons_var.get(),
             prompt_replacements=self.prompt_replacements_var.get(),
+            runway_surface="native" if self.native_runways_var.get() else "transparent",
+            native_painted_lines=self.native_painted_lines_var.get(),
         )
         try:
             run_pipeline(opts, _GuiHooks(self))

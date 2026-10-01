@@ -30,6 +30,10 @@ def build_parser():
     p.add_argument("--no-terrain-vectors", action="store_true", help="skip the TerrainVectorDb scan")
     p.add_argument("--pol-polygons", action="store_true",
                    help="write draped ground as .pol DSF polygons instead of draped .obj")
+    p.add_argument("--native-runways", action="store_true",
+                   help="apt.dat: draw X-Plane runways with markings instead of a transparent surface")
+    p.add_argument("--painted-lines", action="store_true",
+                   help="apt.dat: paint the MSFS painted-line records")
     return p
 
 
@@ -48,6 +52,8 @@ def main(argv=None):
         scan_terrain_vectors=not a.no_terrain_vectors,
         pol_polygons=a.pol_polygons,
         prompt_replacements=False,
+        runway_surface="native" if a.native_runways else "transparent",
+        native_painted_lines=a.painted_lines,
     )
     run_pipeline(opts, PipelineHooks())
     return 0

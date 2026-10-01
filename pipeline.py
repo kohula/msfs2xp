@@ -27,6 +27,7 @@ import texture2ddecoder
 import bgl_extractor
 import dsf_compiler
 import apt_dat
+import apt_native
 import mesh_convert
 import cache_utils
 import gpu_accel
@@ -1466,6 +1467,14 @@ class PipelineOptions:
     scan_terrain_vectors: bool = True
     pol_polygons: bool = False
     prompt_replacements: bool = False
+    # apt.dat built from the package's own airport record: runways drawn as
+    # transparent hard surface under the converted MSFS pavement
+    # ("transparent", default) or as real X-Plane runways with markings
+    # ("native", for packages that ship no runway geometry of their own).
+    runway_surface: str = "transparent"
+    # Add the MSFS painted-line records as apt.dat lines (off by default:
+    # draped models usually already carry the markings).
+    native_painted_lines: bool = False
 
 
 class PipelineHooks:
@@ -2817,45 +2826,44 @@ def run_pipeline(opts, hooks):
         # airport's complete block from the user's own installed
         # X-Plane "Global Airports" pack instead (see apt_dat.py).
         hooks.log(f"\n{'='*50}\n5. GENERATING apt.dat\n{'='*50}", "header")
-        if matched_apt_block:
-            apt_path = out / "Earth nav data" / "apt.dat"
-            # keep_lighting=True: X-Plane draws this airport's real
-            # runway edge/centreline/approach/TDZ/REIL lights, PAPI and
-            # taxiway edge lights from its own Global Airports data.
-            # MSFS represents all of that procedurally (not as converted
-            # objects), so without this the airport has no
-            # runway/taxiway/approach lighting at all. Pavement + markings
-            # stay suppressed -- only the lights come back.
+        apt_path = out / "Earth nav data" / "apt.dat"
+        wrote_apt = False
+        if apt_native.is_usable(native_airport_layout):
+            # The package's own airport record: runways, lights, signs, the
+            # ATC network and stands all come from MSFS; the matched stock
+            # block (if any) only contributes flows, metadata, the beacon
+            # and ground-vehicle routes MSFS has no equivalent for.
+            rows, apt_report = apt_native.build_native_airport(
+                native_airport_layout, stock_block=matched_apt_block,
+                runway_surface=opts.runway_surface, painted_lines=opts.native_painted_lines)
+            note = f"native {native_airport_layout.ident}" + (f", flows/metadata from {matched_apt_ident}"
+                                                              if matched_apt_block else "")
+            apt_dat.write_airport_lines(apt_path, rows, source_note=note)
+            hooks.log(f"Wrote apt.dat for {native_airport_layout.ident} from the package's own airport "
+                      f"record: " + ", ".join(f"{v} {k}" for k, v in sorted(apt_report.items())), "success")
+            wrote_apt = True
+        elif matched_apt_block:
+            # The package's airport record couldn't be decoded: fall back to
+            # the real-world stock block with its pavement anonymized.
+            # keep_lighting=True keeps X-Plane's own runway/taxiway/approach
+            # lighting from that block, since nothing native replaces it.
             apt_dat.write_apt_dat(apt_path, matched_apt_block,
-                                  source_note=f"matched {matched_apt_ident}", keep_lighting=True,
-                                  native_layout=native_airport_layout, airport_name=matched_apt_ident or "")
-            if native_airport_layout and not native_airport_layout.is_empty():
-                hooks.log(f"apt.dat: repositioned {len(native_airport_layout.runway_centers)} runway(s) and "
-                         f"replaced the ATC taxi network ({len(native_airport_layout.taxi_nodes)} nodes, "
-                         f"{len(native_airport_layout.taxi_edges)} edges) + {len(native_airport_layout.ramp_starts)} "
-                         f"ramp starts with this package's own MSFS layout.", "info")
-            target_xp = opts.xp_version
-            if target_xp == "xp11":
-                # write_apt_dat always writes BOTH the modern (1200
-                # spec) file and a ".xp11" legacy sidecar (1100 spec,
-                # jetway rows stripped) -- normally the user has to
-                # manually rename the sidecar over apt.dat for an older
-                # (pre-11.50) X-Plane 11 install. Do that automatically
-                # here when the user has told us that's their actual
-                # target, instead of leaving a modern-spec apt.dat
-                # active by default and requiring a manual step.
-                legacy_path = apt_path.with_name(apt_path.name + ".xp11")
-                shutil.copyfile(legacy_path, apt_path)
-                hooks.log(f"Wrote apt.dat ({len(matched_apt_block)} lines, airport {matched_apt_ident}) -- "
-                         f"legacy X-Plane 11 (pre-11.50) variant active, per the selected target version.",
-                         "success")
-            else:
-                hooks.log(f"Wrote apt.dat ({len(matched_apt_block)} lines, airport {matched_apt_ident}), plus an "
-                         f"apt.dat.xp11 fallback (jetways stripped, legacy 1100 header) for older X-Plane 11 "
-                         f"installs that don't read the 1200 spec -- rename it over apt.dat manually if needed.",
-                         "success")
+                                  source_note=f"matched {matched_apt_ident}", keep_lighting=True)
+            hooks.log(f"Wrote apt.dat from the stock {matched_apt_ident} block ({len(matched_apt_block)} lines) "
+                      f"-- the package's own airport record could not be decoded.", "warning")
+            wrote_apt = True
         else:
-            hooks.log("No matching default airport found -- skipping apt.dat generation.", "warning")
+            hooks.log("No decodable airport record in the package and no matching default airport -- "
+                      "skipping apt.dat generation.", "warning")
+
+        if wrote_apt:
+            # Both apt.dat and an apt.dat.xp11 copy (jetway rows stripped)
+            # are written; for an older (pre-11.50) X-Plane 11 install, make
+            # the legacy one the active file.
+            if opts.xp_version == "xp11":
+                shutil.copyfile(apt_path.with_name(apt_path.name + ".xp11"), apt_path)
+                hooks.log("apt.dat: legacy X-Plane 11 (pre-11.50) variant active, per the selected target "
+                          "version.", "info")
 
         # objects/ picked up pipeline-internal scratch sidecars along the
         # way (.meshir.pkl for terrain_fit/draped_merge, .footprint.json/

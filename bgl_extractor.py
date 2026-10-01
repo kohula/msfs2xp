@@ -51,6 +51,7 @@ SECTION_TYPES = {
     0x27: "NameList", 0x28: "VorIlsIcaoIndex", 0x29: "NdbIcaoIndex",
     0x2A: "WaypointIcaoIndex", 0x2B: "ModelData", 0x2C: "AirportSummary",
     0x2E: "Exclusion", 0x2F: "TimeZone", 0x65: "TerrainVectorDb",
+    0x3C: "Airport",  # rarely used alias of 0x03
 }
 
 GLB_MAGIC = b"glTF"
@@ -93,6 +94,8 @@ KNOWN_LAYOUTS = {
 }
 
 TAXIWAY_SIGN_TYPE = 0x000E
+# FSX-style (0x000C) and MSFS (0x0018) windsock scenery records.
+WINDSOCK_RECORD_TYPES = (0x000C, 0x0018)
 ATTACHED_OBJECT_START_ID = 0x1002
 ATTACHED_OBJECT_END_ID = 0x1001
 ATTACHED_OBJECT_MARKER_SIZE = 0x0004
@@ -1794,7 +1797,7 @@ def _parse_one_bgl_uncached(bgl, models_dir, scan_terrain_vectors=True):
         for sec in airport_secs_this_file:
             for sub in sec.subsections:
                 for rec_type, payload in walk_records(data, sub.data_offset, sub.data_size, is_scenery_obj=False):
-                    if rec_type in (0x0113, 0x003C) and len(payload) >= 24:
+                    if rec_type in airport_layout.AIRPORT_RECORD_IDS and len(payload) >= 24:
                         lon_val, lat_val, alt_val = struct.unpack_from("<IIi", payload, 12)
                         result["airport_lon"] = decode_lonlat_dword(lon_val, is_lat=False)
                         result["airport_lat"] = decode_lonlat_dword(lat_val, is_lat=True)
@@ -1804,10 +1807,14 @@ def _parse_one_bgl_uncached(bgl, models_dir, scan_terrain_vectors=True):
                         layout = airport_layout.decode_airport_layout(payload)
                         if not layout.is_empty():
                             result["airport_layout"] = layout
-                            _wlog(f"      Native airport layout: {len(layout.runway_centers)} runways, "
-                                  f"{len(layout.aprons)} aprons, {len(layout.painted_lines)} painted lines, "
-                                  f"{len(layout.taxi_nodes)} taxi nodes, {len(layout.taxi_edges)} taxi edges, "
-                                  f"{len(layout.ramp_starts)} ramp starts", "info")
+                            _wlog(f"      Native airport layout {layout.ident} ({layout.name}): "
+                                  f"{len(layout.runways)} runways, {len(layout.helipads)} helipads, "
+                                  f"{len(layout.aprons)} aprons, {len(layout.taxi_points)} taxi points, "
+                                  f"{len(layout.taxi_paths)} taxi paths, {len(layout.parkings)} stands, "
+                                  f"{len(layout.light_strings)} light strings, {len(layout.painted_lines)} "
+                                  f"painted lines, {len(layout.signs)} signs", "info")
+                        for w in layout.warnings[:10]:
+                            _wlog(f"      Airport layout: {w}", "warning")
                         break
                 if result["airport_lat"] is not None:
                     break
@@ -2032,6 +2039,20 @@ def extract(target_path: Path, out_dir: Path, log_callback=None, msfs_install_ro
             native_airport_layout = r["airport_layout"]
 
     placements = []
+
+    # Windsock records carry no model GUID -- X-Plane draws windsocks from
+    # its own apt.dat row (19), so they go to the airport layout instead of
+    # becoming unresolvable "placements".
+    windsocks = []
+    for source, rec_type, payload, _q1, _q2 in all_records:
+        if rec_type in WINDSOCK_RECORD_TYPES and len(payload) >= 12:
+            lon_val, lat_val = struct.unpack_from("<II", payload, 4)
+            windsocks.append((decode_lonlat_dword(lat_val, True), decode_lonlat_dword(lon_val, False)))
+    if windsocks:
+        all_records = [r for r in all_records if r[1] not in WINDSOCK_RECORD_TYPES]
+        if native_airport_layout is not None:
+            native_airport_layout.windsocks.extend(windsocks)
+        _log(f"      {len(windsocks)} windsock(s) found -- written as apt.dat windsocks.", "info")
 
     if all_records:
         by_type = defaultdict(list)
