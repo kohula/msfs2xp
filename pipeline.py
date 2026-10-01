@@ -29,6 +29,7 @@ import dsf_compiler
 import apt_dat
 import apt_native
 import obj_scale
+import texture_budget
 import mesh_convert
 import cache_utils
 import gpu_accel
@@ -1481,6 +1482,9 @@ class PipelineOptions:
     native_painted_lines: bool = False
     # How opaque blended MSFS glass is drawn, percent (100 = solid).
     glass_opacity: int = mesh_convert_glass_default
+    # Largest texture side for the biggest buildings; smaller objects get
+    # less (texture_budget). 0 = keep every texture at its source size.
+    max_texture: int = 2048
 
 
 class PipelineHooks:
@@ -2898,6 +2902,17 @@ def run_pipeline(opts, hooks):
                 shutil.copyfile(apt_path.with_name(apt_path.name + ".xp11"), apt_path)
                 hooks.log("apt.dat: legacy X-Plane 11 (pre-11.50) variant active, per the selected target "
                           "version.", "info")
+
+        # Textures held to what they're drawn on (see texture_budget), and
+        # the ones nothing references any more removed. Before the sidecar
+        # sweep below: the MeshIR sidecars make measuring objects fast.
+        try:
+            _shrunk, _unused = texture_budget.apply_texture_budget(out, max_side=opts.max_texture, log=hooks.log)
+            if _shrunk or _unused:
+                hooks.log(f"Textures: {_shrunk} reduced to fit the objects they're drawn on "
+                          f"(max {opts.max_texture} px), {_unused} unreferenced removed.", "info")
+        except Exception as e:
+            hooks.log(f"Texture size pass skipped ({e}).", "warning")
 
         # objects/ picked up pipeline-internal scratch sidecars along the
         # way (.meshir.pkl for terrain_fit/draped_merge, .footprint.json/

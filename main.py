@@ -371,6 +371,9 @@ class ModularPythonConverterApp:
         # How opaque blended MSFS glass is drawn (MSFS glass relies on
         # reflections X-Plane doesn't draw, so its own alpha is near zero).
         self.glass_opacity_var = tk.IntVar(value=50)
+        # Largest texture side for the biggest buildings (smaller objects get
+        # proportionally less); 0 keeps source sizes.
+        self.max_texture_var = tk.IntVar(value=2048)
         self.is_maximized = False
         self._is_minimizing = False
         
@@ -536,6 +539,7 @@ class ModularPythonConverterApp:
                     self.native_runways_var.set(data.get("native_runways", False))
                     self.native_painted_lines_var.set(data.get("native_painted_lines", False))
                     self.glass_opacity_var.set(int(data.get("glass_opacity", 50)))
+                    self.max_texture_var.set(int(data.get("max_texture", 2048)))
                     geom = data.get("geometry")
                     if geom:
                         self.root.geometry(geom)
@@ -559,7 +563,8 @@ class ModularPythonConverterApp:
                     "pol_polygons": self.pol_polygons_var.get(),
                     "native_runways": self.native_runways_var.get(),
                     "native_painted_lines": self.native_painted_lines_var.get(),
-                    "glass_opacity": self.glass_opacity_var.get(),
+                    "glass_opacity": self._glass_opacity(),
+                    "max_texture": self._max_texture(),
                     "geometry": self.root.geometry()
                 }, f)
         except Exception:
@@ -706,6 +711,11 @@ class ModularPythonConverterApp:
         tk.Spinbox(glass_row, from_=1, to=100, increment=5, width=5, textvariable=self.glass_opacity_var,
                    bg="#1c1c1e", fg="#ffffff", buttonbackground="#2a2a2e", relief=tk.FLAT,
                    insertbackground="#ffffff").pack(side=tk.LEFT, padx=(8, 0))
+        tk.Label(glass_row, text="Max texture size px:", bg=self.card_bg, fg="#cccccc",
+                 font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(16, 0))
+        tk.Spinbox(glass_row, values=(0, 512, 1024, 2048, 4096, 8192), width=6, textvariable=self.max_texture_var,
+                   bg="#1c1c1e", fg="#ffffff", buttonbackground="#2a2a2e", relief=tk.FLAT,
+                   insertbackground="#ffffff").pack(side=tk.LEFT, padx=(8, 0))
 
         # --- PROGRESS CARD ---
         prog_card = RoundedCard(left_col, bg_color=self.bg_dark, card_bg=self.card_bg, radius=12, height=210)
@@ -836,6 +846,12 @@ class ModularPythonConverterApp:
         except (tk.TclError, ValueError):
             return 50
 
+    def _max_texture(self):
+        try:
+            return max(0, int(self.max_texture_var.get()))
+        except (tk.TclError, ValueError):
+            return 2048
+
     def run_pipeline(self):
         opts = PipelineOptions(
             pkg_dir=self.pkg_var.get(),
@@ -853,6 +869,7 @@ class ModularPythonConverterApp:
             runway_surface="native" if self.native_runways_var.get() else "transparent",
             native_painted_lines=self.native_painted_lines_var.get(),
             glass_opacity=max(1, min(100, self._glass_opacity())),
+            max_texture=self._max_texture(),
         )
         try:
             run_pipeline(opts, _GuiHooks(self))
