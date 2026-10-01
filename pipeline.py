@@ -1397,6 +1397,59 @@ def wipe_cache_and_temp(log_fn):
             log_fn(f"Cleared {removed} leftover _temp/ entr{'y' if removed == 1 else 'ies'}.", "info")
 
 
+# What a previous run of this pipeline leaves in an output pack, by
+# folder. Only these get removed -- never anything else a user may keep
+# in the pack folder.
+_GENERATED_OUTPUT = {
+    "objects": (".obj", ".json", ".pkl"),
+    "polygons": (".pol",),
+    "textures": (".png", ".dds", ".jpg", ".jpeg", ".tga"),
+}
+
+
+def clean_previous_output(out, log):
+    """Remove what an earlier conversion wrote into `out`, so this run's
+    pack holds only this run's results: stale DSF tiles (a tile this run
+    no longer produces would otherwise keep loading), an apt.dat from a
+    run that matched an airport when this one doesn't, objects/polygons
+    no placement references any more, and textures that would otherwise
+    never be refreshed (the step-2 copy skips names that already exist).
+    Returns the number of files removed."""
+    removed = 0
+
+    def _rm(path):
+        nonlocal removed
+        try:
+            path.unlink()
+            removed += 1
+        except OSError as e:
+            log(f"Could not remove stale output {path}: {e}", "warning")
+
+    nav = out / "Earth nav data"
+    if nav.is_dir():
+        for tile_dir in nav.iterdir():
+            if tile_dir.is_dir():
+                for f in tile_dir.glob("*.dsf"):
+                    _rm(f)
+                try:
+                    tile_dir.rmdir()  # only succeeds once empty
+                except OSError:
+                    pass
+        for name in ("apt.dat", "apt.dat.xp11"):
+            if (nav / name).is_file():
+                _rm(nav / name)
+    for folder, suffixes in _GENERATED_OUTPUT.items():
+        d = out / folder
+        if d.is_dir():
+            for f in d.iterdir():
+                if f.is_file() and (f.suffix.lower() in suffixes or ".tmp_" in f.name):
+                    _rm(f)
+    manifest = out / "plugin_data" / "msfs2xp_proximity.dat"
+    if manifest.is_file():
+        _rm(manifest)
+    return removed
+
+
 @dataclass
 class PipelineOptions:
     """Everything one conversion run needs -- what the GUI's form fields
@@ -1444,6 +1497,9 @@ class PipelineHooks:
 def run_pipeline(opts, hooks):
     pkg = Path(opts.pkg_dir)
     out = Path(opts.out_dir)
+    if out.name.lower() in ("custom scenery", "global scenery") or out.resolve() == Path(out.resolve().anchor):
+        raise ValueError(f"Output folder {out} must be a scenery pack folder of its own "
+                         f"(e.g. 'Custom Scenery/My Airport'), not {out.name or out}.")
 
     if opts.clean_run:
         hooks.log("Clean run requested -- wiping disk cache and leftover temp files first...", "info")
@@ -1451,6 +1507,10 @@ def run_pipeline(opts, hooks):
 
     _LOCAL_TEMP_ROOT.mkdir(parents=True, exist_ok=True)
     temp_dir = Path(tempfile.mkdtemp(prefix="py-msfs-", dir=str(_LOCAL_TEMP_ROOT)))
+
+    stale = clean_previous_output(out, hooks.log)
+    if stale:
+        hooks.log(f"Removed {stale} file(s) left in the output pack by a previous run.", "info")
 
     obj_dir = out / "objects"
     tex_dir = out / "textures"
