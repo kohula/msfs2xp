@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
 from gltf_builder import GltfBuilder  # noqa: E402
 
 import cache_utils
-import main
+import pipeline as main
 import mesh_convert
 convert_module = importlib.import_module("mesh_convert.convert")
 

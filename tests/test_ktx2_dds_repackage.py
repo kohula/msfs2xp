@@ -38,7 +38,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-import main
+import pipeline as main
 
 
 def _build_fake_ktx2(vk_format, width, height, compressed_bytes, supercompression=0, extra_levels=None):

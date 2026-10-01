@@ -7,7 +7,7 @@ found or converted). Exact keyword match always checked; a fuzzy
 """
 import unittest
 
-import main
+import pipeline as main
 
 
 class TestLibrarySubstitution(unittest.TestCase):

@@ -9,7 +9,7 @@ converted.
 """
 import unittest
 
-import main
+import pipeline as main
 
 
 class TestModelStemBasename(unittest.TestCase):

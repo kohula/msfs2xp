@@ -74,7 +74,7 @@ class TestSaveAndMerge(unittest.TestCase):
             self.assertEqual(reps, {"k1": "lib/a2.obj", "k3": "lib/c.obj"})
 
     def test_saved_file_is_readable_by_the_converter_loader(self):
-        import main
+        import pipeline as main
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
             pr.save_replacements(d, {"{A-B}": "lib/x.obj", "some title": "SKIP"})

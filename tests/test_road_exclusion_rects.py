@@ -13,7 +13,7 @@ from pathlib import Path
 
 import numpy as np
 
-import main
+import pipeline as main
 from mesh_convert import mesh_ir
 
 
