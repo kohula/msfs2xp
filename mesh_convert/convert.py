@@ -128,6 +128,7 @@ class MatBuilder:
         self.alpha_cutoff = 0.5
         self.double_sided = False
         self.is_glass = False
+        self.normal_metalness = False
         self.is_decal = False
         self.is_dropped_elevated_decal = False  # decal-named/tagged but elevation-disqualified -- see convert()
         self.is_near_ground_flat = False  # per-material ground-level detection -- see convert()
@@ -1262,6 +1263,57 @@ def find_normal_texture(mat):
         if "detailNormalTexture" in detail:
             return detail["detailNormalTexture"]
     return None
+
+
+def make_normal_metalness(textures_dir, normal_name, comp_name, metallic_factor, roughness_factor):
+    """X-Plane normal map in its NORMAL_METALNESS layout: red/green the
+    tangent-space normal (as the MSFS normal map has it), blue the
+    metalness, alpha the smoothness (white = smooth). glTF/MSFS keep
+    roughness in the metal/roughness ("comp") texture's green channel and
+    metalness in its blue, each multiplied by the material's factor.
+
+    Without this, X-Plane read the normal map's blue as the normal's Z and
+    its alpha as shininess -- an RGB normal map has alpha 255, so every
+    normal-mapped surface was drawn fully glossy. Returns the new texture
+    name, or `normal_name` unchanged if it can't be read."""
+    textures_dir = Path(textures_dir)
+    comp_tag = f"_{Path(comp_name).stem}" if comp_name else ""
+    m8, r8 = int(round(metallic_factor * 255)), int(round(roughness_factor * 255))
+    new_name = f"{Path(normal_name).stem}{comp_tag}_m{m8}r{r8}_nm.png"
+    new_path = textures_dir / new_name
+    with _TEXTURE_LOCK:
+        if new_path.exists() and new_path.stat().st_size > 100 and _is_valid_image(new_path):
+            return new_name
+    try:
+        normal = np.array(Image.open(textures_dir / normal_name).convert("RGBA"))
+    except Exception:
+        return normal_name
+    h, w = normal.shape[:2]
+    out = np.empty((h, w, 4), dtype=np.uint8)
+    out[..., 0] = normal[..., 0]
+    out[..., 1] = normal[..., 1]
+    comp = None
+    if comp_name:
+        try:
+            comp_img = Image.open(textures_dir / comp_name).convert("RGBA")
+            if comp_img.size != (w, h):
+                comp_img = comp_img.resize((w, h), Image.BILINEAR)
+            comp = np.array(comp_img).astype(np.float32)
+        except Exception:
+            comp = None
+    if comp is not None:
+        out[..., 2] = np.clip(comp[..., 2] * metallic_factor, 0, 255).astype(np.uint8)
+        out[..., 3] = np.clip(255.0 - comp[..., 1] * roughness_factor, 0, 255).astype(np.uint8)
+    else:
+        out[..., 2] = m8
+        out[..., 3] = 255 - r8
+    try:
+        temp_path = new_path.with_name(f"{new_name}.tmp_{_unique_suffix()}")
+        Image.fromarray(out, "RGBA").save(temp_path, "PNG")
+        _atomic_replace(temp_path, new_path)
+        return new_name
+    except Exception:
+        return normal_name
 
 
 def find_emissive_texture(mat):
@@ -2629,14 +2681,33 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                         if normal_tex and "index" in normal_tex:
                             img_idx, _ = texture_image_index(gltf, normal_tex["index"])
                             if img_idx is not None:
-                                # No post-processing ever touches the normal
-                                # map slot -- safe to always pass through a
-                                # source .dds unmodified (see
-                                # allow_dds_passthrough's own docstring).
-                                builder.normal_texture_name = extract_image(
+                                # Decoded (not passed through): it's
+                                # rebuilt into X-Plane's NORMAL_METALNESS
+                                # layout together with the material's
+                                # metal/roughness texture.
+                                normal_name = extract_image(
                                     gltf, buffers, img_idx, glb_path, textures_dir, external_textures_dir, image_cache, (128, 128, 255, 255),
-                                    allow_dds_passthrough=True,
+                                    allow_dds_passthrough=False,
                                 )
+                                if normal_name:
+                                    _pbr = mat.get("pbrMetallicRoughness", {}) or {}
+                                    _mr_tex = _pbr.get("metallicRoughnessTexture")
+                                    comp_name = None
+                                    if _mr_tex and "index" in _mr_tex:
+                                        _mr_idx, _ = texture_image_index(gltf, _mr_tex["index"])
+                                        if _mr_idx is not None:
+                                            comp_name = extract_image(
+                                                gltf, buffers, _mr_idx, glb_path, textures_dir, external_textures_dir,
+                                                image_cache, (255, 255, 0, 255), allow_dds_passthrough=False)
+                                    # Without a texture, only factors the
+                                    # material actually states count (the
+                                    # glTF default metallic 1.0 would make
+                                    # every untextured surface metal).
+                                    _metal = float(_pbr.get("metallicFactor", 1.0 if comp_name else 0.0))
+                                    _rough = float(_pbr.get("roughnessFactor", 1.0 if comp_name else 0.5))
+                                    builder.normal_texture_name = make_normal_metalness(
+                                        textures_dir, normal_name, comp_name, _metal, _rough)
+                                    builder.normal_metalness = builder.normal_texture_name != normal_name
 
                         if not builder.texture_name:
                             guess_stem = clean_texture_stem(raw_mat_name)
@@ -3472,6 +3543,8 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
             f.write(f"TEXTURE ../textures/{builder.texture_name}\n")
             if builder.normal_texture_name:
                 f.write(f"TEXTURE_NORMAL ../textures/{builder.normal_texture_name}\n")
+                if getattr(builder, "normal_metalness", False):
+                    f.write("NORMAL_METALNESS\n")
             if builder.emissive_texture_name:
                 f.write(f"TEXTURE_LIT ../textures/{builder.emissive_texture_name}\n")
             if builder.alpha_mode == "BLEND" and not builder_is_draped:
@@ -3646,6 +3719,7 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                 texture_lit=(f"../textures/{builder.emissive_texture_name}" if builder.emissive_texture_name else None),
                 texture_normal=(f"../textures/{builder.normal_texture_name}" if builder.normal_texture_name else None),
                 is_glass=bool(getattr(builder, "is_glass", False)),
+                normal_metalness=bool(getattr(builder, "normal_metalness", False)),
             )
             mesh_ir_module.save(ir, mesh_ir_module.sidecar_path_for(obj_path))
 
