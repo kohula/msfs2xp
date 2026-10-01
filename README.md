@@ -13,22 +13,37 @@ in this codebase.
 
 - **Models**: MSFS glTF/glb assets → X-Plane OBJ8, including animated
   parts (doors, barriers, gates, rotating fixtures), night lighting, and
-  glass/translucent materials.
+  glass/translucent materials. Each model is converted at the most
+  detailed MSFS level of detail that fits a triangle budget scaled to its
+  size, small props get a draw distance, placement scale is honoured, and
+  normal maps are written in X-Plane's `NORMAL_METALNESS` layout.
+- **Glass**: drawn at a chosen opacity (default 50%, 100% = solid) since
+  MSFS glass relies on reflections X-Plane doesn't draw, and drawn after a
+  building's opaque parts so it never hides them.
+- **Textures**: KTX2/DDS decoded or passed through only when X-Plane can
+  load them as they are, then held to the size of the objects drawing
+  them (largest side configurable, default 2048); unused ones removed.
 - **Ground content**: draped pavement, painted lines and markings,
   merged across overlapping placements to avoid X-Plane's draw-order
   z-fighting between same-layer draped surfaces.
 - **Terrain fit**: large buildings get a rigid-tilt correction against
   real sampled X-Plane terrain, so a big footprint doesn't float or sink
   at its corners on sloped ground.
-- **apt.dat**: runway positions, the ATC taxi-route network, and ramp
-  starts are rebuilt from the package's own MSFS BGL data (not just
-  copied from X-Plane's stock real-world block), so ATC/AI ground
-  routing matches a custom-rebuilt airport. Ground-service-vehicle
-  routing and stand metadata fall back to the nearest matching stock
-  entry where MSFS has no equivalent data.
+- **apt.dat**: built from the package's own MSFS airport record (MSFS
+  2020 and 2024 layouts): runways with thresholds, approach lighting and
+  VASI/PAPI, helipads, frequencies, taxiway signs, windsocks, taxiway
+  light strings, the ATC taxi network (real edges, runway edges, taxiway
+  names and size classes, hot zones, vehicle roads) and ramp starts with
+  heading, type, size class and airlines. Runways and aprons are a
+  transparent hard surface under the converted draped MSFS pavement by
+  default (options: real X-Plane runways with markings; MSFS painted
+  lines). A matched stock Global Airports block only lends ATC flows,
+  metadata, the beacon and truck routes -- and is used on its own only
+  when the package's airport record can't be decoded.
 - **SimObject placements**: people, vehicles, and GSE decoded from the
-  package's SimPropContainer (`.spb`) data (see [Third-party
-  code](#third-party-code) below).
+  package's SimPropContainer (`.spb`) data -- read from each file's own
+  property table, or with the full decompiler when a Propdefs folder is
+  configured (see [Third-party code](#third-party-code) below).
 
 Two companion FlyWithLua scripts (`plugins/`) drive behavior X-Plane has
 no native dataref for: proximity-triggered animations (doors/barriers
@@ -44,10 +59,11 @@ lighting. See each plugin's own `README.txt`.
   feature-detected, the app runs without either)
 - An X-Plane 11 or 12 install, for terrain sampling and as the deploy
   target
-- Microsoft's own MSFS SDK "Propdefs" XML data, if you want SimObject
-  (people/vehicle/GSE) extraction — point Settings → "Propdefs folder"
-  (or the `MSFS2XP_PROPDEFS_DIR` env var) at your own copy. Not
-  bundled here; see [Third-party code](#third-party-code).
+- Optionally, Microsoft's own MSFS SDK "Propdefs" XML data: SimProp
+  containers are read without it, but children that reference another
+  object by title need it — point Settings → "Propdefs folder" (or the
+  `MSFS2XP_PROPDEFS_DIR` env var) at your own copy. Not bundled here;
+  see [Third-party code](#third-party-code).
 
 ## Running it
 
@@ -56,6 +72,16 @@ From source:
 ```
 python main.py
 ```
+
+Headless (same pipeline, no window):
+
+```
+python cli.py <msfs package folder> -o "<X-Plane>/Custom Scenery/<pack name>"
+```
+
+`python cli.py --help` lists the options (glass opacity, max texture
+size, native runways, painted lines, ...). The output folder must be the
+pack's own folder; earlier output in it is cleared first.
 
 Or build a standalone Windows executable:
 
@@ -73,8 +99,10 @@ what it bundles and why).
 - A source model's own MSFS-side "TILTED" per-vertex terrain conforming
   has no direct OBJ8 equivalent; this project applies its own rigid-tilt
   correction instead (see above), which is close but not per-vertex.
-- Runway/pavement lighting is currently inherited from X-Plane's own
-  stock airport data, not decoded from MSFS.
+- Placement pitch/bank aren't applied (DSF placements only carry a
+  heading).
+- MSFS jetways stay converted models; X-Plane's own docking jetways
+  (apt.dat 1500) aren't generated.
 
 ## Development notes
 
