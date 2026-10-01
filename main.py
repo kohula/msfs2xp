@@ -10,11 +10,16 @@ from tkinter.scrolledtext import ScrolledText
 
 from PIL import Image, ImageTk
 
+import app_paths
 import cache_utils
 import pick_replacements
 from pipeline import PipelineOptions, PipelineHooks, run_pipeline, wipe_cache_and_temp
 
-CONFIG_FILE = Path("msfs2xp_config.json")
+# Settings live with the cache (next to the program, or the per-user
+# folder when that's read-only -- see app_paths). An older build kept them
+# in the working directory; that copy is still read if there's no new one.
+CONFIG_FILE = app_paths.config_file()
+_LEGACY_CONFIG_FILE = Path("msfs2xp_config.json")
 TRANSPARENT_KEY = "#000001"  # Color key used for window corner rounding transparency
 
 
@@ -514,9 +519,10 @@ class ModularPythonConverterApp:
         self._draw_window_shape(type('Event', (), {'width': self.root.winfo_width(), 'height': self.root.winfo_height()})())
 
     def load_config(self):
-        if CONFIG_FILE.exists():
+        config_file = CONFIG_FILE if CONFIG_FILE.exists() else _LEGACY_CONFIG_FILE
+        if config_file.exists():
             try:
-                with open(CONFIG_FILE, "r") as f:
+                with open(config_file, "r") as f:
                     data = json.load(f)
                     self.pkg_var.set(data.get("pkg_dir", ""))
                     self.out_var.set(data.get("out_dir", ""))
@@ -923,6 +929,11 @@ class _GuiHooks(PipelineHooks):
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
+    # "MSFS2XP cli <args>" (or "MSFS2XP.AppImage cli <args>") runs the
+    # headless converter from the same packaged build -- see cli.py.
+    if len(sys.argv) > 1 and sys.argv[1] == "cli":
+        import cli
+        sys.exit(cli.main(sys.argv[2:]))
     root = tk.Tk()
     app = ModularPythonConverterApp(root)
     root.mainloop()

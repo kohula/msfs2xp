@@ -34,9 +34,10 @@ breaks a conversion run.
 import io
 import math
 import struct
-import sys
 import tempfile
 from pathlib import Path
+
+import app_paths
 
 try:
     import py7zr
@@ -65,15 +66,12 @@ _RASTER_FORMAT_INT = 1
 _RASTER_FORMAT_UNSIGNED_INT = 2
 _RASTER_FORMAT_UNSIGNED_INT_NORMALIZED = 3
 
-# Next to this script, not the system temp/profile drive -- see
-# cache_utils.py's module docstring. Frozen-EXE handling matches
-# cache_utils.py's (__file__ resolves inside the ephemeral PyInstaller
-# extraction dir once bundled, not the real .exe's folder).
-if getattr(sys, "frozen", False):
-    _SCRIPT_DIR = Path(sys.executable).resolve().parent
-else:
-    _SCRIPT_DIR = Path(__file__).resolve().parent
-_LOCAL_TEMP_ROOT = _SCRIPT_DIR / "_temp"
+# Scratch space next to the program, not the system temp drive (an
+# extraction runs into GBs), or the per-user cache folder when the
+# program's folder is read-only -- see app_paths.py. _SCRIPT_DIR is where
+# the program is launched from (read-only lookups only).
+_SCRIPT_DIR = app_paths.program_dir()
+_LOCAL_TEMP_ROOT = app_paths.temp_dir()
 
 _GLOBAL_SCENERY_CANDIDATES = [
     "Global Scenery/X-Plane 12 Global Scenery/Earth nav data",

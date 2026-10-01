@@ -1,7 +1,8 @@
 """
 Self-invalidating on-disk cache for msfs2xp.
 
-Persists under a "_cache" folder next to this script, independent of
+Persists under a "_cache" folder next to the program (see app_paths.py
+for the exact rules, incl. AppImage and read-only installs), independent of
 whatever output folder is picked for a given run -- the same source
 package gets re-run against the same cache across sessions, which matters
 a lot while iterating on bug fixes.
@@ -33,21 +34,14 @@ import sys
 import time
 from pathlib import Path
 
+import app_paths
+
 _MODULE_HASH_CACHE = {}
 
-# GPU/_cache -- next to this script, not on whatever drive the system temp/
-# profile folder happens to live on. Under a frozen PyInstaller EXE,
-# __file__ resolves inside the ephemeral extraction temp dir (sys._MEIPASS)
-# rather than where the real .exe sits on disk, so that case is anchored
-# on sys.executable's own folder instead.
-if getattr(sys, "frozen", False):
-    _SCRIPT_DIR = Path(sys.executable).resolve().parent
-else:
-    _SCRIPT_DIR = Path(__file__).resolve().parent
-
-
+# Next to the program (or the per-user cache folder when that isn't
+# writable, e.g. inside a mounted AppImage) -- see app_paths.py.
 def cache_root():
-    root = _SCRIPT_DIR / "_cache"
+    root = app_paths.cache_dir()
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -62,7 +56,9 @@ def module_version(module_path):
         try:
             data = Path(module_path).read_bytes()
         except OSError:
-            return "unknown"
+            # A frozen build ships no .py source to hash: key on the build
+            # itself, so a new release never serves an old release's cache.
+            return app_paths.build_id() if getattr(sys, "frozen", False) else "unknown"
         h = hashlib.blake2b(data, digest_size=8).hexdigest()
         _MODULE_HASH_CACHE[module_path] = h
     return h

@@ -1,0 +1,6 @@
+#!/bin/sh
+# Starts the bundled program from the read-only AppImage mount.
+#   ./MSFS2XP-x86_64.AppImage              the window
+#   ./MSFS2XP-x86_64.AppImage cli --help   the headless converter
+HERE="$(dirname "$(readlink -f "$0")")"
+exec "$HERE/opt/msfs2xp/MSFS2XP" "$@"

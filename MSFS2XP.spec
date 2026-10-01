@@ -17,7 +17,7 @@ datas = [
     ('spb2xml/textdecode_data.py', 'spb2xml'),
 ]
 binaries = []
-hiddenimports = ['uuid', 'xml.etree.ElementTree', 'xml.dom.minidom']
+hiddenimports = ['uuid', 'xml.etree.ElementTree', 'xml.dom.minidom', 'cli', 'spb_native']
 tmp_ret = collect_all('py7zr')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 

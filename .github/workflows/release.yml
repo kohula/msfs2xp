@@ -1,0 +1,96 @@
+# Builds the Windows .exe and the Linux AppImage and publishes them as a
+# GitHub release. Runs when a version tag (v*) is pushed, or by hand from
+# the Actions tab for an existing tag.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish (e.g. v1.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk python3-venv
+          python3 -m venv .venv
+          .venv/bin/pip install -r requirements.txt
+      - name: Run tests
+        run: .venv/bin/python tests/run_tests.py
+
+  windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build MSFS2XP.exe
+        shell: pwsh
+        run: |
+          python -m pip install -r requirements.txt pyinstaller
+          python -m PyInstaller --noconfirm --clean MSFS2XP.spec
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/MSFS2XP.exe
+
+  linux:
+    needs: test
+    # The AppImage runs on systems with at least the build machine's glibc,
+    # so it's built on the oldest supported runner.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          fetch-depth: 0
+      - name: Build MSFS2XP-x86_64.AppImage
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk python3-venv
+          python3 -m venv .venv
+          .venv/bin/pip install -r requirements.txt pyinstaller
+          VERSION="$TAG" PYTHON=.venv/bin/python packaging/build_appimage.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/MSFS2XP-x86_64.AppImage
+
+  publish:
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ${{ env.TAG }}
+          body_path: packaging/RELEASE_NOTES.md
+          files: |
+            artifacts/windows/MSFS2XP.exe
+            artifacts/linux/MSFS2XP-x86_64.AppImage

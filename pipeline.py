@@ -31,6 +31,7 @@ import apt_native
 import obj_scale
 import texture_budget
 import mesh_convert
+import app_paths
 import cache_utils
 import gpu_accel
 import terrain_fit
@@ -60,18 +61,12 @@ from mesh_convert.convert import flag_stray_vertices
 # __main__ block, so behavior there doesn't change.
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-CONFIG_FILE = Path("msfs2xp_config.json")
-
-# Next to this script, not the system temp/profile drive -- a package
-# extraction can run into the GB range per run and would otherwise quietly
-# fill a small C: system drive. Under a frozen PyInstaller EXE, __file__
-# resolves inside the ephemeral extraction temp dir, so anchor on
-# sys.executable's own folder instead.
-if getattr(sys, "frozen", False):
-    _SCRIPT_DIR = Path(sys.executable).resolve().parent
-else:
-    _SCRIPT_DIR = Path(__file__).resolve().parent
-_LOCAL_TEMP_ROOT = _SCRIPT_DIR / "_temp"
+# Scratch space next to the program, not the system temp drive (an
+# extraction runs into GBs), or the per-user cache folder when the
+# program's folder is read-only -- see app_paths.py. _SCRIPT_DIR is where
+# the program is launched from (read-only lookups only).
+_SCRIPT_DIR = app_paths.program_dir()
+_LOCAL_TEMP_ROOT = app_paths.temp_dir()
 
 # Last-resort library substitution for placements with no real MSFS model
 # available at all (nothing extracted/converted to fall back to) -- never

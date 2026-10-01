@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=MSFS2XP
+Comment=Convert Microsoft Flight Simulator scenery to X-Plane
+Exec=AppRun
+Icon=msfs2xp
+Categories=Utility;
+Terminal=false

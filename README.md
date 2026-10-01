@@ -90,7 +90,15 @@ exe.bat
 ```
 
 which produces `dist/MSFS2XP.exe` (see that script's own comments for
-what it bundles and why).
+what it bundles and why). On Linux, `packaging/build_appimage.sh` builds
+`dist/MSFS2XP-x86_64.AppImage`. Pushing a `v*` tag builds both on GitHub
+Actions and publishes them as a release (`.github/workflows/release.yml`).
+
+The cache, scratch space and settings live next to the program -- next to
+the `.exe`, or next to the `.AppImage` file (the AppImage itself is
+mounted read-only) -- or in the per-user cache folder (`~/.cache/msfs2xp`,
+`%LOCALAPPDATA%\msfs2xp`) when that folder isn't writable.
+`MSFS2XP_DATA_DIR` overrides it.
 
 ## Known limitations
 
