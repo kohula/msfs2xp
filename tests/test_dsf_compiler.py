@@ -298,5 +298,29 @@ class TestDsfCompilerGolden(unittest.TestCase):
         self.assertEqual(poly_range_count, n_triangles)
 
 
+
+class TestDsfObjectPoolLimit(unittest.TestCase):
+    def test_more_objects_than_one_pool_holds_all_round_trip(self):
+        """The Object command addresses its point with a u16, so one pool
+        holds at most 65535 placements. A busier tile used to raise
+        struct.error and lose the whole tile; now it splits into several
+        pools and every placement survives."""
+        import scenery_viewer
+        n = 70000
+        objects = [{"name": f"o{i % 7}", "lat": 47.4 + (i % 300) * 1e-5, "lon": 19.2 + (i // 300) * 1e-5,
+                    "hdg": float(i % 360), "agl": 0.0} for i in range(n)]
+        objects += [{"name": "raised", "lat": 47.41, "lon": 19.21, "hdg": 0.0, "agl": 4.0}]
+        with tempfile.TemporaryDirectory() as td:
+            out_path = Path(td) / "+47+019.dsf"
+            dsf_compiler.build_dsf(47, 19, objects, out_path)
+            tile = scenery_viewer.parse_dsf(out_path)
+        self.assertEqual(len(tile.objects), n + 1)
+        raised = [o for o in tile.objects if o["name"] == "objects/raised.obj"]
+        self.assertEqual(len(raised), 1)
+        self.assertAlmostEqual(raised[0]["agl"], 4.0, places=1)
+        last = tile.objects[n - 1]
+        self.assertAlmostEqual(last["lat"], objects[n - 1]["lat"], places=6)
+        self.assertAlmostEqual(last["lon"], objects[n - 1]["lon"], places=6)
+
 if __name__ == "__main__":
     unittest.main()

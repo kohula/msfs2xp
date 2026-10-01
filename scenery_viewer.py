@@ -45,6 +45,7 @@ _AGL_HEIGHT_OFFSET = -400.0
 
 _CMD_POOL_SELECT = 1
 _CMD_SET_DEF16 = 4
+_CMD_SET_DEF32 = 5
 _CMD_OBJECT = 7
 _CMD_COMMENT8 = 32
 
@@ -201,6 +202,9 @@ def parse_dsf(path: Path):
                 elif opcode == _CMD_SET_DEF16:
                     current_def = struct.unpack_from("<H", raw, pos + 1)[0]
                     pos += 3
+                elif opcode == _CMD_SET_DEF32:
+                    current_def = struct.unpack_from("<I", raw, pos + 1)[0]
+                    pos += 5
                 elif opcode == _CMD_OBJECT:
                     i = struct.unpack_from("<H", raw, pos + 1)[0]
                     pos += 3

@@ -4,7 +4,6 @@ Encodes 16-bit vertex pools using differenced + run-length encoding (encType 3),
 orders POOL before SCAL inside GEOD, and compiles standard X-Plane 12 DSF binaries.
 """
 
-import sys
 import math
 import struct
 import hashlib
@@ -217,33 +216,42 @@ def _build_polygon_pool_and_scal(tile_lat, tile_lon, points):
     return atom_pool + atom_scal
 
 
-def build_geod_atom(tile_lat, tile_lon, draped_objects, agl_objects, polygon_chunks=None):
-    """Builds the single GEOD atom, containing one point pool (index 0, the
-    ordinary 3-plane terrain-draped pool -- always present, even if empty,
-    so pool indexing stays stable) plus a second 4-plane pool (index 1) for
-    AGL-height objects, only when agl_objects is non-empty, plus one
-    ADDITIONAL 4-plane pool per entry in polygon_chunks (see build_dsf's own
-    chunking pass -- each chunk's points list is already capped at
-    _MAX_POLYGON_POOL_POINTS, since DSF pool point indices are u16 and one
-    real airport's draped triangle soup routinely needs far more than
-    65535 vertices total). Returns (atom_bytes, polygon_pool_indices) --
-    the caller (build_cmds_atom) needs to know which pool index each chunk
-    ended up at, since it depends on whether the AGL pool was written this
-    call (an empty-polygons tile must produce byte-identical GEOD output to
-    before this function grew polygon support -- polygon_chunks=None/[]
-    skips writing anything new, exactly reproducing the prior two-pool-max
-    behavior)."""
-    inner = _build_pool_and_scal(tile_lat, tile_lon, draped_objects, include_elevation=False)
-    next_index = 1
-    if agl_objects:
-        inner += _build_pool_and_scal(tile_lat, tile_lon, agl_objects, include_elevation=True)
+# Object pools have the same u16 point-index limit as polygon pools: the
+# Object command (7) addresses its point with a u16, so a tile with more
+# placements than this in one pool used to crash with a struct.error and
+# silently lose the whole tile. build_dsf splits each kind of object pool
+# into chunks of at most this many points.
+_MAX_OBJECT_POOL_POINTS = 65535
+
+
+def _chunks(items, size):
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+def build_geod_atom(tile_lat, tile_lon, draped_chunks, agl_chunks, polygon_chunks=None):
+    """Builds the single GEOD atom. Pool order: every 3-plane terrain-draped
+    object chunk (at least one, even if empty, so a tile with no objects
+    still has the pool 0 it always had), then every 4-plane AGL object
+    chunk, then one 4-plane pool per polygon chunk. Each chunk is already
+    capped at the u16 point-index limit by build_dsf. Returns (atom_bytes,
+    draped_pool_indices, agl_pool_indices, polygon_pool_indices)."""
+    draped_chunks = draped_chunks or [[]]
+    inner = b""
+    next_index = 0
+    draped_idx, agl_idx, polygon_idx = [], [], []
+    for chunk in draped_chunks:
+        inner += _build_pool_and_scal(tile_lat, tile_lon, chunk, include_elevation=False)
+        draped_idx.append(next_index)
         next_index += 1
-    polygon_pool_indices = []
+    for chunk in (agl_chunks or []):
+        inner += _build_pool_and_scal(tile_lat, tile_lon, chunk, include_elevation=True)
+        agl_idx.append(next_index)
+        next_index += 1
     for chunk in (polygon_chunks or []):
         inner += _build_polygon_pool_and_scal(tile_lat, tile_lon, chunk["points"])
-        polygon_pool_indices.append(next_index)
+        polygon_idx.append(next_index)
         next_index += 1
-    return pack_atom(b'DOEG', inner), polygon_pool_indices
+    return pack_atom(b'DOEG', inner), draped_idx, agl_idx, polygon_idx
 
 
 # --- OBJECT REFERENCES ---
@@ -278,25 +286,27 @@ _CMD_POLYGON_RANGE = 13
 _POLYGON_EXPLICIT_UV_PARAM = 65535
 
 
-def build_cmds_atom(draped_objects, agl_objects, unique_names, polygon_chunks=None, polygon_pool_indices=None):
-    """polygon_chunks: optional list of {"points": [...], "ranges": [(def_idx,
-    start_idx, end_idx), ...]} dicts, one per polygon POOL (see build_dsf's
-    own chunking pass) -- def_idx indexes into the POLY definition table
-    (unique .pol paths) the same way object placements index into
-    unique_names; start/end index LOCALLY into that chunk's own pool, built
-    by build_geod_atom (see its own polygon_pool_indices return value,
-    passed straight through here, one pool index per chunk in the same
-    order). Chunks are visited strictly in order (never revisited), so each
-    only ever needs ONE "select pool" command -- matches how the sorted
-    (largest-footprint-first) `polygons` list build_dsf assembles chunks
-    from is itself only ever walked forward once."""
+def _set_definition(cmds, def_idx):
+    """Set Definition: the 16-bit form (command 4), or the 32-bit form
+    (command 5) once a tile has more than 65535 distinct definitions."""
+    if def_idx <= 0xFFFF:
+        cmds.extend(struct.pack('<BH', 4, def_idx))
+    else:
+        cmds.extend(struct.pack('<BI', 5, def_idx))
+
+
+def build_cmds_atom(draped_chunks, agl_chunks, unique_names, polygon_chunks=None,
+                    draped_pool_indices=None, agl_pool_indices=None, polygon_pool_indices=None):
+    """draped_chunks/agl_chunks: object lists, one per pool, in the order
+    build_geod_atom wrote them (their pool indices are passed back in
+    alongside). polygon_chunks: list of {"points": [...], "ranges":
+    [(def_idx, start_idx, end_idx), ...]} dicts, one per polygon pool --
+    def_idx indexes the POLY definition table; start/end index LOCALLY
+    into that chunk's own pool."""
     cmds = bytearray()
     current_def = -1
-    # unique_names.index(...) per placement is O(defs) -- with a big tile's
-    # object count times its distinct-def count that made this the actual
-    # "stuck at DSF compilation" cost (no progress output during it either,
-    # so a slow tile just looked frozen). One dict, built once, makes each
-    # lookup O(1); output order/values are unchanged.
+    # unique_names.index(...) per placement is O(defs) -- one dict, built
+    # once, makes each lookup O(1).
     name_to_idx = {name: i for i, name in enumerate(unique_names)}
 
     def emit(objects):
@@ -304,20 +314,24 @@ def build_cmds_atom(draped_objects, agl_objects, unique_names, polygon_chunks=No
         for i, obj in enumerate(objects):
             def_idx = name_to_idx[obj_ref(obj)]
             if def_idx != current_def:
-                cmds.extend(struct.pack('<BH', 4, def_idx))
+                _set_definition(cmds, def_idx)
                 current_def = def_idx
             cmds.extend(struct.pack('<BH', 7, i))
 
-    cmds += struct.pack('<BH', 1, 0)  # select pool 0 (draped)
-    emit(draped_objects)
+    draped_chunks = draped_chunks or [[]]
+    draped_pool_indices = draped_pool_indices or list(range(len(draped_chunks)))
+    for chunk, pool_idx in zip(draped_chunks, draped_pool_indices):
+        cmds += struct.pack('<BH', 1, pool_idx)
+        emit(chunk)
 
-    if agl_objects:
+    if agl_chunks:
         # dsf_Cmd_Comment8(32), commentLen=6, dsf_Comment_AGL(2), want_agl=1
         # -- switches every subsequent object placed from a 4-plane pool
         # into AGL mode (instead of the default MSL) until changed again.
         cmds += struct.pack('<BBHi', 32, 6, 2, 1)
-        cmds += struct.pack('<BH', 1, 1)  # select pool 1 (agl)
-        emit(agl_objects)
+        for chunk, pool_idx in zip(agl_chunks, agl_pool_indices):
+            cmds += struct.pack('<BH', 1, pool_idx)
+            emit(chunk)
 
     if polygon_chunks:
         current_poly_def = -1
@@ -327,7 +341,7 @@ def build_cmds_atom(draped_objects, agl_objects, unique_names, polygon_chunks=No
             cmds += struct.pack('<BH', 1, pool_idx)  # select this chunk's polygon pool
             for def_idx, start_idx, end_idx in chunk["ranges"]:
                 if def_idx != current_poly_def:
-                    cmds.extend(struct.pack('<BH', 4, def_idx))
+                    _set_definition(cmds, def_idx)
                     current_poly_def = def_idx
                 cmds.extend(struct.pack('<BHHH', _CMD_POLYGON_RANGE, _POLYGON_EXPLICIT_UV_PARAM, start_idx, end_idx))
 
@@ -487,10 +501,13 @@ def build_dsf(tile_lat, tile_lon, objects, out_path: Path, exclusions=None, excl
     atom_demn = pack_atom(b'NMED', b'')
 
     atom_defn = pack_atom(b'NFED', atom_tert + atom_objt + atom_poly + atom_netw + atom_demn)
-    atom_geod, polygon_pool_indices = build_geod_atom(
-        tile_lat, tile_lon, draped_objects, agl_objects, polygon_chunks)
+    draped_chunks = _chunks(draped_objects, _MAX_OBJECT_POOL_POINTS) or [[]]
+    agl_chunks = _chunks(agl_objects, _MAX_OBJECT_POOL_POINTS)
+    atom_geod, draped_idx, agl_idx, polygon_pool_indices = build_geod_atom(
+        tile_lat, tile_lon, draped_chunks, agl_chunks, polygon_chunks)
     atom_cmds = build_cmds_atom(
-        draped_objects, agl_objects, unique_obj_names, polygon_chunks, polygon_pool_indices)
+        draped_chunks, agl_chunks, unique_obj_names, polygon_chunks,
+        draped_idx, agl_idx, polygon_pool_indices)
 
     dsf_header = b'XPLNEDSF' + struct.pack('<I', 1)
     full_dsf_data = dsf_header + atom_head + atom_defn + atom_geod + atom_cmds
