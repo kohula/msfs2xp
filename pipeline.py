@@ -38,6 +38,7 @@ import scenery_viewer
 import geo_transform
 from mesh_convert import mesh_ir
 from mesh_convert.convert import dds_file_is_xplane_loadable, decode_dds_bytes_to_png
+from mesh_convert.convert import DEFAULT_GLASS_OPACITY as mesh_convert_glass_default
 from mesh_convert.convert import flag_stray_vertices
 
 # CONFIRMED REAL BUG this fixes: mesh_convert/convert.py (and any other
@@ -957,7 +958,7 @@ def _package_version(package_module):
 
 
 def cached_convert(glb_path, obj_dir, tex_dir, ext_tex_dir, pitch, yaw, roll, disable_cache=False,
-                    static_doors=False):
+                    static_doors=False, glass_opacity=mesh_convert_glass_default):
     """Disk-cached wrapper around mesh_convert.convert -- this is the
     picklable function submitted to the mesh-conversion process pool. On a
     cache hit it skips the actual GLTF parse/vertex processing/OBJ write
@@ -997,6 +998,7 @@ def cached_convert(glb_path, obj_dir, tex_dir, ext_tex_dir, pitch, yaw, roll, di
         # rather than relying on repr().
         "|".join(str(p) for p in ext_tex_dir) if isinstance(ext_tex_dir, (list, tuple)) else (str(ext_tex_dir) if ext_tex_dir else ""),
         str(static_doors),
+        f"glass{int(glass_opacity)}",
     )
     obj_dir = Path(obj_dir)
     tex_dir = Path(tex_dir)
@@ -1025,7 +1027,8 @@ def cached_convert(glb_path, obj_dir, tex_dir, ext_tex_dir, pitch, yaw, roll, di
         # Cache entry incomplete/pruned -- fall through and reconvert.
 
     result_paths = mesh_convert.convert(glb_path, obj_dir, tex_dir, ext_tex_dir, pitch, yaw, roll,
-                                         disable_proximity_animation=static_doors)
+                                         disable_proximity_animation=static_doors,
+                                         glass_opacity=glass_opacity)
 
     if result_paths and not disable_cache:
         try:
@@ -1476,6 +1479,8 @@ class PipelineOptions:
     # Add the MSFS painted-line records as apt.dat lines (off by default:
     # draped models usually already carry the markings).
     native_painted_lines: bool = False
+    # How opaque blended MSFS glass is drawn, percent (100 = solid).
+    glass_opacity: int = mesh_convert_glass_default
 
 
 class PipelineHooks:
@@ -1758,7 +1763,7 @@ def run_pipeline(opts, hooks):
                     executor.submit(
                         cached_convert,
                         m, obj_dir, tex_dir, external_textures_root, "0.0", "180.0", "0.0",
-                        opts.disable_cache, opts.static_doors
+                        opts.disable_cache, opts.static_doors, opts.glass_opacity
                     ): m.stem for m in model_files
                 }
                 

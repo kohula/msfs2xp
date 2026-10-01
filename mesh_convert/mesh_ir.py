@@ -30,6 +30,15 @@ from pathlib import Path
 import numpy as np
 
 
+# An object's parts (one .obj per material) are all placed at the same
+# point, and X-Plane draws the objects of one layer group in no particular
+# order -- so a glass part drawn before the walls/interior behind it writes
+# depth and hides them. One group step later puts every object with
+# blended geometry after all the opaque ones. A global attribute: it goes
+# in the header, before POINT_COUNTS.
+BLENDED_LAYER_GROUP = "ATTR_layer_group objects 1"
+
+
 @dataclass
 class LightEntry:
     pos: tuple  # (x, y, z) world-space
@@ -66,6 +75,13 @@ class MeshIR:
     alpha_mode: str = "OPAQUE"  # OPAQUE | BLEND | MASK
     alpha_cutoff: float = 0.5
     lights: list = field(default_factory=list)  # list[LightEntry] -- only for the "_lights" pseudo-sub-object
+    # The night and normal-map textures the .obj was written with. Without
+    # these a terrain-fitted or merged copy lost its TEXTURE_LIT (glass and
+    # windows no longer lit at night) and its normal map.
+    texture_lit: str | None = None
+    texture_normal: str | None = None
+    normal_metalness: bool = False
+    is_glass: bool = False
     footprint_area_m2: float | None = None
     proximity_dataref: str | None = None
 
@@ -104,7 +120,16 @@ def write_obj8(ir: MeshIR, obj_path: Path) -> None:
         lines.append("TILTED\n")
 
     if len(ir.positions):
-        lines.append(f"TEXTURE {ir.texture or ''}\n\n")
+        lines.append(f"TEXTURE {ir.texture or ''}\n")
+        if ir.texture_normal:
+            lines.append(f"TEXTURE_NORMAL {ir.texture_normal}\n")
+            if ir.normal_metalness:
+                lines.append("NORMAL_METALNESS\n")
+        if ir.texture_lit:
+            lines.append(f"TEXTURE_LIT {ir.texture_lit}\n")
+        if ir.alpha_mode == "BLEND" and not ir.draped:
+            lines.append(BLENDED_LAYER_GROUP + "\n")
+        lines.append("\n")
         lines.append(f"POINT_COUNTS {len(ir.positions)} 0 0 {len(ir.indices)}\n\n")
         for (x, y, z), (nx, ny, nz), (u, v) in zip(ir.positions, ir.normals, ir.uvs):
             lines.append(f"VT {x:.5f} {y:.5f} {z:.5f} {nx:.5f} {ny:.5f} {nz:.5f} {u:.5f} {v:.5f}\n")
@@ -117,7 +142,7 @@ def write_obj8(ir: MeshIR, obj_path: Path) -> None:
             lines.append("ATTR_no_cull\n")
         if ir.alpha_mode == "BLEND":
             lines.append("ATTR_blend\n")
-            lines.append("ATTR_shiny_rat 0.5\n")
+            lines.append(f"ATTR_shiny_rat {'1.0' if ir.is_glass else '0.5'}\n")
         elif ir.alpha_mode == "MASK":
             lines.append(f"ATTR_no_blend {ir.alpha_cutoff:.3f}\n")
             lines.append("ATTR_shiny_rat 0.5\n")

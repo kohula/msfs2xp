@@ -1051,12 +1051,80 @@ def _is_reusable_texture(png_path):
 
 
 _REAL_TRANSPARENCY_ALPHA_THRESHOLD = 250
-# Alpha (0-255) a glass/window material is forced to when its own albedo
-# carries no real transparency -- deliberately low, for a genuinely clear
-# pane rather than a grey sheet. Paired with forced double-sided
-# (ATTR_no_cull) so the far wall/interior still draws behind it. Raise
-# toward ~80-120 for a more visibly tinted look.
-_GLASS_TRANSLUCENCY_FLOOR = 24
+
+# How opaque blended MSFS glass is drawn, in percent (convert()'s
+# glass_opacity). MSFS glass gets its look from reflections X-Plane
+# doesn't draw -- its albedo alpha is often ~0.01 -- so drawn at its own
+# alpha (or the old 24/255 floor multiplied onto it) it all but vanished.
+# At 100 glass is drawn opaque, which also sidesteps blending entirely.
+DEFAULT_GLASS_OPACITY = 50
+
+
+def glass_alpha_255(opacity_pct):
+    return int(round(max(1, min(100, opacity_pct)) * 255 / 100))
+
+
+def apply_glass_alpha(png_path, alpha_255):
+    """Copy of a glass texture where every texel is at least `alpha_255`
+    opaque: panes the author left near-invisible read as glass at the
+    chosen opacity, while opaque texels (frames, mullions painted into the
+    same texture) stay opaque. The colour is untouched."""
+    new_name = f"{png_path.stem}_glass{alpha_255}.png"
+    new_path = png_path.with_name(new_name)
+    with _TEXTURE_LOCK:
+        if new_path.exists() and new_path.stat().st_size > 100 and _is_valid_image(new_path):
+            return new_name
+    try:
+        arr = np.array(Image.open(png_path).convert("RGBA"))
+        arr[..., 3] = np.maximum(arr[..., 3], alpha_255)
+        temp_path = new_path.with_name(f"{new_name}.tmp_{_unique_suffix()}")
+        Image.fromarray(arr, "RGBA").save(temp_path, "PNG")
+        _atomic_replace(temp_path, new_path)
+        return new_name
+    except Exception:
+        return png_path.name
+
+
+_OPAQUE_COPY_CACHE = {}
+
+
+def make_opaque_copy(textures_dir, texture_name):
+    key = (str(textures_dir), texture_name)
+    if key not in _OPAQUE_COPY_CACHE:
+        _OPAQUE_COPY_CACHE[key] = _make_opaque_copy(textures_dir, texture_name)
+    return _OPAQUE_COPY_CACHE[key]
+
+
+def _make_opaque_copy(textures_dir, texture_name):
+    """glTF OPAQUE materials ignore their texture's alpha, but X-Plane
+    alpha-tests every object (ATTR_no_blend), so stray alpha in an MSFS
+    albedo -- commonly a reflection/glass mask on facade textures --
+    punched see-through holes where windows are. Returns the name of a copy
+    with alpha forced opaque when the texture has see-through texels, else
+    the name unchanged. Reads PNG and DXT DDS (Pillow decodes both)."""
+    src = Path(textures_dir) / texture_name
+    try:
+        with Image.open(src) as img:
+            if "A" not in img.getbands() and img.mode not in ("RGBA", "LA", "P"):
+                return texture_name
+            rgba = img.convert("RGBA")
+    except Exception:
+        return texture_name
+    if rgba.getchannel("A").getextrema()[0] >= _REAL_TRANSPARENCY_ALPHA_THRESHOLD:
+        return texture_name
+    new_name = f"{Path(texture_name).stem}_opaque.png"
+    new_path = src.with_name(new_name)
+    with _TEXTURE_LOCK:
+        if new_path.exists() and new_path.stat().st_size > 100 and _is_valid_image(new_path):
+            return new_name
+    try:
+        rgba.putalpha(255)
+        temp_path = new_path.with_name(f"{new_name}.tmp_{_unique_suffix()}")
+        rgba.save(temp_path, "PNG")
+        _atomic_replace(temp_path, new_path)
+        return new_name
+    except Exception:
+        return texture_name
 
 
 def _texture_has_real_transparency(png_path):
@@ -1791,7 +1859,7 @@ def _vertex_positions_are_subset(small_verts, big_verts, eps=0.05):
 
 
 def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.0, yaw=0.0, roll=0.0,
-            disable_proximity_animation=False):
+            disable_proximity_animation=False, glass_opacity=DEFAULT_GLASS_OPACITY):
     global _EXPORTED_COUNT
     glb_path = Path(glb_path)
     objects_dir = Path(objects_dir)
@@ -2472,24 +2540,22 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                             # translucency is the closer approximation.
                             builder.alpha_mode = "BLEND"
                             builder.is_glass = True
-                            # CAP the pane alpha at the floor, don't just
-                            # fill it in when the author left it opaque -- a
-                            # parallax window authored at, say, 50% still has
-                            # to read as clear glass, not a milky sheet.
-                            builder.base_color_factor = (
-                                builder.base_color_factor[0], builder.base_color_factor[1], builder.base_color_factor[2],
-                                min(builder.base_color_factor[3], _GLASS_TRANSLUCENCY_FLOOR))
-                        elif builder.is_glass and builder.alpha_mode == "BLEND":
-                            # A genuine glass material already authored
-                            # BLEND, but relying on the TEXTURE's own alpha
-                            # for the real punch-through pattern (its own
-                            # baseColorFactor may default to opaque). Cap
-                            # the factor alpha at the floor unconditionally
-                            # -- glazing should read as genuinely
-                            # see-through, not partially tinted.
-                            builder.base_color_factor = (
-                                builder.base_color_factor[0], builder.base_color_factor[1], builder.base_color_factor[2],
-                                min(builder.base_color_factor[3], _GLASS_TRANSLUCENCY_FLOOR))
+
+                        # Blended glass is drawn at the chosen glass
+                        # opacity (see DEFAULT_GLASS_OPACITY), not at the
+                        # author's alpha: the pane alpha is SET to it (an
+                        # untextured pane's colour swatch below, a textured
+                        # pane's texels via apply_glass_alpha), at 100%
+                        # the glass is simply drawn opaque.
+                        _blended_glass = builder.is_glass and builder.alpha_mode == "BLEND"
+                        if _blended_glass:
+                            if glass_opacity >= 100:
+                                builder.alpha_mode = "OPAQUE"
+                                _blended_glass = False
+                            else:
+                                builder.base_color_factor = (
+                                    builder.base_color_factor[0], builder.base_color_factor[1],
+                                    builder.base_color_factor[2], glass_alpha_255(glass_opacity))
 
                         # MSFS glass/alpha-blended surfaces are often
                         # authored single-sided (doubleSided: false) and
@@ -2537,7 +2603,10 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                                     builder.texture_name = apply_color_factor(
                                         textures_dir / builder.texture_name, builder.base_color_factor[:3])
 
-                                if builder.alpha_mode == "BLEND" and builder.base_color_factor[3] < 255:
+                                if _blended_glass:
+                                    builder.texture_name = apply_glass_alpha(
+                                        textures_dir / builder.texture_name, glass_alpha_255(glass_opacity))
+                                elif builder.alpha_mode == "BLEND" and builder.base_color_factor[3] < 255:
                                     builder.texture_name = apply_alpha_factor(textures_dir / builder.texture_name, builder.base_color_factor[3])
 
                                 # Some exporters stamp alphaMode BLEND
@@ -2551,19 +2620,10 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                                 # texture actually carries real
                                 # transparency (checked via decoded alpha
                                 # extrema, not by re-trusting alphaMode).
-                                if builder.alpha_mode == "BLEND" and builder.base_color_factor[3] >= 250:
-                                    if builder.is_glass:
-                                        # Glass with an opaque-ish albedo still has to READ as
-                                        # glass: keep BLEND and bake a translucency floor into
-                                        # the texture's alpha now (apply_alpha_factor already
-                                        # ran above with the then-opaque factor).
-                                        builder.base_color_factor = (
-                                            builder.base_color_factor[0], builder.base_color_factor[1],
-                                            builder.base_color_factor[2], _GLASS_TRANSLUCENCY_FLOOR)
-                                        builder.texture_name = apply_alpha_factor(
-                                            textures_dir / builder.texture_name, _GLASS_TRANSLUCENCY_FLOOR)
-                                    elif not _texture_has_real_transparency(textures_dir / builder.texture_name):
-                                        builder.alpha_mode = "OPAQUE"
+                                if (builder.alpha_mode == "BLEND" and not _blended_glass
+                                        and builder.base_color_factor[3] >= 250
+                                        and not _texture_has_real_transparency(textures_dir / builder.texture_name)):
+                                    builder.alpha_mode = "OPAQUE"
 
                         normal_tex = find_normal_texture(mat)
                         if normal_tex and "index" in normal_tex:
@@ -3403,6 +3463,9 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
             # reintroducing the stale one on any object they touch.
             builder.vertices = [(v[0], 0.0, v[2]) for v in builder.vertices]
 
+        if builder.alpha_mode == "OPAQUE" and builder.texture_name and not builder_is_draped:
+            builder.texture_name = make_opaque_copy(textures_dir, builder.texture_name)
+
         with obj_path.open("w", encoding="utf-8") as f:
             f.write("I\n800\nOBJ\n\n")
 
@@ -3411,6 +3474,8 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                 f.write(f"TEXTURE_NORMAL ../textures/{builder.normal_texture_name}\n")
             if builder.emissive_texture_name:
                 f.write(f"TEXTURE_LIT ../textures/{builder.emissive_texture_name}\n")
+            if builder.alpha_mode == "BLEND" and not builder_is_draped:
+                f.write(mesh_ir_module.BLENDED_LAYER_GROUP + "\n")
             f.write("\n")
 
             f.write(f"POINT_COUNTS {num_verts} 0 0 {num_indices}\n\n")
@@ -3578,6 +3643,9 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                 alpha_cutoff=builder.alpha_cutoff,
                 footprint_area_m2=builder_footprint_area,
                 proximity_dataref=builder.proximity_dataref,
+                texture_lit=(f"../textures/{builder.emissive_texture_name}" if builder.emissive_texture_name else None),
+                texture_normal=(f"../textures/{builder.normal_texture_name}" if builder.normal_texture_name else None),
+                is_glass=bool(getattr(builder, "is_glass", False)),
             )
             mesh_ir_module.save(ir, mesh_ir_module.sidecar_path_for(obj_path))
 

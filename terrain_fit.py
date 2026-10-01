@@ -96,6 +96,7 @@ only leaves that vertex unwarped. This is a best-effort visual
 improvement, never something that should block a conversion run.
 """
 
+import dataclasses
 import hashlib
 import pickle
 from pathlib import Path
@@ -246,13 +247,9 @@ def apply_shared_shift_to_group(obj_dir, obj_stems, transform, xplane_root):
         shifted = _apply_vertical_shift(ir, vertical_shift)
 
         digest = hashlib.md5(f"{vertical_shift}_{stem}".encode("utf-8")).hexdigest()[:10]
-        corrected = mesh_ir.MeshIR(
-            name=f"{stem}_tfitlink_{digest}", texture=ir.texture, tilted=False,
-            draped=ir.draped, draped_layer_offset=ir.draped_layer_offset,
-            double_sided=ir.double_sided, alpha_mode=ir.alpha_mode, alpha_cutoff=ir.alpha_cutoff,
-            footprint_area_m2=ir.footprint_area_m2, proximity_dataref=ir.proximity_dataref,
-            positions=shifted, normals=ir.normals, uvs=ir.uvs, indices=ir.indices,
-        )
+        # dataclasses.replace keeps every other field (night/normal
+        # textures, glass, draped layer group) instead of re-listing them.
+        corrected = dataclasses.replace(ir, name=f"{stem}_tfitlink_{digest}", tilted=False, positions=shifted)
         fitted_path = obj_dir / f"{corrected.name}.obj"
         if not fitted_path.exists():
             mesh_ir.write_obj8(corrected, fitted_path)
@@ -404,16 +401,18 @@ def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_d
                 result[stem] = (stem, False, "rigid_skip" if len(ir.positions) else "disqualified")
             continue
 
-        corrected = mesh_ir.MeshIR(
+        corrected = dataclasses.replace(
             # tilted=False whenever this sibling's geometry is corrected
             # (warp or shift), replacing TILTED's own rotation rather
             # than stacking with it. A sibling reaching here only for its
-            # lights keeps its original tilted flag untouched.
-            name=f"{stem}_tfit_{digest}", texture=ir.texture,
-            tilted=False if (warp_positions or rigid_warp or rigid_shift) else ir.tilted, draped=ir.draped,
-            draped_layer_offset=ir.draped_layer_offset, double_sided=ir.double_sided,
-            alpha_mode=ir.alpha_mode, alpha_cutoff=ir.alpha_cutoff,
-            footprint_area_m2=ir.footprint_area_m2, proximity_dataref=ir.proximity_dataref,
+            # lights keeps its original tilted flag untouched. Geometry
+            # and lights start empty and are filled in below, exactly as
+            # before; every other field (night/normal textures, glass,
+            # draped layer group) carries over.
+            ir, name=f"{stem}_tfit_{digest}",
+            tilted=False if (warp_positions or rigid_warp or rigid_shift) else ir.tilted,
+            positions=np.zeros((0, 3)), normals=np.zeros((0, 3)), uvs=np.zeros((0, 2)),
+            indices=np.zeros((0,), dtype=np.int64), lights=[],
         )
         if warp_positions or rigid_warp:
             warped = ir.positions.copy()

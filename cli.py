@@ -32,6 +32,8 @@ def build_parser():
                    help="write draped ground as .pol DSF polygons instead of draped .obj")
     p.add_argument("--native-runways", action="store_true",
                    help="apt.dat: draw X-Plane runways with markings instead of a transparent surface")
+    p.add_argument("--glass-opacity", type=int, default=50, metavar="PCT",
+                   help="how opaque building glass is drawn, 1-100 (default 50; 100 = solid)")
     p.add_argument("--painted-lines", action="store_true",
                    help="apt.dat: paint the MSFS painted-line records")
     return p
@@ -54,6 +56,7 @@ def main(argv=None):
         prompt_replacements=False,
         runway_surface="native" if a.native_runways else "transparent",
         native_painted_lines=a.painted_lines,
+        glass_opacity=max(1, min(100, a.glass_opacity)),
     )
     run_pipeline(opts, PipelineHooks())
     return 0

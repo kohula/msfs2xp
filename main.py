@@ -368,6 +368,9 @@ class ModularPythonConverterApp:
         # pavement), and paint the MSFS painted-line records.
         self.native_runways_var = tk.BooleanVar(value=False)
         self.native_painted_lines_var = tk.BooleanVar(value=False)
+        # How opaque blended MSFS glass is drawn (MSFS glass relies on
+        # reflections X-Plane doesn't draw, so its own alpha is near zero).
+        self.glass_opacity_var = tk.IntVar(value=50)
         self.is_maximized = False
         self._is_minimizing = False
         
@@ -532,6 +535,7 @@ class ModularPythonConverterApp:
                     self.pol_polygons_var.set(data.get("pol_polygons", False))
                     self.native_runways_var.set(data.get("native_runways", False))
                     self.native_painted_lines_var.set(data.get("native_painted_lines", False))
+                    self.glass_opacity_var.set(int(data.get("glass_opacity", 50)))
                     geom = data.get("geometry")
                     if geom:
                         self.root.geometry(geom)
@@ -555,6 +559,7 @@ class ModularPythonConverterApp:
                     "pol_polygons": self.pol_polygons_var.get(),
                     "native_runways": self.native_runways_var.get(),
                     "native_painted_lines": self.native_painted_lines_var.get(),
+                    "glass_opacity": self.glass_opacity_var.get(),
                     "geometry": self.root.geometry()
                 }, f)
         except Exception:
@@ -694,6 +699,13 @@ class ModularPythonConverterApp:
             options_inner, "apt.dat: paint the MSFS painted lines (if the draped models don't carry them)",
             self.native_painted_lines_var
         ).grid(row=8, column=0, columnspan=4, sticky="w", pady=4)
+        glass_row = tk.Frame(options_inner, bg=self.card_bg)
+        glass_row.grid(row=9, column=0, columnspan=4, sticky="w", pady=4)
+        tk.Label(glass_row, text="Glass opacity % (100 = solid):", bg=self.card_bg, fg="#cccccc",
+                 font=("Segoe UI", 9)).pack(side=tk.LEFT)
+        tk.Spinbox(glass_row, from_=1, to=100, increment=5, width=5, textvariable=self.glass_opacity_var,
+                   bg="#1c1c1e", fg="#ffffff", buttonbackground="#2a2a2e", relief=tk.FLAT,
+                   insertbackground="#ffffff").pack(side=tk.LEFT, padx=(8, 0))
 
         # --- PROGRESS CARD ---
         prog_card = RoundedCard(left_col, bg_color=self.bg_dark, card_bg=self.card_bg, radius=12, height=210)
@@ -818,6 +830,12 @@ class ModularPythonConverterApp:
             return
         threading.Thread(target=wipe_cache_and_temp, args=(self.log,), daemon=True).start()
 
+    def _glass_opacity(self):
+        try:
+            return int(self.glass_opacity_var.get())
+        except (tk.TclError, ValueError):
+            return 50
+
     def run_pipeline(self):
         opts = PipelineOptions(
             pkg_dir=self.pkg_var.get(),
@@ -834,6 +852,7 @@ class ModularPythonConverterApp:
             prompt_replacements=self.prompt_replacements_var.get(),
             runway_surface="native" if self.native_runways_var.get() else "transparent",
             native_painted_lines=self.native_painted_lines_var.get(),
+            glass_opacity=max(1, min(100, self._glass_opacity())),
         )
         try:
             run_pipeline(opts, _GuiHooks(self))
