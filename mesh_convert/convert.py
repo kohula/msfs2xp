@@ -989,6 +989,36 @@ def decode_dds_bytes_to_png(raw_bytes, out_png_path):
         return False
 
 
+def dds_is_xplane_loadable(header):
+    """True only for a DDS X-Plane's loader is known to accept as-is:
+    legacy DXT1/DXT3/DXT5 FourCC (no DX10 extension header -- BC4/5/7
+    in a DX10 DDS load as "missing texture"), power-of-two sides (anything
+    else is refused with "DDS but its size is not power of 2"), and a real
+    mip chain (a single-level DDS is rejected outright). `header` needs
+    only the first 128 bytes. Anything failing this must be decoded to
+    PNG instead of passed through -- MSFS 2020 packages ship their
+    .PNG.DDS textures mostly as BC7/BC5 in DX10 files, exactly the kind
+    that fails."""
+    if len(header) < 128 or header[:4] != b"DDS ":
+        return False
+    height, width = struct.unpack_from("<II", header, 12)
+    mip_count = struct.unpack_from("<I", header, 28)[0]
+    fourcc = header[84:88]
+    if fourcc not in (b"DXT1", b"DXT3", b"DXT5"):
+        return False
+    if width <= 0 or height <= 0 or width & (width - 1) or height & (height - 1):
+        return False
+    return mip_count > 1 or (width == 1 and height == 1)
+
+
+def dds_file_is_xplane_loadable(path):
+    try:
+        with open(path, "rb") as f:
+            return dds_is_xplane_loadable(f.read(128))
+    except OSError:
+        return False
+
+
 def _is_valid_image(path):
     """True only if path opens AND fully decodes without error -- used
     everywhere this pipeline decides whether an existing output file can
@@ -1446,7 +1476,8 @@ def extract_image(gltf, buffers, image_index, glb_path, textures_dir, external_t
         # referenced by any compiled .obj (0/1276), a pure ~2.7GB waste.
         # This check makes the CURRENT caller's own allow_dds_passthrough
         # decide first, independent of what any other caller needed.
-        if allow_dds_passthrough and out_dds_path.exists() and out_dds_path.stat().st_size > 100:
+        if (allow_dds_passthrough and out_dds_path.exists() and out_dds_path.stat().st_size > 100
+                and dds_file_is_xplane_loadable(out_dds_path)):
             cache[image_index] = out_dds_path.name
             return out_dds_path.name
         if out_png_path.exists() and out_png_path.stat().st_size > 100 and _is_reusable_texture(out_png_path):
@@ -1458,7 +1489,7 @@ def extract_image(gltf, buffers, image_index, glb_path, textures_dir, external_t
         passthrough when allowed and the bytes really are DDS, else the
         existing decode-to-PNG path. Returns the output filename actually
         written, or None on failure -- same contract save_as_png had."""
-        if allow_dds_passthrough and raw_bytes[:4] == b"DDS ":
+        if allow_dds_passthrough and dds_is_xplane_loadable(raw_bytes):
             temp_path = dest_path.with_name(f"{out_dds_path.name}.tmp_{_unique_suffix()}")
             temp_path.write_bytes(raw_bytes)
             _atomic_replace(temp_path, out_dds_path)
@@ -1548,7 +1579,8 @@ def extract_image(gltf, buffers, image_index, glb_path, textures_dir, external_t
                 _atomic_replace(temp_path, out_png_path)
                 cache[image_index] = out_name
                 return out_name
-            elif allow_dds_passthrough and match.suffix.lower() == ".dds":
+            elif (allow_dds_passthrough and match.suffix.lower() == ".dds"
+                  and dds_file_is_xplane_loadable(match)):
                 # Usually a self-match: Step 2's own bulk KTX2 pass
                 # (main.py) already wrote exactly this file at exactly
                 # out_dds_path before any model conversion started, so

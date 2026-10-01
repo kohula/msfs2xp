@@ -35,6 +35,7 @@ import draped_merge
 import scenery_viewer
 import geo_transform
 from mesh_convert import mesh_ir
+from mesh_convert.convert import dds_file_is_xplane_loadable, decode_dds_bytes_to_png
 from mesh_convert.convert import flag_stray_vertices
 
 # CONFIRMED REAL BUG this fixes: mesh_convert/convert.py (and any other
@@ -1577,25 +1578,44 @@ def run_pipeline(opts, hooks):
         standard_textures = [p for p in pkg_files if p.is_file() and p.suffix.lower() in valid_exts and p.suffix.lower() != '.ktx2']
         
         copied_count = 0
+        decoded_dds_count = 0
         for p in standard_textures:
             raw_name = p.name.lower()
             actual_ext = p.suffix.lower()
-            
+
             clean_base = raw_name
             for ext in ['.png.dds', '.dds', '.jpg', '.jpeg', '.tga', '.png']:
                 if clean_base.endswith(ext):
                     clean_base = clean_base[:-len(ext)]
                     break
-                    
-            target_name = clean_base + actual_ext
-            target = tex_dir / target_name
-            
+
+            # A DDS X-Plane can't load as-is (BC7/BC5 in a DX10 file, odd
+            # sizes, no mips -- most MSFS 2020 .PNG.DDS textures) is
+            # decoded to PNG here instead of copied, so nothing downstream
+            # can pick the unloadable file up by name.
+            if actual_ext == ".dds" and not dds_file_is_xplane_loadable(p):
+                target = tex_dir / f"{clean_base}.png"
+                if target.exists():
+                    continue
+                try:
+                    if decode_dds_bytes_to_png(p.read_bytes(), target):
+                        decoded_dds_count += 1
+                except OSError:
+                    pass
+                continue
+
+            target = tex_dir / (clean_base + actual_ext)
+            # First one wins within a run; the output folder is cleared of
+            # last run's textures up front, so this never keeps a stale file.
             if not target.exists():
                 try:
                     shutil.copy2(p, target)
                     copied_count += 1
                 except Exception:
                     pass
+        if decoded_dds_count:
+            hooks.log(f"Decoded {decoded_dds_count} DDS texture(s) X-Plane can't load as-is "
+                      f"(DX10/BC7/BC5, non-power-of-2 or no mips) to PNG.", "info")
         hooks.log(f"Copied {copied_count} standard textures into 'textures' folder.", "success")
 
         ktx2_files = [p for p in pkg_files if p.is_file() and p.suffix.lower() == '.ktx2']

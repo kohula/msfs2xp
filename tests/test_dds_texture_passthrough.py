@@ -17,6 +17,7 @@ them might.
 import importlib
 import sys
 import tempfile
+import struct
 import unittest
 from pathlib import Path
 
@@ -25,10 +26,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
 import mesh_convert
 convert_module = importlib.import_module("mesh_convert.convert")
 
-# A minimal payload that only needs to satisfy extract_image's own
-# passthrough check (raw_bytes[:4] == b"DDS ") -- passthrough never
-# decodes it, so it doesn't need to be a real, fully-valid DDS.
-_FAKE_DDS_BYTES = b"DDS " + b"\x00" * 124 + b"FAKEPIXELDATA"
+# A DDS X-Plane can load as-is (DXT1, power-of-2, real mip chain) --
+# the only kind extract_image passes through (see
+# convert.dds_is_xplane_loadable). Passthrough never decodes it, so the
+# block contents don't matter.
+def _loadable_dds(level_bytes):
+    flags = 0x1 | 0x2 | 0x4 | 0x1000 | 0x80000 | 0x20000
+    head = struct.pack("<7I11I", 124, flags, 4, 4, 8, 0, len(level_bytes), *([0] * 11))
+    pf = struct.pack("<2I4s5I", 32, 0x4, b"DXT1", 0, 0, 0, 0, 0)
+    caps = struct.pack("<5I", 0x1000 | 0x8 | 0x400000, 0, 0, 0, 0)
+    return b"DDS " + head + pf + caps + b"".join(level_bytes)
+
+
+_FAKE_DDS_BYTES = _loadable_dds([b"FAKEPIXL", b"FAKEPIX2", b"FAKEPIX3"])
+# BC7 in a DX10 file, as MSFS 2020 ships most .PNG.DDS textures: X-Plane
+# can't load it, so it must be decoded rather than passed through.
+_DX10_DDS_BYTES = (b"DDS " + struct.pack("<7I11I", 124, 0x1007, 4, 4, 16, 0, 0, *([0] * 11))
+                   + struct.pack("<2I4s5I", 32, 0x4, b"DX10", 0, 0, 0, 0, 0)
+                   + struct.pack("<5I", 0x1000, 0, 0, 0, 0)
+                   + struct.pack("<5I", 98, 3, 0, 1, 0) + b"\x00" * 16)
 _FAKE_PNG_BYTES = None  # filled in by setUpModule
 
 
@@ -62,6 +78,27 @@ class TestDdsPassthrough(unittest.TestCase):
             self.assertTrue(out_name.endswith(".dds"), f"expected a .dds passthrough, got {out_name!r}")
             written = (textures_dir / out_name).read_bytes()
             self.assertEqual(written, _FAKE_DDS_BYTES, "passthrough must write the exact original bytes, no re-encoding")
+
+    def test_dds_x_plane_cannot_load_is_decoded_even_when_passthrough_allowed(self):
+        with tempfile.TemporaryDirectory() as td:
+            textures_dir = Path(td)
+            gltf, buffers = _make_gltf_with_embedded_image(_DX10_DDS_BYTES)
+            out_name = convert_module.extract_image(
+                gltf, buffers, 0, Path(td) / "model.glb", textures_dir, None, {}, (255, 255, 255, 255),
+                allow_dds_passthrough=True,
+            )
+            self.assertTrue(out_name.endswith(".png"), f"a DX10/BC7 DDS must be decoded, got {out_name!r}")
+            self.assertFalse((textures_dir / "sometexture.dds").exists())
+
+    def test_loadability_check(self):
+        self.assertTrue(convert_module.dds_is_xplane_loadable(_FAKE_DDS_BYTES))
+        self.assertFalse(convert_module.dds_is_xplane_loadable(_DX10_DDS_BYTES), "DX10 header")
+        single = bytearray(_FAKE_DDS_BYTES)
+        single[28:32] = b"\x00\x00\x00\x00"
+        self.assertFalse(convert_module.dds_is_xplane_loadable(bytes(single)), "no mip chain")
+        odd = bytearray(_FAKE_DDS_BYTES)
+        odd[16:20] = (6).to_bytes(4, "little")
+        self.assertFalse(convert_module.dds_is_xplane_loadable(bytes(odd)), "not a power of 2")
 
     def test_dds_bytes_still_decoded_when_passthrough_not_allowed(self):
         """The default (allow_dds_passthrough=False, matching every
