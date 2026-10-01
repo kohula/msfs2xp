@@ -28,6 +28,7 @@ import bgl_extractor
 import dsf_compiler
 import apt_dat
 import apt_native
+import obj_scale
 import mesh_convert
 import cache_utils
 import gpu_accel
@@ -1800,6 +1801,53 @@ def run_pipeline(opts, hooks):
 
         hooks.log(f"Mesh conversion finished. Successfully converted {completed_models}/{total_models} models.")
 
+        # GUID-miss fallback: resolve a placement to a converted model
+        # by its TITLE when guid_map doesn't. Used by BOTH the
+        # terrain-fit pre-warm and the placement loop so a title-
+        # resolved object gets the same treatment a guid-resolved one
+        # would (pre-warmed fit, offsets, AGL) instead of silently
+        # disappearing. A scaled placement resolves to its scaled copy
+        # (see the scaled-variant pass just below).
+        title_stem_index = build_title_stem_index(converted_stems_map)
+
+        def _resolve_original_stem(pl):
+            if pl.get("_scaled_stem"):
+                return pl["_scaled_stem"]
+            st = guid_map.get(pl["guid"])
+            if st and st in converted_stems_map:
+                return st
+            tk = _model_stem_basename(pl.get("title"))
+            if tk:
+                cand = title_stem_index.get(tk)
+                if cand:
+                    return cand
+            return st  # None or an unconverted stem -> falls through to the picker
+
+        # Scaled placements: a DSF placement can't scale an object, so every
+        # (model, scale) actually placed gets its own copy with the scale
+        # baked in, registered like a converted model of its own. Its
+        # recentering offset scales with it. Done before the sidecar scans
+        # below so the copies' sidecars are picked up like any other.
+        scaled_variants = 0
+        for _p in all_placements:
+            _s = float(_p.get("scale", 1.0) or 1.0)
+            if abs(_s - 1.0) < 1e-3:
+                continue
+            _st = _resolve_original_stem(_p)
+            if not (_st and _st in converted_stems_map):
+                continue
+            _key = _st + obj_scale.scale_suffix(_s)
+            if _key not in converted_stems_map:
+                converted_stems_map[_key] = [obj_scale.make_scaled_variant(obj_dir, _x, _s)
+                                             for _x in converted_stems_map[_st]]
+                _mx, _my, _mz = offsets.get(_st.lower(), (0.0, 0.0, 0.0))
+                offsets[_key.lower()] = (_mx * _s, _my * _s, _mz * _s)
+                scaled_variants += 1
+            _p["_scaled_stem"] = _key
+        if scaled_variants:
+            hooks.log(f"Wrote {scaled_variants} scaled object variant(s) for placements MSFS scales "
+                      f"(DSF placements can't scale an object).", "info")
+
         # Proximity-triggered animations (MSFS's Z:VisibleRadiusBox
         # pattern -- doors/barriers/gates that open when the aircraft
         # gets close) have no equivalent stock X-Plane dataref, so
@@ -1920,25 +1968,6 @@ def run_pipeline(opts, hooks):
         complex_model_log_count = 0
 
         library_substitution_count = 0
-
-        # GUID-miss fallback: resolve a placement to a converted model
-        # by its TITLE when guid_map doesn't. Used by BOTH the
-        # terrain-fit pre-warm and the placement loop so a title-
-        # resolved object gets the same treatment a guid-resolved one
-        # would (pre-warmed fit, offsets, AGL) instead of silently
-        # disappearing.
-        title_stem_index = build_title_stem_index(converted_stems_map)
-
-        def _resolve_original_stem(pl):
-            st = guid_map.get(pl["guid"])
-            if st and st in converted_stems_map:
-                return st
-            tk = _model_stem_basename(pl.get("title"))
-            if tk:
-                cand = title_stem_index.get(tk)
-                if cand:
-                    return cand
-            return st  # None or an unconverted stem -> falls through to the picker
 
         # --- terrain-fit pre-warm (multi-process) --------------------
         # terrain_fit.get_or_create_fitted_group() is the expensive part

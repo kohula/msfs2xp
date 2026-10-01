@@ -298,18 +298,70 @@ def walk_scenery_object_records(data: bytes, start: int, size: int):
 
     return records, skipped
 
+# Library-object (0x000B) and SimProp-container (0x001B) placements come in
+# two sizes: the classic 64-byte record and a 92-byte one from newer MSFS
+# tooling, which inserts a double-precision lat/lon (0x2C/0x34) and a
+# 32-bit heading (0x44) after the classic head. In both, the GUID is
+# anchored on the END of the record, not a fixed offset: a library
+# object's model GUID is the 16 bytes ending 4 before the end (the last 4
+# are the scale); a container's GUID is the last 16 bytes (its scale the
+# 4 before). Reading the GUID at the classic fixed offset (44/48) from a
+# 92-byte record picked up the precise latitude's bytes instead.
+_LIBOBJ_MIN_LEN = 0x40
+_LIBOBJ_HIRES_LEN = 0x5C
+
+
+def decode_library_placement(rec: bytes):
+    """Placement dict fields for a 0x000B/0x001B record (4-byte header
+    included), or None if it's too short. Keys: lat, lon, alt, is_agl,
+    pitch, roll, hdg, scale, guid (hex of the raw 16 bytes, the same form
+    guid_map uses)."""
+    if len(rec) < _LIBOBJ_MIN_LEN:
+        return None
+    rec_type, size = struct.unpack_from("<HH", rec, 0)
+    size = min(size, len(rec))
+    if size < _LIBOBJ_MIN_LEN:
+        return None
+    lon_val, lat_val, alt_val, flags, p_val, r_val, h_val = struct.unpack_from("<IIiHHHH", rec, 4)
+    lat, lon = decode_lonlat_dword(lat_val, True), decode_lonlat_dword(lon_val, False)
+    hdg = h_val * (360.0 / 65536.0)
+    if size >= _LIBOBJ_HIRES_LEN:
+        plat, plon = struct.unpack_from("<dd", rec, 0x2C)
+        # Trust the precise copy only when it agrees with the coarse one.
+        if math.isfinite(plat) and math.isfinite(plon) and abs(plat - lat) < 1e-3 and abs(plon - lon) < 1e-3:
+            lat, lon = plat, plon
+        fine = struct.unpack_from("<I", rec, 0x44)[0]
+        if (fine >> 16) == h_val:
+            hdg = fine * (360.0 / 4294967296.0)
+    if rec_type == 0x001B:
+        guid = rec[size - 16:size]
+        scale = struct.unpack_from("<f", rec, size - 20)[0]
+    else:
+        guid = rec[size - 20:size - 4]
+        scale = struct.unpack_from("<f", rec, size - 4)[0]
+    if not (math.isfinite(scale) and 0.001 < scale < 1000.0):
+        scale = 1.0
+    return {
+        "lat": lat, "lon": lon, "alt": alt_val / 1000.0, "is_agl": bool(flags & 0x0001),
+        "pitch": p_val * (360.0 / 65536.0), "roll": r_val * (360.0 / 65536.0), "hdg": hdg % 360.0,
+        "scale": scale, "guid": guid.hex().lower(),
+    }
+
+
 def find_embedded_library_objects(blob: bytes):
     hits = []
     for rec_type, layout in KNOWN_LAYOUTS.items():
         rec_len = layout.get("rec_len")
         if rec_len is None: continue
-        pat = struct.pack("<HH", rec_type, rec_len)
-        idx = -1
-        while True:
-            idx = blob.find(pat, idx + 1)
-            if idx == -1: break
-            if idx + rec_len > len(blob): continue
-            hits.append((rec_type, idx, blob[idx:idx + rec_len]))
+        lengths = (rec_len, _LIBOBJ_HIRES_LEN) if rec_type in (0x000b, 0x001b) else (rec_len,)
+        for length in lengths:
+            pat = struct.pack("<HH", rec_type, length)
+            idx = -1
+            while True:
+                idx = blob.find(pat, idx + 1)
+                if idx == -1: break
+                if idx + length > len(blob): continue
+                hits.append((rec_type, idx, blob[idx:idx + length]))
     hits.sort(key=lambda h: h[1])
     return hits
 
@@ -322,6 +374,14 @@ def extract_airport_embedded_placements(data: bytes, airport_sections, guid_map:
             hits = find_embedded_library_objects(blob)
             if not hits: continue
             for rec_type, blob_off, rec in hits:
+                decoded = decode_library_placement(rec) if rec_type in (0x000b, 0x001b) else None
+                if decoded is not None:
+                    found_placements.append({
+                        **decoded, "title": None, "livery": None,
+                        "height_offset": placement_height_offset(decoded["alt"], decoded["is_agl"], arp_alt),
+                        "qmid1": sub.qmid1, "qmid2": sub.qmid2, "source": "Airport-Embedded",
+                    })
+                    continue
                 layout = KNOWN_LAYOUTS[rec_type]
                 guid_off, pos_off = layout["guid_off"], layout["pos_off"]
                 heading_off, heading_type = layout["heading_off"], layout["heading_type"]
@@ -1211,6 +1271,7 @@ def extract_spb_placements(spb_path: Path, airport_lat: float, airport_lon: floa
       anchor_roll = _anchor.get("roll", 0.0)
       anchor_hdg = _anchor.get("hdg", 0.0)
       anchor_is_agl = _anchor.get("is_agl", True)
+      anchor_scale = float(_anchor.get("scale", 1.0) or 1.0)
       for attach in _attaches:
         offset_node = attach.find(".//OffsetXYZ")
         guid_node = attach.find(".//WorldBase.MDLGuid")
@@ -1251,6 +1312,9 @@ def extract_spb_placements(spb_path: Path, airport_lat: float, airport_lon: floa
                 else:
                     x, y, z = 0.0, 0.0, 0.0
 
+                # A scaled container scales its children's offsets and
+                # sizes with it.
+                x, y, z = x * anchor_scale, y * anchor_scale, z * anchor_scale
                 lat, lon, dy = resolve_attach_offset(x, y, z, anchor_lat, anchor_lon,
                                                       anchor_pitch, anchor_roll, anchor_hdg)
                 alt = anchor_alt + dy
@@ -1271,6 +1335,17 @@ def extract_spb_placements(spb_path: Path, airport_lat: float, airport_lon: floa
                     if len(h_parts) >= 3:
                         c_pitch, c_roll, c_hdg = float(h_parts[0]), float(h_parts[1]), float(h_parts[2])
                 
+                child_scale = 1.0
+                for node in attach.iter():
+                    if node.tag.endswith("Scale") and "UV" not in node.tag and node.text:
+                        try:
+                            child_scale = float(node.text.split(",")[0])
+                        except ValueError:
+                            pass
+                        break
+                if not (0.001 < child_scale < 1000.0):
+                    child_scale = 1.0
+
                 final_pitch = (anchor_pitch + c_pitch) % 360.0
                 final_roll = (anchor_roll + c_roll) % 360.0
                 final_hdg = (anchor_hdg + c_hdg) % 360.0
@@ -1286,6 +1361,7 @@ def extract_spb_placements(spb_path: Path, airport_lat: float, airport_lon: floa
                     "pitch": final_pitch,
                     "roll": final_roll,
                     "hdg": final_hdg,
+                    "scale": anchor_scale * child_scale,
                     "is_agl": anchor_is_agl,
                     "qmid1": 0,
                     "qmid2": 0,
@@ -1879,7 +1955,8 @@ def _dedupe_placements(placements):
         if guid is None or lat is None or lon is None or hdg is None:
             out.append(p)
             continue
-        key = (guid, round(float(lat), 6), round(float(lon), 6), round(float(hdg), 1))
+        key = (guid, round(float(lat), 6), round(float(lon), 6), round(float(hdg), 1),
+               round(float(p.get("scale", 1.0)), 3))
         if key in seen:
             dropped += 1
             continue
@@ -2070,6 +2147,18 @@ def extract(target_path: Path, out_dir: Path, log_callback=None, msfs_install_ro
                 recs = [it[0] for it in sub_items]
 
                 if rec_len < 22:
+                    continue
+
+                if rec_type in (0x000b, 0x001b) and rec_len >= _LIBOBJ_MIN_LEN:
+                    for rec, qmid1, qmid2 in sub_items:
+                        decoded = decode_library_placement(rec)
+                        if decoded is None:
+                            continue
+                        placements.append({
+                            **decoded, "title": None, "livery": None,
+                            "height_offset": placement_height_offset(decoded["alt"], decoded["is_agl"], airport_alt),
+                            "qmid1": qmid1, "qmid2": qmid2, "source": source,
+                        })
                     continue
 
                 is_title_bucket = False
