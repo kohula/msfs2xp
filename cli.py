@@ -39,9 +39,6 @@ def build_parser():
                         "(default 2048, 0 = keep source sizes)")
     p.add_argument("--painted-lines", action="store_true",
                    help="apt.dat: paint the MSFS painted-line records")
-    p.add_argument("--no-flatten", action="store_true",
-                   help="apt.dat: don't flatten the terrain inside the airport boundary "
-                        "(objects there are then terrain-fitted to X-Plane's own ground)")
     return p
 
 
@@ -64,7 +61,6 @@ def main(argv=None):
         native_painted_lines=a.painted_lines,
         glass_opacity=max(1, min(100, a.glass_opacity)),
         max_texture=max(0, a.max_texture),
-        flatten_airport=not a.no_flatten,
     )
     run_pipeline(opts, PipelineHooks())
     return 0

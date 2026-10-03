@@ -36,6 +36,7 @@ import cache_utils
 import gpu_accel
 import terrain_dem
 import terrain_fit
+import host_floor
 import draped_merge
 import scenery_viewer
 import geo_transform
@@ -872,8 +873,76 @@ def pool_worker_count():
     return max(1, min(cpu_workers, mem_workers))
 
 
+def _place_props_on_host_floors(cands, obj_dir, xplane_root):
+    """host_floor.py: give every small placement standing on a large
+    building's floor the building's base level instead of the terrain under
+    it, and drop its own terrain fit (it now moves with the building).
+    cands: the placement loop's _anchor_cluster_candidates. Returns
+    (buildings that hold props, placements moved)."""
+    def rigid_stems(c):
+        return [s for s, (_e, _fa, draped, _r) in c["stem_entries"].items() if not draped]
+
+    def irs(stems):
+        return [terrain_fit._load_ir(obj_dir, s) for s in stems]
+
+    hosts = []
+    for i, c in enumerate(cands):
+        stems = rigid_stems(c)
+        reasons = {c["stem_entries"][s][3] for s in stems}
+        # a per-vertex-warped building already follows the ground under it
+        if not stems or "applied_rigid_warp" in reasons:
+            continue
+        group = irs(stems)
+        bbox = host_floor.footprint(group)
+        if not host_floor.is_host_size(bbox):
+            continue
+        cover = host_floor.horizontal_cover(group)
+        if cover is None:
+            continue
+        t = terrain_fit.get_cached_transform(c["group_key"])
+        ground = t.get("origin_elev") if t else None
+        if ground is None:
+            ground = terrain_dem.get_elevation(xplane_root, c["abs_lat"], c["abs_lon"])
+        if ground is None:
+            continue
+        if c.get("linked_shift") is not None:
+            shift = c["linked_shift"]
+        elif "applied_vertical_shift" in reasons and t and t.get("vertical_shift") is not None:
+            shift = t["vertical_shift"]
+        else:
+            shift = 0.0
+        hosts.append(host_floor.Host(i, c["abs_lat"], c["abs_lon"], c["hdg"], bbox, cover,
+                                     c["agl"], ground + shift))
+    if not hosts:
+        return 0, 0
+
+    index = host_floor.HostIndex(hosts)
+    host_keys = {h.key for h in hosts}
+    used, moved = set(), 0
+    for i, c in enumerate(cands):
+        stems = rigid_stems(c)
+        if i in host_keys or not stems:
+            continue
+        bbox = host_floor.footprint(irs(stems))
+        area = (bbox[1] - bbox[0]) * (bbox[3] - bbox[2]) if bbox else 0.0
+        host = index.host_for(c["abs_lat"], c["abs_lon"], c["height_offset"], area)
+        if host is None:
+            continue
+        ground = terrain_dem.get_elevation(xplane_root, c["abs_lat"], c["abs_lon"])
+        if ground is None:
+            continue
+        agl = c["agl"] + host.base - ground
+        for s in stems:
+            entry = c["stem_entries"][s][0]
+            entry["name"] = s
+            entry["agl"] = agl
+        used.add(host.key)
+        moved += 1
+    return len(used), moved
+
+
 def _terrain_fit_group_worker(obj_stems, base_lat, base_lon, heading_deg,
-                              skip_draped, obj_dir_str, xplane_root_str, flat_zones=None):
+                              skip_draped, obj_dir_str, xplane_root_str):
     """Worker for the parallel terrain-fit pre-warm in step 4. Runs ONE
     terrain_fit group in this subprocess. The heavy part -- pickle-loading
     each sub-object's MeshIR, sampling the DEM, building the warped copy,
@@ -900,11 +969,7 @@ def _terrain_fit_group_worker(obj_stems, base_lat, base_lon, heading_deg,
     the log claiming candidates existed. Confirmed real symptom (user):
     differently-sourced parts of one building (materials/glass vs. shell)
     getting terrain-fitted independently instead of moving together."""
-    import terrain_dem
     import terrain_fit
-    # a spawned worker (Windows) starts without the parent's flat zones
-    if flat_zones is not None and terrain_dem.flat_zones() != flat_zones:
-        terrain_dem.set_flat_zones(flat_zones)
     group_key = (tuple(sorted(obj_stems)), round(base_lat, 6), round(base_lon, 6),
                  round(heading_deg, 2), bool(skip_draped))
     try:
@@ -1485,9 +1550,6 @@ class PipelineOptions:
     # Largest texture side for the biggest buildings; smaller objects get
     # less (texture_budget). 0 = keep every texture at its source size.
     max_texture: int = 2048
-    # Level the terrain inside the airport boundary ("1302 flatten 1"), as
-    # MSFS does: every model in the package stands on flat ground there.
-    flatten_airport: bool = True
 
 
 class PipelineHooks:
@@ -1576,29 +1638,6 @@ def run_pipeline(opts, hooks):
             all_exclusions.extend(exclusions)
         except Exception as e:
             hooks.log(f"Fatal error parsing BGL directory: {e}", "error")
-
-        # The airport's apt.dat (step 5) flattens the terrain inside its
-        # boundary, so inside it terrain fit (step 4) must see that flat
-        # ground, not the raw elevation raster's bumps -- otherwise a
-        # building gets shifted to match ground X-Plane no longer draws
-        # while the props standing in and around it don't.
-        # The boundary also takes in the airport's own furnishings near
-        # it (objects of the airport record and SimProp containers --
-        # terminal interiors, jetways, apron gear), so a terminal is level
-        # all the way through, not just on its apron side.
-        terrain_dem.set_flat_zones([])
-        airport_boundary_points = []
-        if apt_native.is_usable(native_airport_layout):
-            airport_boundary_points = apt_native.points_near_airport(native_airport_layout, [
-                (p["lat"], p["lon"]) for p in all_placements
-                if p.get("lat") is not None and p.get("lon") is not None
-                and str(p.get("source", "")) in ("Airport-Embedded", "SPB-SimPropContainer")])
-        if opts.flatten_airport and apt_native.is_usable(native_airport_layout):
-            _ring = apt_native.airport_boundary(native_airport_layout, airport_boundary_points)
-            if _ring:
-                terrain_dem.set_flat_zones([(_ring, native_airport_layout.alt_m)])
-                hooks.log(f"Airport terrain is flattened to {native_airport_layout.alt_m:.1f} m inside its "
-                          f"boundary; models there are not terrain-fitted.", "info")
 
         # Look up the matching real-world airport's complete apt.dat
         # block once, right after we have the BGL's airport reference
@@ -1992,6 +2031,8 @@ def run_pipeline(opts, hooks):
         # picker instead of a hex string.
         simprop_names = load_simprop_names(pkg)
         agl_placement_count = 0
+        # Where placement heights come from, for the log (see below).
+        _height_stats = {"msl": [], "below_origin": 0}
         terrain_fit_applied_count = 0
         terrain_fit_unavailable_warned = False
         terrain_fit_reason_counts = {}
@@ -2045,12 +2086,11 @@ def run_pipeline(opts, hooks):
                 hooks.log(f"Terrain-fit pre-warm: {len(_tf_jobs)} unique placement group(s) "
                          f"across {_tf_workers} process(es)...", "info")
                 _obj_dir_s, _xp_s, _skip_d = str(obj_dir), str(xplane_root), bool(use_pol_polygons)
-                _flat_z = terrain_dem.flat_zones()
                 try:
                     with ProcessPoolExecutor(max_workers=_tf_workers) as _ex:
                         _futs = [
                             _ex.submit(_terrain_fit_group_worker, _st, _la, _lo, _hd,
-                                       _skip_d, _obj_dir_s, _xp_s, _flat_z)
+                                       _skip_d, _obj_dir_s, _xp_s)
                             for (_st, _la, _lo, _hd) in _tf_jobs
                         ]
                         for _f in as_completed(_futs):
@@ -2123,6 +2163,10 @@ def run_pipeline(opts, hooks):
                 agl = p.get("height_offset", 0.0) + mid_y
                 if abs(agl) >= 0.01:
                     agl_placement_count += 1
+                if p.get("is_agl") is False and abs(p.get("height_offset", 0.0)) >= 0.05:
+                    _height_stats["msl"].append(p.get("height_offset", 0.0))
+                if mid_y <= -0.05:
+                    _height_stats["below_origin"] += 1
 
                 generated_stems = converted_stems_map[original_stem]
                 _footprint_exclusion_candidates.append((generated_stems, abs_lat, abs_lon, p["hdg"]))
@@ -2207,7 +2251,8 @@ def run_pipeline(opts, hooks):
 
                 _anchor_cluster_candidates.append({
                     "group_key": _fit_gk, "raw_lat": p["lat"], "raw_lon": p["lon"], "hdg": p["hdg"],
-                    "agl": agl, "mid_x": mid_x, "mid_z": mid_z,
+                    "abs_lat": abs_lat, "abs_lon": abs_lon,
+                    "agl": agl, "height_offset": p.get("height_offset", 0.0), "mid_x": mid_x, "mid_z": mid_z,
                     "any_applied": group_any_applied, "stem_entries": _stem_entries,
                 })
 
@@ -2368,14 +2413,33 @@ def run_pipeline(opts, hooks):
                     if linked_applied:
                         entry, _, _, _ = cand["stem_entries"][stem]
                         entry["name"] = new_name
+                        cand["linked_shift"] = best_transform["vertical_shift"]
                         _linked_count += 1
 
         if _linked_count:
             hooks.log(f"{_linked_count} placement sub-object(s) linked to a sibling placement's terrain-fit "
                      f"shift at the same real-world anchor.", "info")
 
+        # Seats, people, counters... inside a building: on its floor, not
+        # on the X-Plane ground under each of them (see host_floor.py).
+        if xplane_root is not None and _anchor_cluster_candidates:
+            try:
+                _hosts, _on_floor = _place_props_on_host_floors(_anchor_cluster_candidates, obj_dir, xplane_root)
+                if _on_floor:
+                    hooks.log(f"{_on_floor} placement(s) inside {_hosts} building(s) set on their building's "
+                              f"floor instead of the terrain under them.", "info")
+            except Exception as e:
+                hooks.log(f"(couldn't set props on their buildings' floors: {e})", "warning")
+
         if agl_placement_count:
             hooks.log(f"{agl_placement_count} placement(s) use native DSF AGL height placement to fix floating/sunken SPB-attached or upper-floor objects.", "info")
+        if _height_stats["msl"] or _height_stats["below_origin"]:
+            _msl = sorted(_height_stats["msl"])
+            hooks.log(f"Placement heights: {len(_msl)} placed at an absolute altitude off the airport "
+                      f"elevation" + (f" (by {_msl[0]:+.2f} .. {_msl[-1]:+.2f} m, median "
+                                      f"{_msl[len(_msl) // 2]:+.2f} m)" if _msl else "")
+                      + f"; {_height_stats['below_origin']} with parts below their ground point "
+                        f"(placed with a negative height).", "info")
         if terrain_fit_applied_count:
             hooks.log(f"{terrain_fit_applied_count} rigid placement(s) warped against real sampled X-Plane terrain to fix floating/sunken corners.", "info")
         if terrain_fit_reason_counts:
@@ -2904,8 +2968,7 @@ def run_pipeline(opts, hooks):
             # and ground-vehicle routes MSFS has no equivalent for.
             rows, apt_report = apt_native.build_native_airport(
                 native_airport_layout, stock_block=matched_apt_block,
-                runway_surface=opts.runway_surface, painted_lines=opts.native_painted_lines,
-                flatten=opts.flatten_airport, boundary_points=airport_boundary_points)
+                runway_surface=opts.runway_surface, painted_lines=opts.native_painted_lines)
             note = f"native {native_airport_layout.ident}" + (f", flows/metadata from {matched_apt_ident}"
                                                               if matched_apt_block else "")
             apt_dat.write_airport_lines(apt_path, rows, source_note=note)

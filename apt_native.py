@@ -212,19 +212,13 @@ def _header(layout, stock_block):
     return [f"{kind} {round(layout.alt_m * FEET_PER_M)} {has_tower} 0 {ident} {_text(name) or ident}"], ident, kind
 
 
-def _metadata(layout, stock_block, ident, flatten):
+def _metadata(layout, stock_block, ident):
     meta = {}
     for line in _stock_rows(stock_block, {"1302"}):
         parts = line.split(None, 2)
         if len(parts) >= 2:
             meta[parts[1]] = parts[2] if len(parts) > 2 else ""
-    # flatten 1 levels the terrain inside the airport boundary (row 130),
-    # which is what MSFS does under its airports and what every model in
-    # the package was built to stand on. Without it pavement, buildings
-    # and the props inside them each follow X-Plane's own uneven ground.
-    meta.pop("flatten", None)
-    if flatten:
-        meta["flatten"] = "1"
+    meta.pop("flatten", None)  # terrain_fit fits buildings to the unflattened terrain
     if len(ident) == 4 and ident.isalpha() and ident.isupper():
         meta["icao_code"] = ident
     meta["datum_lat"] = f"{layout.lat:.6f}"
@@ -386,52 +380,15 @@ def _pavement_rows(layout, report):
     return rows
 
 
-BOUNDARY_MARGIN_M = 60.0
-
-
-BOUNDARY_REACH_M = 300.0
-
-
-def _layout_points(layout):
+def _boundary_rows(layout, plane, margin_m=60.0):
     pts = []
     for rw in layout.runways:
-        pts += runway_ends(rw)
+        for lat, lon in runway_ends(rw):
+            pts.append(plane.xy(lat, lon))
     for poly in layout.aprons:
-        pts += [tuple(v) for v in poly.vertices]
-    pts += [(p.lat, p.lon) for p in layout.taxi_points]
-    pts += [(p.lat, p.lon) for p in layout.parkings]
-    pts += [(h.lat, h.lon) for h in layout.helipads]
-    return pts
-
-
-def points_near_airport(layout, points, reach_m=BOUNDARY_REACH_M):
-    """The (lat, lon) `points` within `reach_m` of the airport's runways,
-    aprons, taxi network, stands or helipads -- e.g. the terminal's
-    furnishings, to take into the boundary so the ground under the whole
-    terminal is flattened, not just its apron side."""
-    plane = _Plane(layout.lat, layout.lon)
-    cells = {}
-    for lat, lon in _layout_points(layout):
-        x, y = plane.xy(lat, lon)
-        cells.setdefault((int(x // reach_m), int(y // reach_m)), []).append((x, y))
-    out = []
-    for lat, lon in points:
-        x, y = plane.xy(lat, lon)
-        cx, cy = int(x // reach_m), int(y // reach_m)
-        if any(math.hypot(x - ax, y - ay) <= reach_m
-               for dx in (-1, 0, 1) for dy in (-1, 0, 1)
-               for ax, ay in cells.get((cx + dx, cy + dy), ())):
-            out.append((lat, lon))
-    return out
-
-
-def airport_boundary(layout, extra_points=(), margin_m=BOUNDARY_MARGIN_M):
-    """The airport boundary ring [(lat, lon), ...]: the convex hull of the
-    runways, aprons, taxi network, stands, helipads and `extra_points`,
-    pushed out by `margin_m`. Empty if there is nothing to enclose. This
-    is also the area X-Plane flattens (see _metadata)."""
-    plane = _Plane(layout.lat, layout.lon)
-    pts = [plane.xy(lat, lon) for lat, lon in list(_layout_points(layout)) + list(extra_points)]
+        pts += [plane.xy(*v) for v in poly.vertices]
+    pts += [plane.xy(p.lat, p.lon) for p in layout.parkings]
+    pts += [plane.xy(h.lat, h.lon) for h in layout.helipads]
     hull = _convex_hull([(round(x, 2), round(y, 2)) for x, y in pts])
     if not hull:
         return []
@@ -441,13 +398,6 @@ def airport_boundary(layout, extra_points=(), margin_m=BOUNDARY_MARGIN_M):
     for x, y in hull:
         d = max(math.hypot(x - cx, y - cy), 1e-9)
         ring.append(plane.latlon(x + (x - cx) / d * margin_m, y + (y - cy) / d * margin_m))
-    return ring
-
-
-def _boundary_rows(layout, extra_points=()):
-    ring = airport_boundary(layout, extra_points)
-    if not ring:
-        return []
     rows = ["130 Airport Boundary"]
     for lat, lon in ring[:-1]:
         rows.append(f"111 {lat:.8f} {lon:.8f}")
@@ -677,23 +627,18 @@ def _ramp_rows(layout, report):
     return rows
 
 
-def build_native_airport(layout, stock_block=None, runway_surface="transparent", painted_lines=False,
-                         flatten=True, boundary_points=()):
+def build_native_airport(layout, stock_block=None, runway_surface="transparent", painted_lines=False):
     """apt.dat rows for one airport from its decoded MSFS layout. Returns
-    (rows, report) where report counts what was written, by kind.
-    flatten: level the terrain inside the airport boundary.
-    boundary_points: more (lat, lon) the boundary must enclose (see
-    points_near_airport)."""
+    (rows, report) where report counts what was written, by kind."""
     report = {}
     plane = _Plane(layout.lat, layout.lon)
     rows, ident, kind = _header(layout, stock_block)
-    boundary = _boundary_rows(layout, boundary_points)
-    rows += _metadata(layout, stock_block, ident, flatten and bool(boundary))
+    rows += _metadata(layout, stock_block, ident)
     runway_rows, light_objects = _runway_rows(layout, runway_surface != "native", report)
     rows += runway_rows
     rows += _pavement_rows(layout, report)
     rows += _line_rows(layout, plane, painted_lines, report)
-    rows += boundary
+    rows += _boundary_rows(layout, plane)
     rows += _point_rows(layout, stock_block, kind, report)
     rows += light_objects
     rows += _frequency_rows(layout, stock_block, ident)

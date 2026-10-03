@@ -26,14 +26,11 @@ in this codebase.
 - **Ground content**: draped pavement, painted lines and markings,
   merged across overlapping placements to avoid X-Plane's draw-order
   z-fighting between same-layer draped surfaces.
-- **Flat airport ground**: the apt.dat flattens the terrain inside the
-  airport boundary (runways, taxiways, aprons, stands and the airport's
-  own buildings and furnishings), as MSFS does -- so pavement, terminals
-  and the seats and people inside them all stand on the same level
-  ground (`--no-flatten` / the GUI checkbox turns it off).
-- **Terrain fit**: outside the flattened airport, buildings are fitted to
+- **Terrain fit**: large buildings get a rigid-tilt correction against
   real sampled X-Plane terrain, so a big footprint doesn't float or sink
-  at its corners on sloped ground.
+  at its corners on sloped ground. X-Plane's terrain itself is left as it
+  is; seats, people and other props standing on a building's floor are
+  set on that floor's level rather than on the ground under each of them.
 - **apt.dat**: built from the package's own MSFS airport record (MSFS
   2020 and 2024 layouts): runways with thresholds, approach lighting and
   VASI/PAPI, helipads, frequencies, taxiway signs, windsocks, taxiway
