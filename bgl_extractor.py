@@ -1546,6 +1546,11 @@ def extract_spb_placements(spb_path: Path, airport_lat: float, airport_lon: floa
             # own, so this full accumulated alt is what has to be
             # baked into the exported .obj geometry downstream.
             alt = anchor_alt + dy
+            # ...and like any placement's alt, it is only a height above
+            # ground when the container is AGL-placed; an MSL-placed
+            # container's alt is an absolute altitude (the child inherits
+            # the flag below, so nested containers stay consistent).
+            height_offset = placement_height_offset(alt, anchor_is_agl, airport_alt or 0.0)
             if not (0.001 < child_scale < 1000.0):
                 child_scale = 1.0
             found.append({
@@ -1555,7 +1560,7 @@ def extract_spb_placements(spb_path: Path, airport_lat: float, airport_lon: floa
                 "lat": lat,
                 "lon": lon,
                 "alt": alt,
-                "height_offset": alt,
+                "height_offset": height_offset,
                 "pitch": (anchor_pitch + c_pitch) % 360.0,
                 "roll": (anchor_roll + c_roll) % 360.0,
                 "hdg": (anchor_hdg + c_hdg) % 360.0,

@@ -192,6 +192,39 @@ class TestExtractSpbPlacementsHeightChain(unittest.TestCase):
                 "the exact ~2.1 m tower-shell/interior desync bug.")
         self.assertNotAlmostEqual(entry["height_offset"], 4.915, places=3)
 
+    def test_msl_placed_container_gives_height_above_the_airport(self):
+        """A container placed with an absolute (MSL) altitude: its alt is
+        not a height above ground, so the child's height is the chain's
+        altitude minus the airport's elevation -- not 101 m in the air."""
+        spb2xml_dir = Path(bgl_extractor.__file__).resolve().parent / "spb2xml"
+        sys.path.insert(0, str(spb2xml_dir))
+        import decompiler
+
+        container_guid = "{21111111-2222-3333-4444-555555555555}"
+        attach_guid = "{76666666-7777-8888-9999-aaaaaaaaaaaa}"
+        propdefs_dir = tempfile.mkdtemp()
+        (Path(propdefs_dir) / "dummy.xml").write_text("<x/>", encoding="utf-8")
+        bgl_extractor._PROPDEFS_CACHE[propdefs_dir] = {}
+        existing_placements = [{
+            "guid": _spb_guid_hex(container_guid), "lat": 47.5, "lon": 19.25,
+            "alt": 101.0, "height_offset": 1.0,
+            "pitch": 0.0, "roll": 0.0, "hdg": 0.0, "is_agl": False,
+        }]
+        fake_root = self._patched_decompile(container_guid, attach_guid, offset_xyz="0.0,0.5,0.0")
+        with mock.patch.object(decompiler.Decompiler, "__init__", return_value=None), \
+             mock.patch.object(decompiler.Decompiler, "decompile", return_value=fake_root):
+            spb_path = Path(tempfile.mkdtemp()) / "Seats_SimPropContainer.spb"
+            spb_path.write_bytes(b"")
+            found = bgl_extractor.extract_spb_placements(
+                spb_path, airport_lat=47.5, airport_lon=19.25, airport_alt=100.0,
+                existing_placements=existing_placements,
+                _log=lambda *a, **k: None, propdefs_dir=propdefs_dir)
+
+        self.assertEqual(len(found), 1)
+        self.assertAlmostEqual(found[0]["alt"], 101.5, places=6)
+        self.assertAlmostEqual(found[0]["height_offset"], 1.5, places=6)
+        self.assertFalse(found[0]["is_agl"])
+
 
 class TestExtractSpbPlacementsFallbackAnchorIsKept(unittest.TestCase):
     """REGRESSION GUARD: a same-session attempt to make extract_spb_placements

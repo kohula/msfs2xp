@@ -373,6 +373,7 @@ class ModularPythonConverterApp:
         # pavement), and paint the MSFS painted-line records.
         self.native_runways_var = tk.BooleanVar(value=False)
         self.native_painted_lines_var = tk.BooleanVar(value=False)
+        self.flatten_airport_var = tk.BooleanVar(value=True)
         # How opaque blended MSFS glass is drawn (MSFS glass relies on
         # reflections X-Plane doesn't draw, so its own alpha is near zero).
         self.glass_opacity_var = tk.IntVar(value=50)
@@ -544,6 +545,7 @@ class ModularPythonConverterApp:
                     self.pol_polygons_var.set(data.get("pol_polygons", False))
                     self.native_runways_var.set(data.get("native_runways", False))
                     self.native_painted_lines_var.set(data.get("native_painted_lines", False))
+                    self.flatten_airport_var.set(data.get("flatten_airport", True))
                     self.glass_opacity_var.set(int(data.get("glass_opacity", 50)))
                     self.max_texture_var.set(int(data.get("max_texture", 2048)))
                     geom = data.get("geometry")
@@ -569,6 +571,7 @@ class ModularPythonConverterApp:
                     "pol_polygons": self.pol_polygons_var.get(),
                     "native_runways": self.native_runways_var.get(),
                     "native_painted_lines": self.native_painted_lines_var.get(),
+                    "flatten_airport": self.flatten_airport_var.get(),
                     "glass_opacity": self._glass_opacity(),
                     "max_texture": self._max_texture(),
                     "geometry": self.root.geometry()
@@ -710,8 +713,12 @@ class ModularPythonConverterApp:
             options_inner, "apt.dat: paint the MSFS painted lines (if the draped models don't carry them)",
             self.native_painted_lines_var
         ).grid(row=8, column=0, columnspan=4, sticky="w", pady=4)
+        _styled_checkbutton(
+            options_inner, "apt.dat: flatten the terrain inside the airport, as MSFS does (recommended)",
+            self.flatten_airport_var
+        ).grid(row=9, column=0, columnspan=4, sticky="w", pady=4)
         glass_row = tk.Frame(options_inner, bg=self.card_bg)
-        glass_row.grid(row=9, column=0, columnspan=4, sticky="w", pady=4)
+        glass_row.grid(row=10, column=0, columnspan=4, sticky="w", pady=4)
         tk.Label(glass_row, text="Glass opacity % (100 = solid):", bg=self.card_bg, fg="#cccccc",
                  font=("Segoe UI", 9)).pack(side=tk.LEFT)
         tk.Spinbox(glass_row, from_=1, to=100, increment=5, width=5, textvariable=self.glass_opacity_var,
@@ -874,6 +881,7 @@ class ModularPythonConverterApp:
             prompt_replacements=self.prompt_replacements_var.get(),
             runway_surface="native" if self.native_runways_var.get() else "transparent",
             native_painted_lines=self.native_painted_lines_var.get(),
+            flatten_airport=self.flatten_airport_var.get(),
             glass_opacity=max(1, min(100, self._glass_opacity())),
             max_texture=self._max_texture(),
         )

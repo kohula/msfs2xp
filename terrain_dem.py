@@ -85,6 +85,12 @@ _NODATA_RAW = {1: -128, 2: -32768, 4: -2147483648}
 
 _dem_cache = {}  # dsf_path (str) -> {layer_name: DemLayer}
 
+# Areas X-Plane levels at runtime (an apt.dat airport boundary with
+# "1302 flatten 1"): [(ring [(lat, lon), ...], (lat0, lat1, lon0, lon1),
+# elevation_m)]. The raster still holds the unflattened ground there, so
+# sampling it would fit models to bumps X-Plane no longer draws.
+_flat_zones = []
+
 
 class DemLayer:
     """One raster layer's grid, decoded lazily per-sample (never expands
@@ -300,13 +306,58 @@ def _get_cached_layers(dsf_path):
     return _dem_cache[key]
 
 
+def set_flat_zones(zones):
+    """zones: [(ring [(lat, lon), ...], elevation_m), ...] -- areas X-Plane
+    flattens (see _flat_zones); get_elevation reports elevation_m inside
+    them. An empty list clears them."""
+    _flat_zones.clear()
+    for ring, elev in zones or []:
+        ring = [(float(a), float(o)) for a, o in ring]
+        if len(ring) >= 3 and elev is not None:
+            lats = [a for a, _ in ring]
+            lons = [o for _, o in ring]
+            _flat_zones.append((ring, (min(lats), max(lats), min(lons), max(lons)), float(elev)))
+
+
+def flat_zones():
+    """The current zones, in set_flat_zones' input form (to hand to a
+    worker process)."""
+    return [(ring, elev) for ring, _, elev in _flat_zones]
+
+
+def _inside(ring, lat, lon):
+    inside = False
+    j = len(ring) - 1
+    for i in range(len(ring)):
+        ai, oi = ring[i]
+        aj, oj = ring[j]
+        if (ai > lat) != (aj > lat) and lon < oi + (lat - ai) * (oj - oi) / (aj - ai):
+            inside = not inside
+        j = i
+    return inside
+
+
+def flat_elevation(lat, lon):
+    """The levelled elevation at (lat, lon) if it is inside a flat zone,
+    else None."""
+    for ring, (a0, a1, o0, o1), elev in _flat_zones:
+        if a0 <= lat <= a1 and o0 <= lon <= o1 and _inside(ring, lat, lon):
+            return elev
+    return None
+
+
 def get_elevation(xplane_root, lat, lon, layer_name="elevation"):
     """Real X-Plane terrain elevation (meters) at (lat, lon), bilinearly
     sampled from the default global scenery's own elevation raster, or
     None if unavailable (no X-Plane install found, tile missing, py7zr not
-    installed, or that post is NODATA in the source data)."""
+    installed, or that post is NODATA in the source data). Inside a flat
+    zone (see set_flat_zones) it is the zone's levelled elevation."""
     if xplane_root is None:
         return None
+    if layer_name == "elevation":
+        flat = flat_elevation(lat, lon)
+        if flat is not None:
+            return flat
     dsf_path = find_dsf_for_latlon(xplane_root, lat, lon)
     if dsf_path is None:
         return None

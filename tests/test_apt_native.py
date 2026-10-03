@@ -114,9 +114,42 @@ class TestNativeAirport(unittest.TestCase):
                  "1101 09L right"]
         rows, _ = apt_native.build_native_airport(_layout(), stock_block=stock)
         self.assertIn("1302 city Budapest", rows)
-        self.assertNotIn("1302 flatten 1", rows)
+        self.assertEqual(rows.count("1302 flatten 1"), 1)
         self.assertIn("18 47.44 19.26 1 BCN", rows)
         self.assertIn("1100 09L 11810 arrivals jets 000000 360359 Arr", rows)
+
+    def test_airport_is_flattened_inside_its_boundary(self):
+        self.assertIn("1302 flatten 1", self.rows)
+        self.assertIn("130 Airport Boundary", self.rows)
+        ring = apt_native.airport_boundary(_layout())
+        self.assertGreaterEqual(len(ring), 3)
+        rows, _ = apt_native.build_native_airport(_layout(), flatten=False)
+        self.assertNotIn("1302 flatten 1", rows)
+        self.assertIn("130 Airport Boundary", rows)
+
+    def test_boundary_takes_in_furnishings_near_the_airport_only(self):
+        layout = _layout()
+        lat, lon = apt_native.runway_ends(layout.runways[0])[0]
+        m_lat, _ = metres_per_degree(lat)
+        far = (lat + 5000.0 / m_lat, lon)
+        near = apt_native.points_near_airport(layout, [(lat, lon), far])
+        self.assertEqual(near, [(lat, lon)])
+
+        base = apt_native.airport_boundary(layout)
+        top = max(a for a, _ in base)
+        top_lon = next(o for a, o in base if a == top)
+        outside = (top + 100.0 / m_lat, top_lon)  # 100 m past the boundary's northmost corner
+        self.assertEqual(apt_native.points_near_airport(layout, [outside]), [outside])
+        grown = apt_native.airport_boundary(layout, [outside])
+        self.assertGreater(max(a for a, _ in grown), outside[0])
+        rows, _ = apt_native.build_native_airport(layout, boundary_points=[outside])
+        boundary_lats = [float(r.split()[1]) for r in rows[rows.index("130 Airport Boundary") + 1:]
+                         if r.startswith(("111 ", "113 "))][:len(grown)]
+        self.assertGreater(max(boundary_lats), outside[0])
+
+    def test_stock_flatten_is_not_kept_when_flatten_is_off(self):
+        rows, _ = apt_native.build_native_airport(_layout(), stock_block=["1302 flatten 1"], flatten=False)
+        self.assertNotIn("1302 flatten 1", rows)
 
     def test_flows_naming_unknown_runways_are_dropped(self):
         stock = ["1000 West", "1100 13R 11810 arrivals jets 000000 360359 Arr"]
