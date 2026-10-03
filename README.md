@@ -31,6 +31,11 @@ in this codebase.
   at its corners on sloped ground. X-Plane's terrain itself is left as it
   is; seats, people and other props standing on a building's floor are
   set on that floor's level rather than on the ground under each of them.
+- **Flatten fallback** (off by default; GUI checkbox or `--flatten`): the
+  apt.dat flattens the terrain inside the airport boundary (runways,
+  taxiways, aprons, stands and the airport's own buildings and
+  furnishings), as MSFS does, and models there are no longer
+  terrain-fitted -- for an airport where objects still float or sink.
 - **apt.dat**: built from the package's own MSFS airport record (MSFS
   2020 and 2024 layouts): runways with thresholds, approach lighting and
   VASI/PAPI, helipads, frequencies, taxiway signs, windsocks, taxiway

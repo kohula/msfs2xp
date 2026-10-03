@@ -942,7 +942,7 @@ def _place_props_on_host_floors(cands, obj_dir, xplane_root):
 
 
 def _terrain_fit_group_worker(obj_stems, base_lat, base_lon, heading_deg,
-                              skip_draped, obj_dir_str, xplane_root_str):
+                              skip_draped, obj_dir_str, xplane_root_str, flat_zones=None):
     """Worker for the parallel terrain-fit pre-warm in step 4. Runs ONE
     terrain_fit group in this subprocess. The heavy part -- pickle-loading
     each sub-object's MeshIR, sampling the DEM, building the warped copy,
@@ -969,7 +969,11 @@ def _terrain_fit_group_worker(obj_stems, base_lat, base_lon, heading_deg,
     the log claiming candidates existed. Confirmed real symptom (user):
     differently-sourced parts of one building (materials/glass vs. shell)
     getting terrain-fitted independently instead of moving together."""
+    import terrain_dem
     import terrain_fit
+    # a spawned worker (Windows) starts without the parent's flat zones
+    if flat_zones is not None and terrain_dem.flat_zones() != flat_zones:
+        terrain_dem.set_flat_zones(flat_zones)
     group_key = (tuple(sorted(obj_stems)), round(base_lat, 6), round(base_lon, 6),
                  round(heading_deg, 2), bool(skip_draped))
     try:
@@ -1550,6 +1554,11 @@ class PipelineOptions:
     # Largest texture side for the biggest buildings; smaller objects get
     # less (texture_budget). 0 = keep every texture at its source size.
     max_texture: int = 2048
+    # Fallback, off by default: level the terrain inside the airport
+    # boundary ("1302 flatten 1"), as MSFS does, so every model there stands
+    # on flat ground. Normally X-Plane's terrain is kept and props follow
+    # their buildings' floors instead (host_floor.py).
+    flatten_airport: bool = False
 
 
 class PipelineHooks:
@@ -1638,6 +1647,29 @@ def run_pipeline(opts, hooks):
             all_exclusions.extend(exclusions)
         except Exception as e:
             hooks.log(f"Fatal error parsing BGL directory: {e}", "error")
+
+        # The airport's apt.dat (step 5) flattens the terrain inside its
+        # boundary, so inside it terrain fit (step 4) must see that flat
+        # ground, not the raw elevation raster's bumps -- otherwise a
+        # building gets shifted to match ground X-Plane no longer draws
+        # while the props standing in and around it don't.
+        # The boundary also takes in the airport's own furnishings near
+        # it (objects of the airport record and SimProp containers --
+        # terminal interiors, jetways, apron gear), so a terminal is level
+        # all the way through, not just on its apron side.
+        terrain_dem.set_flat_zones([])
+        airport_boundary_points = []
+        if apt_native.is_usable(native_airport_layout):
+            airport_boundary_points = apt_native.points_near_airport(native_airport_layout, [
+                (p["lat"], p["lon"]) for p in all_placements
+                if p.get("lat") is not None and p.get("lon") is not None
+                and str(p.get("source", "")) in ("Airport-Embedded", "SPB-SimPropContainer")])
+        if opts.flatten_airport and apt_native.is_usable(native_airport_layout):
+            _ring = apt_native.airport_boundary(native_airport_layout, airport_boundary_points)
+            if _ring:
+                terrain_dem.set_flat_zones([(_ring, native_airport_layout.alt_m)])
+                hooks.log(f"Airport terrain is flattened to {native_airport_layout.alt_m:.1f} m inside its "
+                          f"boundary; models there are not terrain-fitted.", "info")
 
         # Look up the matching real-world airport's complete apt.dat
         # block once, right after we have the BGL's airport reference
@@ -2086,11 +2118,12 @@ def run_pipeline(opts, hooks):
                 hooks.log(f"Terrain-fit pre-warm: {len(_tf_jobs)} unique placement group(s) "
                          f"across {_tf_workers} process(es)...", "info")
                 _obj_dir_s, _xp_s, _skip_d = str(obj_dir), str(xplane_root), bool(use_pol_polygons)
+                _flat_z = terrain_dem.flat_zones()
                 try:
                     with ProcessPoolExecutor(max_workers=_tf_workers) as _ex:
                         _futs = [
                             _ex.submit(_terrain_fit_group_worker, _st, _la, _lo, _hd,
-                                       _skip_d, _obj_dir_s, _xp_s)
+                                       _skip_d, _obj_dir_s, _xp_s, _flat_z)
                             for (_st, _la, _lo, _hd) in _tf_jobs
                         ]
                         for _f in as_completed(_futs):
@@ -2968,7 +3001,8 @@ def run_pipeline(opts, hooks):
             # and ground-vehicle routes MSFS has no equivalent for.
             rows, apt_report = apt_native.build_native_airport(
                 native_airport_layout, stock_block=matched_apt_block,
-                runway_surface=opts.runway_surface, painted_lines=opts.native_painted_lines)
+                runway_surface=opts.runway_surface, painted_lines=opts.native_painted_lines,
+                flatten=opts.flatten_airport, boundary_points=airport_boundary_points)
             note = f"native {native_airport_layout.ident}" + (f", flows/metadata from {matched_apt_ident}"
                                                               if matched_apt_block else "")
             apt_dat.write_airport_lines(apt_path, rows, source_note=note)
