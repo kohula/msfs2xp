@@ -2388,16 +2388,19 @@ def run_pipeline(opts, hooks):
         except OSError as e:
             hooks.log(f"Could not write unresolved_objects.json: {e}", "warning")
 
-        # Base layer for the picker's map view: the just-compiled DSF's
+        # Base layer for the picker's map view: this run's draped
         # pavement/taxiway footprints in world coords + a thinned set
         # of every placed object's position, dumped so the picker can
-        # draw a top-down airport map instantly without re-parsing the
-        # DSF and 10k+ .obj files itself. Best-effort -- only when there
-        # is something to pick, and never fatal.
+        # draw a top-down airport map instantly without re-parsing
+        # 10k+ .obj files itself. Built from this run's placements, not
+        # from a DSF: the DSF is compiled after the picker has run (so
+        # its picks apply to this conversion), and the previous run's
+        # DSF is already gone (clean_previous_output). Best-effort --
+        # only when there is something to pick, and never fatal.
         if unresolved_objects:
             try:
-                hooks.log("Building the picker's map base (reads the compiled DSF)...", "info")
-                _scene = scenery_viewer.build_scene(out)
+                hooks.log("Building the picker's map base...", "info")
+                _scene = scenery_viewer.scene_from_placements(out, dsf_tiles)
                 # OBJ8 .obj has no triangle index in this reader, so the
                 # draped footprints are dumped as a thinned POINT CLOUD
                 # (a scatter of every Nth pavement vertex) -- enough to

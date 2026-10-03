@@ -280,23 +280,63 @@ def _local_xz_to_latlon(lat0, lon0, heading_deg, x, z):
     return geo_transform.local_offset_to_latlon(lat0, lon0, heading_deg, x, z)
 
 
-def build_scene(pack_dir: Path):
-    nav_dir = pack_dir / "Earth nav data"
-    dsf_paths = sorted(nav_dir.rglob("*.dsf")) if nav_dir.is_dir() else []
+def _new_scene():
+    return {"exclusions": [], "rigid": [], "draped": [], "library": [], "lights": [], "tile_count": 0}
+
+
+def _object_reader(pack_dir: Path):
     objects_dir = pack_dir / "objects"
     obj_cache = {}
 
     def _get_obj(name):
-        if name.endswith(".obj"):
-            name_no_ext = name[:-4]
-        else:
-            name_no_ext = name
         if name not in obj_cache:
             candidate = objects_dir / Path(name).name if name.startswith("objects/") else pack_dir / name
             obj_cache[name] = parse_obj8(candidate) if candidate.is_file() else None
         return obj_cache[name]
 
-    scene = {"exclusions": [], "rigid": [], "draped": [], "library": [], "lights": [], "tile_count": 0}
+    return _get_obj
+
+
+def _add_object(scene, get_obj, obj):
+    """One placement ({name, lat, lon, hdg, agl, is_agl}; name is the DSF
+    definition path) into the scene's library/draped/rigid/lights lists."""
+    name = obj["name"]
+    if not name.startswith("objects/"):
+        scene["library"].append({"lat": obj["lat"], "lon": obj["lon"], "hdg": obj["hdg"], "path": name})
+        return
+    ir = get_obj(name)
+    if ir is None:
+        scene["library"].append({
+            "lat": obj["lat"], "lon": obj["lon"], "hdg": obj["hdg"], "path": name + " (unreadable)",
+        })
+        return
+
+    for lx, ly, lz in ir["lights"]:
+        lat, lon = _local_xz_to_latlon(obj["lat"], obj["lon"], obj["hdg"], lx, lz)
+        scene["lights"].append({"lat": lat, "lon": lon})
+
+    if ir["draped"] and ir["positions"]:
+        ring = [
+            _local_xz_to_latlon(obj["lat"], obj["lon"], obj["hdg"], px, pz)
+            for px, py, pz in ir["positions"]
+        ]
+        scene["draped"].append({
+            "name": name, "ring": ring, "layer_offset": ir["layer_offset"] or 0,
+            "texture": ir["texture"],
+        })
+    else:
+        scene["rigid"].append({
+            "name": name, "lat": obj["lat"], "lon": obj["lon"], "hdg": obj["hdg"],
+            "tilted": ir["tilted"], "agl": obj.get("agl", 0.0), "is_agl": obj.get("is_agl", False),
+        })
+
+
+def build_scene(pack_dir: Path):
+    """The scene of a compiled pack, read back from its DSF tiles."""
+    nav_dir = pack_dir / "Earth nav data"
+    dsf_paths = sorted(nav_dir.rglob("*.dsf")) if nav_dir.is_dir() else []
+    get_obj = _object_reader(pack_dir)
+    scene = _new_scene()
 
     for dsf_path in dsf_paths:
         tile = parse_dsf(dsf_path)
@@ -304,40 +344,29 @@ def build_scene(pack_dir: Path):
             continue
         scene["tile_count"] += 1
         scene["exclusions"].extend(tile.exclusions)
-
         for obj in tile.objects:
-            name = obj["name"]
-            if not name.startswith("objects/"):
-                scene["library"].append({
-                    "lat": obj["lat"], "lon": obj["lon"], "hdg": obj["hdg"], "path": name,
-                })
+            _add_object(scene, get_obj, obj)
+
+    return scene
+
+
+def scene_from_placements(pack_dir: Path, tiles):
+    """The same scene as build_scene, but from placements not yet compiled
+    into a DSF: `tiles` maps (lat, lon) -> the converter's placement dicts
+    ({"name": stem or None, "library_path": ..., "lat", "lon", "hdg",
+    "agl"}), with the converted .obj files already in pack_dir/objects."""
+    get_obj = _object_reader(pack_dir)
+    scene = _new_scene()
+    for objects in tiles.values():
+        scene["tile_count"] += 1
+        for p in objects:
+            name = p.get("library_path") or (f"objects/{p['name']}.obj" if p.get("name") else None)
+            if not name:
                 continue
-            ir = _get_obj(name)
-            if ir is None:
-                scene["library"].append({
-                    "lat": obj["lat"], "lon": obj["lon"], "hdg": obj["hdg"], "path": name + " (unreadable)",
-                })
-                continue
-
-            for lx, ly, lz in ir["lights"]:
-                lat, lon = _local_xz_to_latlon(obj["lat"], obj["lon"], obj["hdg"], lx, lz)
-                scene["lights"].append({"lat": lat, "lon": lon})
-
-            if ir["draped"] and ir["positions"]:
-                ring = [
-                    _local_xz_to_latlon(obj["lat"], obj["lon"], obj["hdg"], px, pz)
-                    for px, py, pz in ir["positions"]
-                ]
-                scene["draped"].append({
-                    "name": name, "ring": ring, "layer_offset": ir["layer_offset"] or 0,
-                    "texture": ir["texture"],
-                })
-            else:
-                scene["rigid"].append({
-                    "name": name, "lat": obj["lat"], "lon": obj["lon"], "hdg": obj["hdg"],
-                    "tilted": ir["tilted"], "agl": obj["agl"], "is_agl": obj["is_agl"],
-                })
-
+            _add_object(scene, get_obj, {
+                "name": name, "lat": p["lat"], "lon": p["lon"], "hdg": p.get("hdg", 0.0),
+                "agl": p.get("agl", 0.0), "is_agl": bool(p.get("agl")),
+            })
     return scene
 
 

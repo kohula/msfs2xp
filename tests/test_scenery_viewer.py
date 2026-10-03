@@ -149,5 +149,46 @@ class TestSceneryViewer(unittest.TestCase):
             self.assertIn("lib/airport/lights/beacon.obj", content)
 
 
+    def test_scene_from_placements_needs_no_dsf(self):
+        # The replacement picker's map is built mid-run, before this run's
+        # DSF exists (and after the previous run's was cleared), so it must
+        # come from the placements themselves.
+        with tempfile.TemporaryDirectory() as td:
+            pack_dir = Path(td)
+            objects_dir = pack_dir / "objects"
+            objects_dir.mkdir()
+            (objects_dir / "pave.obj").write_text(
+                "I\n800\nOBJ\n\nTEXTURE ../textures/asphalt.png\n\n"
+                "POINT_COUNTS 4 0 0 6\n\n"
+                "VT -5.0 0.0 -5.0 0 1 0 0 0\nVT 5.0 0.0 -5.0 0 1 0 1 0\n"
+                "VT 5.0 0.0 5.0 0 1 0 1 1\nVT -5.0 0.0 5.0 0 1 0 0 1\n\n"
+                "IDX 0\nIDX 1\nIDX 2\nIDX 0\nIDX 2\nIDX 3\n\n"
+                "ATTR_draped\nTRIS 0 6\n",
+                encoding="utf-8",
+            )
+            (objects_dir / "shed.obj").write_text(
+                "I\n800\nOBJ\n\nTEXTURE ../textures/shed.png\n\n"
+                "POINT_COUNTS 1 0 0 0\n\nVT 0 0 0 0 1 0 0 0\n\nTRIS 0 0\n",
+                encoding="utf-8",
+            )
+            tiles = {(47, 8): [
+                {"name": "pave", "lat": 47.0, "lon": 8.0, "hdg": 0.0, "agl": 0.0},
+                {"name": "shed", "lat": 47.001, "lon": 8.001, "hdg": 45.0, "agl": 2.0},
+                {"name": None, "library_path": "lib/airport/lights/beacon.obj",
+                 "lat": 47.002, "lon": 8.002, "hdg": 0.0, "agl": 0.0},
+            ]}
+            self.assertFalse((pack_dir / "Earth nav data").exists())
+
+            scene = scenery_viewer.scene_from_placements(pack_dir, tiles)
+            self.assertEqual(len(scene["draped"]), 1)
+            self.assertEqual(len(scene["draped"][0]["ring"]), 4)
+            lat, lon = scene["draped"][0]["ring"][0]
+            self.assertAlmostEqual(lat, 47.0, places=3)
+            self.assertAlmostEqual(lon, 8.0, places=3)
+            self.assertEqual(len(scene["rigid"]), 1)
+            self.assertTrue(scene["rigid"][0]["is_agl"])
+            self.assertEqual([l["path"] for l in scene["library"]], ["lib/airport/lights/beacon.obj"])
+
+
 if __name__ == "__main__":
     unittest.main()
