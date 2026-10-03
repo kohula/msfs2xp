@@ -1,32 +1,27 @@
+Test build: fixes for objects standing at the wrong height and for the
+replacement picker's map.
+
 ## What's new
 
-- **apt.dat from the package's own airport record** (MSFS 2020 and 2024):
-  runways with thresholds, approach lights and PAPI/VASI, helipads,
-  frequencies, taxiway signs, windsocks, taxiway lights, the ATC taxi
-  network (real edges, runway edges, taxiway names and size classes, hot
-  zones, vehicle roads) and ramp starts with heading, type, size class and
-  airlines. Your converted draped pavement stays what you see; runways and
-  aprons are a transparent hard surface under it (options: real X-Plane
-  runways with markings, MSFS painted lines). The stock X-Plane airport only
-  lends ATC flows, metadata, the beacon and truck routes.
-- **Glass** is drawn at a chosen opacity (default 50%, 100% = solid), is
-  drawn after a building's solid parts so it no longer hides them, solid
-  facades no longer get windows punched out, and terrain-fitted buildings
-  keep their lit windows at night.
-- **Lighter scenery**: each model uses the most detailed MSFS level of
-  detail that fits a size-based triangle budget, small props fade out with
-  distance, textures are held to the size of what they're drawn on (max
-  configurable, default 2048) and unused ones are removed.
-- **Fixes**: tiles with more than 65,535 objects no longer vanish; DDS
-  textures X-Plane can't load are decoded instead of passed through; normal
-  maps use X-Plane's NORMAL_METALNESS layout (no more fully glossy
-  surfaces); MSFS placement scale is applied; newer 92-byte placement
-  records are read correctly; buildings and draped ground no longer drift
-  1-2 m apart; a re-run clears the previous run's output first.
-- **SimProp containers** (interiors, apron lights, jetways) are read even
-  without the MSFS SDK Propdefs folder.
-- **Headless converter** in the same build: `MSFS2XP.exe cli --help` /
-  `./MSFS2XP-x86_64.AppImage cli --help`.
+- **Props stay on their building's floor**: seats, people, counters and
+  other objects inside a building now take their height from the
+  building's floor instead of from the X-Plane ground under each of them.
+  Where the terrain under a terminal isn't level they were sunk into the
+  floor or floating above it. Objects on the open apron or under an open
+  canopy still sit on their own ground. X-Plane's terrain is not changed.
+- **SimProp container heights**: objects inside a container placed at an
+  absolute (sea-level) altitude got that whole altitude as their height
+  above ground; they are now placed relative to the airport elevation.
+- **Flatten fallback** (off by default): a new checkbox ("apt.dat: flatten
+  the terrain inside the airport", or `--flatten`) levels the terrain
+  inside the airport boundary, as MSFS does, for an airport where objects
+  still float or sink.
+- **Replacement picker map**: the "Where it is" map shows the airport's
+  pavement and objects again (it was blank apart from the red dot).
+- **Diagnostics**: the conversion log has a "Placement heights:" line
+  (objects placed at an absolute altitude, models with parts below their
+  ground point) and a line counting objects set on their building's floor
+  -- please include them when reporting floating or sunken objects.
 
 ## Windows
 
