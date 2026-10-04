@@ -879,6 +879,50 @@ def pool_worker_count():
     return max(1, min(cpu_workers, mem_workers))
 
 
+PLACEMENT_REPORT_NAME = "msfs2xp_placements.csv"
+
+
+def _write_placement_report(path, cands, obj_dir, dsf_tiles, airport_alt):
+    """One CSV row per converted placement: where its height came from and
+    what each step did to it -- for tracking down an object that floats or
+    sinks (open it in a spreadsheet, filter by model name or position)."""
+    import csv
+    placed = {id(o) for objects in dsf_tiles.values() for o in objects}
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["model", "title", "source", "lat", "lon", "heading", "msfs_alt_m", "msfs_alt_is_agl",
+                    "airport_alt_m", "height_above_ground_m", "recenter_lift_m", "agl_before_fixes_m",
+                    "model_height_m", "solid_parts", "draped_parts", "terrain_fit", "on_building_floor",
+                    "final_parts"])
+        for c in cands:
+            entries = c["stem_entries"]
+            solid = [s for s, (_e, _fa, d, _r) in entries.items() if not d]
+            draped = [s for s, (_e, _fa, d, _r) in entries.items() if d]
+            ys = []
+            for s in solid:
+                ir = terrain_fit._load_ir(obj_dir, s)
+                if ir is not None and len(ir.positions):
+                    ys += [float(ir.positions[:, 1].min()), float(ir.positions[:, 1].max())]
+            final = []
+            for s, (e, _fa, _d, _r) in entries.items():
+                if id(e) not in placed:
+                    final.append(f"{s}=removed")
+                else:
+                    final.append(f"{e.get('name')}@{e.get('agl', 0.0):+.2f}")
+            reasons = sorted({r for (_e, _fa, _d, r) in entries.values()})
+            w.writerow([
+                c.get("model", ""), c.get("title", ""), c.get("source", ""),
+                f"{c['abs_lat']:.7f}", f"{c['abs_lon']:.7f}", f"{c.get('hdg', 0.0):.1f}",
+                "" if c.get("alt") is None else f"{c['alt']:.3f}",
+                "" if c.get("is_agl") is None else ("yes" if c["is_agl"] else "no (MSL)"),
+                "" if airport_alt is None else f"{airport_alt:.3f}",
+                f"{c.get('height_offset', 0.0):+.3f}", f"{-c.get('mid_y', 0.0):+.3f}",
+                f"{c.get('agl', 0.0):+.3f}", f"{max(ys) - min(ys):.2f}" if ys else "",
+                len(solid), len(draped), " ".join(reasons), "yes" if c.get("hosted") else "",
+                " ".join(final),
+            ])
+
+
 def _bake_negative_heights(dsf_tiles, obj_dir):
     """Objects meant to reach below the ground -- a drain tile whose
     channel and base sit under the surface, anything MSFS places below its
@@ -2391,6 +2435,8 @@ def run_pipeline(opts, hooks):
                     "group_key": _fit_gk, "raw_lat": p["lat"], "raw_lon": p["lon"], "hdg": p["hdg"],
                     "abs_lat": abs_lat, "abs_lon": abs_lon,
                     "agl": agl, "height_offset": p.get("height_offset", 0.0), "mid_x": mid_x, "mid_z": mid_z,
+                    "mid_y": mid_y, "model": original_stem, "title": p.get("title") or "",
+                    "source": p.get("source") or "", "is_agl": p.get("is_agl"), "alt": p.get("alt"),
                     "any_applied": group_any_applied, "stem_entries": _stem_entries,
                 })
 
@@ -2596,6 +2642,15 @@ def run_pipeline(opts, hooks):
                           + ".", "info")
         except Exception as e:
             hooks.log(f"(couldn't lower below-ground objects: {e})", "warning")
+
+        try:
+            _airport_alt = native_airport_layout.alt_m if native_airport_layout is not None else None
+            _write_placement_report(out / PLACEMENT_REPORT_NAME, _anchor_cluster_candidates, obj_dir,
+                                    dsf_tiles, _airport_alt)
+            hooks.log(f"Wrote {PLACEMENT_REPORT_NAME} (every placement's height, step by step) to the "
+                      f"output folder.", "info")
+        except Exception as e:
+            hooks.log(f"(couldn't write {PLACEMENT_REPORT_NAME}: {e})", "warning")
 
         if agl_placement_count:
             hooks.log(f"{agl_placement_count} placement(s) use native DSF AGL height placement to fix floating/sunken SPB-attached or upper-floor objects.", "info")
