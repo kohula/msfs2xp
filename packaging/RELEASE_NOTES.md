@@ -1,25 +1,19 @@
-Test build: terrain fit back to 1.1.2, a skirt only on steep ground, and
-objects meant to sit below the ground no longer float.
+Diagnostic test build: same conversion as 1.1.4, plus a report of every
+placement's height.
 
 ## What's new
 
-- **Terrain fit restored**: 1.1.3's leveling made every building worse;
-  the fit is back to how it was in 1.1.2.
-- **Skirt only on steep ground**: where the ground under a building is
-  steep (over a 3 % gradient), it is lifted level to the highest ground
-  and a skirt is added below its walls down to the terrain, instead of the
-  building (and its roof) being bent to the slope. Everywhere else the
-  1.1.2 fit is unchanged.
-- **Below-ground objects sink again**: objects meant to reach below the
-  ground -- e.g. a drain tile whose channel sits under the surface, or
-  anything MSFS places below its own ground level (where it has water) --
-  were standing on the ground in X-Plane, their surface hovering above
-  the pavement. The drop is now built into their geometry. The log shows
-  "N placement(s) reaching below the ground lowered into the terrain".
+- **`msfs2xp_placements.csv`** in the output scenery folder: one row per
+  converted object -- model name, title, source, position, MSFS altitude
+  and whether it is above ground or above sea level, the airport
+  elevation, the resulting height above ground, the converter's re-basing
+  lift, the model's height, the terrain-fit outcome, whether it was set
+  on a building's floor, and what each part finally became. Open it in a
+  spreadsheet and filter by model name or position to see why an object
+  floats or sinks.
 
-Kept from 1.1.3: large flat ground sheets draped onto the terrain, flat
-clutter removed across the whole airport, only real buildings carry
-objects on their floors, doubled placements merged.
+Everything from 1.1.4 is unchanged: terrain fit as in 1.1.2, a skirt
+only on steep ground, below-ground drops built into the geometry.
 
 ## Windows
 
