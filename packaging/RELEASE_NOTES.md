@@ -1,26 +1,31 @@
-Test build: SimProp objects in the right place, tighter and more complete
-exclusions, no more flat objects hovering over the runways.
+Test build: level buildings, nothing hovering over the airport ground, no
+doubled buildings.
 
 ## What's new
 
-- **SimProp containers placed correctly**: everything inside a SimProp
-  container (seats, people, apron gear, jetways) was mirrored front-to-back
-  around the container -- a terminal's seats could end up outside the
-  building. Fixed.
-- **Exclusion zones**: a rotated building no longer gets an exclusion far
-  larger than itself (the footprint is now cut into rectangles after
-  rotating it, not before), and the package's own exclusion areas are kept
-  instead of being replaced by the per-object footprints, so areas the
-  scenery author cleared stay cleared.
-- **Runway clutter removed**: flat objects lying on the runways (covers,
-  plates and flush fixtures under 0.5 m tall, without lights), which hover
-  over X-Plane's runway ground, are removed. Aircraft, vehicles, signs,
-  lights and painted markings are kept. Checkbox "Remove flat objects
-  lying on the runways" (on by default) or `--keep-runway-objects`.
+- **Buildings stay level on uneven ground**: a building is no longer bent
+  to follow the terrain (which tilted its roof). It is lifted as one piece
+  to the highest ground under it, and only the bottom edge of its walls
+  reaches down to the terrain, like a foundation. Low flat pieces still
+  follow the ground.
+- **No more hovering ground sheets**: a large flat ground-cover sheet was
+  placed as a solid object and hovered metres above the apron like a
+  ceiling; large flat sheets on the airport ground are now draped onto
+  the terrain. It was also mistaken for a building floor, lifting the
+  signs, barriers and vehicles on it -- only real buildings (2.5 m tall
+  or more) carry objects on their floors now.
+- **Flat clutter across the whole airport**: small flat objects (covers,
+  plates, flush fixtures under 0.5 m, no lights) are removed anywhere
+  inside the airport, not just on the runway strip. Checkbox "Flat
+  objects on the airport ground" (on by default) or `--keep-flat-objects`.
+- **No doubled buildings**: the same object reached twice (a raw
+  placement and a SimProp container) is now recognised within 0.5 m /
+  2 degrees / 0.3 m, so it is placed once instead of twice a few
+  centimetres apart.
 
-Also in this test series (1.1.1): props stay on their building's floor,
-SimProp container heights, a flatten fallback checkbox (off by default),
-the replacement picker's map, and a "Placement heights:" log line.
+Also in this test series: SimProp containers placed correctly and tighter
+exclusions (1.1.2), props on their building's floor, a flatten fallback
+checkbox and the replacement picker's map (1.1.1).
 
 ## Windows
 
