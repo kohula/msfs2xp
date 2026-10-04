@@ -1,21 +1,24 @@
-"""Flat objects lying on a runway: dropped.
+"""Flat objects lying on the airport ground: small ones dropped, large ones
+draped.
 
-MSFS runways carry many very low objects -- pit and drain covers, in-
-pavement fixtures, cable plates -- that sit flush with MSFS's own runway
-surface. In X-Plane the runway ground is X-Plane's terrain, not MSFS's, so
-these end up hovering above the pavement and grass (or sunk into it), and
-being only centimetres tall they add nothing seen from a cockpit. An
-object is dropped when:
+MSFS airports carry many very low objects that sit flush with MSFS's own
+level airport ground -- pit and drain covers, in-pavement fixtures, cable
+plates, and large ground-cover sheets. In X-Plane the ground there is
+X-Plane's terrain, not MSFS's, so a rigid flat object hangs at its anchor's
+ground height: small ones hover a little over the grass and pavement, and
+a sheet hundreds of metres wide hovers metres above every dip like a
+ceiling. Inside the airport (the apt.dat boundary, or a runway strip):
 
-- its anchor lies on a runway strip: the runway itself, its overrun/blast
-  pad, plus a margin beyond each edge for shoulders and edge plates;
-- its solid (non-draped) geometry is less than MAX_HEIGHT_M tall and at
-  most MAX_SIDE_M across -- aircraft, vehicles, signs and anything with
-  real height are kept, as is a large flat piece that could be pavement;
-- it carries no lights of its own (runway and approach light fixtures are
-  kept).
+- a flat object (solid geometry under MAX_HEIGHT_M tall, standing on the
+  ground in MSFS -- its height above ground under GROUND_AGL_M -- with no
+  lights) up to MAX_SIDE_M across is dropped: only centimetres tall, it
+  adds nothing seen from a cockpit;
+- a larger one is draped instead (ATTR_draped, under the pavement layers),
+  so it lies on X-Plane's ground like the rest of the pavement.
 
-Draped geometry (markings, decals) is never dropped.
+Aircraft, vehicles, signs, light fixtures and anything resting on a
+building (a prop set on a building's floor) are kept as they are; draped
+geometry is never touched.
 """
 
 import math
@@ -24,8 +27,11 @@ from geo_transform import metres_per_degree
 
 MAX_HEIGHT_M = 0.5
 MAX_SIDE_M = 15.0
+GROUND_AGL_M = 1.0
 EDGE_MARGIN_M = 10.0
 END_MARGIN_M = 30.0
+DRAPED_LAYER_GROUP = "shoulders"  # below "taxiways"/"runways"/"markings"
+DRAPED_LAYER_OFFSET = -5
 
 
 class RunwayStrip:
@@ -63,27 +69,68 @@ def on_runway(lat, lon, strips):
     return any(s.contains(lat, lon) for s in strips)
 
 
-def is_low_flat(irs, max_height=MAX_HEIGHT_M, max_side=MAX_SIDE_M):
-    """True for one placement's solid sub-objects (MeshIRs) that are all
-    low and small and carry no lights."""
+def _inside(ring, lat, lon):
+    inside = False
+    j = len(ring) - 1
+    for i in range(len(ring)):
+        ai, oi = ring[i]
+        aj, oj = ring[j]
+        if (ai > lat) != (aj > lat) and lon < oi + (lat - ai) * (oj - oi) / (aj - ai):
+            inside = not inside
+        j = i
+    return inside
+
+
+class AirportGround:
+    """The airport's ground: inside its boundary ring [(lat, lon), ...]
+    (apt_native.airport_boundary) or on a runway strip."""
+
+    def __init__(self, ring, strips):
+        self.ring = list(ring or [])
+        self.strips = list(strips or [])
+        if self.ring:
+            lats = [a for a, _ in self.ring]
+            lons = [o for _, o in self.ring]
+            self.bbox = (min(lats), max(lats), min(lons), max(lons))
+
+    def __bool__(self):
+        return bool(self.ring or self.strips)
+
+    def contains(self, lat, lon):
+        if self.ring:
+            a0, a1, o0, o1 = self.bbox
+            if a0 <= lat <= a1 and o0 <= lon <= o1 and _inside(self.ring, lat, lon):
+                return True
+        return on_runway(lat, lon, self.strips)
+
+
+def classify(irs, agl, max_height=MAX_HEIGHT_M, max_side=MAX_SIDE_M, ground_agl=GROUND_AGL_M):
+    """For one placement's solid sub-objects (MeshIRs) standing `agl` m
+    above the ground: "drop" (small flat clutter), "drape" (a large flat
+    sheet) or None (anything else)."""
+    if agl is not None and agl > ground_agl:
+        return None
     y_min = y_max = x_min = x_max = z_min = z_max = None
     for ir in irs:
         if ir is None:
             continue
         if ir.lights:
-            return False
+            return None
         if not len(ir.positions):
             continue
         p = ir.positions
-        y0, y1 = float(p[:, 1].min()), float(p[:, 1].max())
-        x0, x1 = float(p[:, 0].min()), float(p[:, 0].max())
-        z0, z1 = float(p[:, 2].min()), float(p[:, 2].max())
-        y_min = y0 if y_min is None else min(y_min, y0)
-        y_max = y1 if y_max is None else max(y_max, y1)
-        x_min = x0 if x_min is None else min(x_min, x0)
-        x_max = x1 if x_max is None else max(x_max, x1)
-        z_min = z0 if z_min is None else min(z_min, z0)
-        z_max = z1 if z_max is None else max(z_max, z1)
-    if y_min is None:
-        return False
-    return (y_max - y_min) < max_height and max(x_max - x_min, z_max - z_min) <= max_side
+        y_min = min(y_min, float(p[:, 1].min())) if y_min is not None else float(p[:, 1].min())
+        y_max = max(y_max, float(p[:, 1].max())) if y_max is not None else float(p[:, 1].max())
+        x_min = min(x_min, float(p[:, 0].min())) if x_min is not None else float(p[:, 0].min())
+        x_max = max(x_max, float(p[:, 0].max())) if x_max is not None else float(p[:, 0].max())
+        z_min = min(z_min, float(p[:, 2].min())) if z_min is not None else float(p[:, 2].min())
+        z_max = max(z_max, float(p[:, 2].max())) if z_max is not None else float(p[:, 2].max())
+    if y_min is None or y_max - y_min >= max_height:
+        return None
+    return "drop" if max(x_max - x_min, z_max - z_min) <= max_side else "drape"
+
+
+def is_low_flat(irs, max_height=MAX_HEIGHT_M, max_side=MAX_SIDE_M):
+    """True for small flat clutter (see classify), ignoring height above
+    ground."""
+    return classify(irs, None, max_height, max_side) == "drop"

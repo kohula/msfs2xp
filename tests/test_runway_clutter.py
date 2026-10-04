@@ -51,34 +51,60 @@ class TestRunwayClutter(unittest.TestCase):
                                    size=1, dataref=None, named_light=None)
         self.assertFalse(runway_clutter.is_low_flat([_box("edge_light", 0.3, 0.3, 0.3), _box("l", 0, 0, 0, [light])]))
 
-    def test_pipeline_drops_only_clutter_entries(self):
+    def test_classify_drop_drape_or_keep(self):
+        self.assertEqual(runway_clutter.classify([_box("cover", 2, 0.15, 1)], 0.0), "drop")
+        self.assertEqual(runway_clutter.classify([_box("sheet", 400, 0.1, 300)], 0.0), "drape")
+        self.assertIsNone(runway_clutter.classify([_box("sign", 3, 1.2, 0.3)], 0.0))
+        # an elevated flat thing (a canopy roof) is not ground clutter
+        self.assertIsNone(runway_clutter.classify([_box("canopy", 40, 0.2, 20)], 6.0))
+
+    def test_airport_ground_is_the_boundary_or_a_runway_strip(self):
+        ring = [self._at(-50, -50), self._at(50, -50), self._at(50, 50), self._at(-50, 50)]
+        ground = runway_clutter.AirportGround(ring, self.strips)
+        self.assertTrue(ground.contains(*self._at(0, 40)))   # grass inside the boundary
+        self.assertTrue(ground.contains(*self._at(700, 0)))   # runway strip outside the ring
+        self.assertFalse(ground.contains(*self._at(0, 200)))
+        self.assertFalse(runway_clutter.AirportGround([], []))
+
+    def test_pipeline_drops_small_drapes_large_keeps_the_rest(self):
         import tempfile
         from pathlib import Path
         with tempfile.TemporaryDirectory() as td:
             obj_dir = Path(td)
-            for ir in (_box("cover", 2, 0.15, 1), _box("sign", 3, 1.2, 0.3), _box("decal", 2, 0.0, 2)):
+            for ir in (_box("cover", 2, 0.15, 1), _box("sign", 3, 1.2, 0.3), _box("decal", 2, 0.0, 2),
+                       _box("sheet", 300, 0.2, 200)):
                 mesh_ir.save(ir, mesh_ir.sidecar_path_for(obj_dir / f"{ir.name}.obj"))
             terrain_fit._ir_cache.clear()
+            ground = runway_clutter.AirportGround([], self.strips)
             on = self._at(100, 5)
             off = self._at(100, 80)
-            cover_on = {"name": "cover"}
-            cover_off = {"name": "cover"}
-            sign_on = {"name": "sign"}
-            decal_on = {"name": "decal"}
+            cover_on, cover_off, cover_on_floor = {"name": "cover"}, {"name": "cover"}, {"name": "cover"}
+            sign_on, decal_on = {"name": "sign"}, {"name": "decal"}
+            sheet = {"name": "sheet", "agl": 0.0}
             cands = [
-                {"abs_lat": on[0], "abs_lon": on[1], "stem_entries": {
+                {"abs_lat": on[0], "abs_lon": on[1], "agl": 0.0, "stem_entries": {
                     "cover": (cover_on, False, False, "negligible"), "decal": (decal_on, False, True, "applied")}},
-                {"abs_lat": off[0], "abs_lon": off[1], "stem_entries": {"cover": (cover_off, False, False, "x")}},
-                {"abs_lat": on[0], "abs_lon": on[1], "stem_entries": {"sign": (sign_on, False, False, "x")}},
+                {"abs_lat": off[0], "abs_lon": off[1], "agl": 0.0,
+                 "stem_entries": {"cover": (cover_off, False, False, "x")}},
+                {"abs_lat": on[0], "abs_lon": on[1], "agl": 0.0, "hosted": True,
+                 "stem_entries": {"cover": (cover_on_floor, False, False, "x")}},
+                {"abs_lat": on[0], "abs_lon": on[1], "agl": 0.0,
+                 "stem_entries": {"sign": (sign_on, False, False, "x")}},
+                {"abs_lat": on[0], "abs_lon": on[1], "agl": 0.0,
+                 "stem_entries": {"sheet": (sheet, False, False, "x")}},
             ]
-            tiles = {(51, 0): [cover_on, decal_on, cover_off, sign_on]}
-            self.assertEqual(pipeline._drop_runway_clutter(cands, obj_dir, tiles, self.strips), 1)
+            tiles = {(51, 0): [cover_on, decal_on, cover_off, cover_on_floor, sign_on, sheet]}
+            self.assertEqual(pipeline._settle_flat_airport_objects(cands, obj_dir, tiles, ground), (1, 1))
             kept = tiles[(51, 0)]
-            self.assertNotIn(cover_on, [o for o in kept if o is cover_on])
-            self.assertTrue(any(o is decal_on for o in kept))
-            self.assertTrue(any(o is cover_off for o in kept))
-            self.assertTrue(any(o is sign_on for o in kept))
-            self.assertEqual(len(kept), 3)
+            self.assertFalse(any(o is cover_on for o in kept))
+            for o in (decal_on, cover_off, cover_on_floor, sign_on, sheet):
+                self.assertTrue(any(k is o for k in kept))
+            self.assertEqual(sheet["name"], "sheet_drp")
+            text = (obj_dir / "sheet_drp.obj").read_text(encoding="utf-8")
+            self.assertIn("ATTR_draped", text)
+            self.assertIn("ATTR_layer_group_draped shoulders -5", text)
+            draped_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / "sheet_drp.obj"))
+            self.assertTrue(draped_ir.draped)
             terrain_fit._ir_cache.clear()
 
 

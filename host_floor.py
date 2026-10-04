@@ -27,6 +27,7 @@ import numpy as np
 from geo_transform import latlon_offset_to_local, metres_per_degree
 
 HOST_MIN_SIDE_M = 20.0  # a building at least this long can host props
+HOST_MIN_HEIGHT_M = 2.5  # ...and this tall: a flat ground sheet is not a building floor
 PROP_MAX_AREA_RATIO = 0.25  # a prop's footprint is at most this share of its host's
 _MIN_UP_NORMAL = 0.5  # floor/roof/ceiling triangles, not walls
 FLOOR_TOLERANCE_M = 0.5  # how close the floor must be to the prop's own height
@@ -125,8 +126,21 @@ class Host:
         return x0 <= x <= x1 and z0 <= z <= z1 and self.cover.has_floor(x, z, height_offset - self.agl)
 
 
-def is_host_size(bbox):
-    return bbox is not None and max(bbox[1] - bbox[0], bbox[3] - bbox[2]) >= HOST_MIN_SIDE_M
+def is_host_size(bbox, height=None):
+    """Long enough (bbox: x_min, x_max, z_min, z_max) and, when `height`
+    is given, tall enough to be a building."""
+    if bbox is None or max(bbox[1] - bbox[0], bbox[3] - bbox[2]) < HOST_MIN_SIDE_M:
+        return False
+    return height is None or height >= HOST_MIN_HEIGHT_M
+
+
+def height_of(irs):
+    """Vertical extent of these MeshIRs' positions (0 if none)."""
+    ys = [ir.positions[:, 1] for ir in irs if ir is not None and len(ir.positions)]
+    if not ys:
+        return 0.0
+    y = np.concatenate(ys)
+    return float(y.max() - y.min())
 
 
 class HostIndex:

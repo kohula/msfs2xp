@@ -721,7 +721,7 @@ class ModularPythonConverterApp:
             self.flatten_airport_var
         ).grid(row=9, column=0, columnspan=4, sticky="w", pady=4)
         _styled_checkbutton(
-            options_inner, "Remove flat objects lying on the runways (covers, plates that would hover)",
+            options_inner, "Flat objects on the airport ground: remove small ones, drape large sheets (they hover otherwise)",
             self.remove_runway_clutter_var
         ).grid(row=10, column=0, columnspan=4, sticky="w", pady=4)
         glass_row = tk.Frame(options_inner, bg=self.card_bg)

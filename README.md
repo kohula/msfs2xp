@@ -26,15 +26,18 @@ in this codebase.
 - **Ground content**: draped pavement, painted lines and markings,
   merged across overlapping placements to avoid X-Plane's draw-order
   z-fighting between same-layer draped surfaces.
-- **Terrain fit**: large buildings get a rigid-tilt correction against
-  real sampled X-Plane terrain, so a big footprint doesn't float or sink
-  at its corners on sloped ground. X-Plane's terrain itself is left as it
+- **Terrain fit**: against real sampled X-Plane terrain. A building stays
+  level: it is lifted to the highest ground under its footprint and only
+  the bottom edge of its walls is pulled down onto the terrain (a skirt),
+  so it neither floats nor sinks at its corners and its roof doesn't tilt.
+  Low flat pieces follow the ground. X-Plane's terrain itself is left as it
   is; seats, people and other props standing on a building's floor are
   set on that floor's level rather than on the ground under each of them.
-- **Runway clutter**: flat objects lying on the runways (covers, plates,
-  flush fixtures under 0.5 m tall, without lights) are removed, since they
-  hover over X-Plane's runway ground (`--keep-runway-objects` / the GUI
-  checkbox keeps them).
+- **Flat objects on the airport ground**: covers, plates and flush
+  fixtures (under 0.5 m tall, no lights) inside the airport are removed,
+  and large flat ground sheets are draped onto the terrain, since rigid
+  flat objects hover over X-Plane's uneven ground
+  (`--keep-flat-objects` / the GUI checkbox keeps them as they are).
 - **Exclusions**: each converted object's own footprint (cut into
   north/east-aligned rectangles after rotation, +0.5 m), plus the
   package's own exclusion rectangles.

@@ -2131,20 +2131,30 @@ def _parse_one_bgl_uncached(bgl, models_dir, scan_terrain_vectors=True):
     return result
 
 
+_DEDUPE_POS_M = 0.5
+_DEDUPE_HDG_DEG = 2.0
+_DEDUPE_HEIGHT_M = 0.3
+
+
 def _dedupe_placements(placements):
     """CONFIRMED REAL BUG (a real EGLC package): a GUID identifies a
     MODEL/TYPE, shared across every real-world instance of it -- never a
     unique placement. Two entirely different extraction paths (a raw BGL
     SceneryObject record, and the same object ALSO reachable via SPB
     container-attach expansion) can independently produce a placement
-    for the exact same real-world instance: same GUID, same position,
-    same heading. Left in, this doubles the object in the output --
-    visually a duplicate, and z-fighting/glitching for anything draped.
-    Keys on (guid, lat, lon, hdg) rounded to a few decimal places (float
-    jitter from two different derivations of the same real-world point),
-    keeping the FIRST occurrence of each key and dropping the rest.
+    for the exact same real-world instance. Left in, this doubles the
+    object in the output -- and since each copy is terrain-fitted on its
+    own, the two end up a few centimetres apart: a building drawn twice,
+    flickering.
+
+    Two derivations of one point differ by float jitter, and comparing
+    rounded coordinates splits values that straddle a rounding boundary,
+    so copies are matched with tolerances instead: same GUID and scale,
+    within _DEDUPE_POS_M horizontally, _DEDUPE_HDG_DEG of heading and
+    _DEDUPE_HEIGHT_M of height (stacked containers, a row of lamps or
+    chairs side by side stay distinct). The first occurrence is kept.
     Returns (deduped_list, dropped_count)."""
-    seen = set()
+    cells = {}
     out = []
     dropped = 0
     for p in placements:
@@ -2153,12 +2163,29 @@ def _dedupe_placements(placements):
         if guid is None or lat is None or lon is None or hdg is None:
             out.append(p)
             continue
-        key = (guid, round(float(lat), 6), round(float(lon), 6), round(float(hdg), 1),
-               round(float(p.get("scale", 1.0)), 3))
-        if key in seen:
+        lat, lon, hdg = float(lat), float(lon), float(hdg)
+        height = float(p.get("height_offset", 0.0) or 0.0)
+        scale = round(float(p.get("scale", 1.0) or 1.0), 3)
+        m_lat, m_lon = geo_transform.metres_per_degree(lat)
+        y, x = lat * m_lat, lon * m_lon
+        cy, cx = int(math.floor(y / _DEDUPE_POS_M)), int(math.floor(x / _DEDUPE_POS_M))
+        duplicate = False
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                for ky, kx, kh, kheight in cells.get((guid, scale, cy + dy, cx + dx), ()):
+                    if (math.hypot(ky - y, kx - x) <= _DEDUPE_POS_M
+                            and abs((kh - hdg + 180.0) % 360.0 - 180.0) <= _DEDUPE_HDG_DEG
+                            and abs(kheight - height) <= _DEDUPE_HEIGHT_M):
+                        duplicate = True
+                        break
+                if duplicate:
+                    break
+            if duplicate:
+                break
+        if duplicate:
             dropped += 1
             continue
-        seen.add(key)
+        cells.setdefault((guid, scale, cy, cx), []).append((y, x, hdg, height))
         out.append(p)
     return out, dropped
 

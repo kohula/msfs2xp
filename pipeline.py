@@ -16,6 +16,7 @@ import json
 import hashlib
 import logging
 import pickle
+import dataclasses
 from pathlib import Path
 from dataclasses import dataclass
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -878,26 +879,50 @@ def pool_worker_count():
     return max(1, min(cpu_workers, mem_workers))
 
 
-def _drop_runway_clutter(cands, obj_dir, dsf_tiles, strips):
-    """Remove from dsf_tiles the solid parts of every placement
-    runway_clutter.py counts as flat clutter on a runway; draped parts
-    stay. Returns the number of placements dropped."""
-    if not strips:
-        return 0
+def _settle_flat_airport_objects(cands, obj_dir, dsf_tiles, ground):
+    """runway_clutter.py: for every placement standing on the airport
+    ground (not on a building's floor), drop the solid parts of small flat
+    clutter and drape large flat sheets onto the terrain. Returns
+    (dropped, draped) placement counts."""
+    if not ground:
+        return 0, 0
     drop = set()
-    count = 0
+    dropped = draped = 0
     for c in cands:
-        stems = [s for s, (_e, _fa, draped, _r) in c["stem_entries"].items() if not draped]
-        if not stems or not runway_clutter.on_runway(c["abs_lat"], c["abs_lon"], strips):
+        if c.get("hosted"):
             continue
-        if not runway_clutter.is_low_flat([terrain_fit._load_ir(obj_dir, s) for s in stems]):
+        stems = [s for s, (_e, _fa, is_draped, _r) in c["stem_entries"].items() if not is_draped]
+        if not stems or not ground.contains(c["abs_lat"], c["abs_lon"]):
             continue
-        drop.update(id(c["stem_entries"][s][0]) for s in stems)
-        count += 1
+        irs = [terrain_fit._load_ir(obj_dir, s) for s in stems]
+        kind = runway_clutter.classify(irs, c.get("agl"))
+        if kind == "drop":
+            drop.update(id(c["stem_entries"][s][0]) for s in stems)
+            dropped += 1
+        elif kind == "drape":
+            for s, ir in zip(stems, irs):
+                entry = c["stem_entries"][s][0]
+                if ir is None or not len(ir.positions):
+                    drop.add(id(entry))
+                    continue
+                name = f"{s}_drp"
+                path = obj_dir / f"{name}.obj"
+                if not path.exists():
+                    flat = ir.positions.copy()
+                    flat[:, 1] = 0.0
+                    sheet = dataclasses.replace(
+                        ir, name=name, positions=flat, draped=True, tilted=False, lod_far=None,
+                        draped_layer_group=runway_clutter.DRAPED_LAYER_GROUP,
+                        draped_layer_offset=runway_clutter.DRAPED_LAYER_OFFSET)
+                    mesh_ir.write_obj8(sheet, path)
+                    mesh_ir.save(sheet, mesh_ir.sidecar_path_for(path))
+                entry["name"] = name
+                entry["agl"] = 0.0
+            draped += 1
     if drop:
         for key, objects in dsf_tiles.items():
             dsf_tiles[key] = [o for o in objects if id(o) not in drop]
-    return count
+    return dropped, draped
 
 
 def _place_props_on_host_floors(cands, obj_dir, xplane_root):
@@ -921,7 +946,7 @@ def _place_props_on_host_floors(cands, obj_dir, xplane_root):
             continue
         group = irs(stems)
         bbox = host_floor.footprint(group)
-        if not host_floor.is_host_size(bbox):
+        if not host_floor.is_host_size(bbox, host_floor.height_of(group)):
             continue
         cover = host_floor.horizontal_cover(group)
         if cover is None:
@@ -934,7 +959,7 @@ def _place_props_on_host_floors(cands, obj_dir, xplane_root):
             continue
         if c.get("linked_shift") is not None:
             shift = c["linked_shift"]
-        elif "applied_vertical_shift" in reasons and t and t.get("vertical_shift") is not None:
+        elif reasons & {"applied_vertical_shift", "applied_skirt"} and t and t.get("vertical_shift") is not None:
             shift = t["vertical_shift"]
         else:
             shift = 0.0
@@ -963,6 +988,7 @@ def _place_props_on_host_floors(cands, obj_dir, xplane_root):
             entry = c["stem_entries"][s][0]
             entry["name"] = s
             entry["agl"] = agl
+        c["hosted"] = True
         used.add(host.key)
         moved += 1
     return len(used), moved
@@ -1586,7 +1612,8 @@ class PipelineOptions:
     # on flat ground. Normally X-Plane's terrain is kept and props follow
     # their buildings' floors instead (host_floor.py).
     flatten_airport: bool = False
-    # Drop flat objects lying on the runways (runway_clutter.py).
+    # Flat objects on the airport ground: drop small ones, drape large
+    # sheets (runway_clutter.py).
     remove_runway_clutter: bool = True
 
 
@@ -2493,17 +2520,21 @@ def run_pipeline(opts, hooks):
             except Exception as e:
                 hooks.log(f"(couldn't set props on their buildings' floors: {e})", "warning")
 
-        # Flat objects lying on a runway (covers, plates, flush fixtures)
-        # hover over X-Plane's runway ground: dropped (runway_clutter.py).
+        # Flat objects on the airport ground hover over X-Plane's terrain:
+        # small ones are dropped, large sheets draped (runway_clutter.py).
         if opts.remove_runway_clutter and apt_native.is_usable(native_airport_layout):
             try:
-                _dropped = _drop_runway_clutter(_anchor_cluster_candidates, obj_dir, dsf_tiles,
-                                                runway_clutter.runway_strips(native_airport_layout))
-                if _dropped:
-                    hooks.log(f"Removed {_dropped} flat object(s) lying on the runways (under "
-                              f"{runway_clutter.MAX_HEIGHT_M:g} m tall, no lights).", "info")
+                _ground = runway_clutter.AirportGround(
+                    apt_native.airport_boundary(native_airport_layout),
+                    runway_clutter.runway_strips(native_airport_layout))
+                _dropped, _sheets = _settle_flat_airport_objects(
+                    _anchor_cluster_candidates, obj_dir, dsf_tiles, _ground)
+                if _dropped or _sheets:
+                    hooks.log(f"Flat objects on the airport ground: removed {_dropped} small one(s) (under "
+                              f"{runway_clutter.MAX_HEIGHT_M:g} m tall, no lights), draped {_sheets} large "
+                              f"ground sheet(s) onto the terrain.", "info")
             except Exception as e:
-                hooks.log(f"(couldn't check for flat objects on the runways: {e})", "warning")
+                hooks.log(f"(couldn't check for flat objects on the airport ground: {e})", "warning")
 
         if agl_placement_count:
             hooks.log(f"{agl_placement_count} placement(s) use native DSF AGL height placement to fix floating/sunken SPB-attached or upper-floor objects.", "info")

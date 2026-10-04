@@ -84,6 +84,15 @@ class TestHostFloor(unittest.TestCase):
         self.assertIsNone(index.host_for(lat, lon, 0.0, area=1500.0))
         self.assertIsNone(index.host_for(*self._at(500.0, 500.0), 0.0, area=2.0))
 
+    def test_a_flat_ground_sheet_is_not_a_building(self):
+        """A 400 m ground-cover sheet is long enough but not tall enough:
+        treated as a building floor, it lifted the signs and barriers on
+        it to its own (hovering) height."""
+        sheet = _ir("sheet", [_quad(-200, 200, -150, 150, 0.0), _quad(-200, 200, -150, 150, 0.2)])
+        self.assertFalse(host_floor.is_host_size(host_floor.footprint([sheet]), host_floor.height_of([sheet])))
+        self.assertTrue(host_floor.is_host_size(host_floor.footprint([_l_shaped_terminal()]),
+                                                host_floor.height_of([_l_shaped_terminal()])))
+
     def test_small_things_are_not_hosts(self):
         self.assertFalse(host_floor.is_host_size((-2, 2, -2, 2)))
         self.assertTrue(host_floor.is_host_size((-15, 15, -2, 2)))

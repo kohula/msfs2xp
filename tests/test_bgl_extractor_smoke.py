@@ -1072,3 +1072,34 @@ class TestRemoveRedundantContainerWrappers(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDedupePlacementsTolerance(unittest.TestCase):
+    """The same model reached twice (a raw placement and a container's
+    expansion) with float jitter between the two: one copy kept. Real
+    repeated instances side by side or stacked are kept."""
+
+    def _p(self, lat, lon, hdg=10.0, h=0.0, guid="g1", scale=1.0):
+        return {"guid": guid, "lat": lat, "lon": lon, "hdg": hdg, "height_offset": h, "scale": scale}
+
+    def test_near_copies_straddling_a_rounding_boundary_are_one(self):
+        a = self._p(51.50000049, 0.05, hdg=10.0)
+        b = self._p(51.50000051, 0.0500000003, hdg=10.3)  # ~2 mm and 0.3 degrees apart
+        out, dropped = bgl_extractor._dedupe_placements([a, b])
+        self.assertEqual((out, dropped), ([a], 1))
+
+    def test_neighbours_stacks_and_other_models_stay(self):
+        base = self._p(51.5, 0.05)
+        side = self._p(51.5 + 1.0 / 111250.0, 0.05)        # 1 m north
+        stacked = self._p(51.5, 0.05, h=2.6)               # a container on top
+        turned = self._p(51.5, 0.05, hdg=100.0)
+        other = self._p(51.5, 0.05, guid="g2")
+        bigger = self._p(51.5, 0.05, scale=2.0)
+        out, dropped = bgl_extractor._dedupe_placements([base, side, stacked, turned, other, bigger])
+        self.assertEqual(dropped, 0)
+        self.assertEqual(len(out), 6)
+
+    def test_heading_wraps_around_north(self):
+        a = self._p(51.5, 0.05, hdg=359.5)
+        b = self._p(51.5, 0.05, hdg=0.5)
+        self.assertEqual(bgl_extractor._dedupe_placements([a, b])[1], 1)

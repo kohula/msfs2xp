@@ -39,9 +39,11 @@ def build_parser():
                         "(default 2048, 0 = keep source sizes)")
     p.add_argument("--painted-lines", action="store_true",
                    help="apt.dat: paint the MSFS painted-line records")
-    p.add_argument("--keep-runway-objects", action="store_true",
-                   help="keep flat objects lying on the runways (covers, plates; removed by default "
-                        "because they hover over X-Plane's runway ground)")
+    p.add_argument("--keep-flat-objects", "--keep-runway-objects", dest="keep_runway_objects",
+                   action="store_true",
+                   help="keep flat objects lying on the airport ground as they are (by default small "
+                        "ones -- covers, plates -- are removed and large ground sheets draped, since "
+                        "they hover over X-Plane's terrain)")
     p.add_argument("--flatten", action="store_true",
                    help="apt.dat: flatten the terrain inside the airport boundary, as MSFS does "
                         "(fallback; by default X-Plane's terrain is kept)")
