@@ -70,38 +70,48 @@ class TestPureMathHelpers(unittest.TestCase):
 
 
 class TestResolveAttachOffset(unittest.TestCase):
-    """SimPropAttach OffsetXYZ -> real-world lat/lon. Confirmed real
-    regression: a hand-rolled heading rotation here disagreed with
-    geo_transform's (the convention every other placement in this project
-    uses) on the sign of the north/south term -- a building's separate
-    "interior" object (LHBP_B_1_8_1) rendered out to the side of its own
-    exterior shell instead of inside it."""
+    """SimPropAttach OffsetXYZ -> real-world lat/lon. The offset is in
+    MSFS's frame (+X right, +Z forward: north at heading 0), while
+    geo_transform's local frame has -Z north. Passing Z through unchanged
+    mirrored every container child north<->south around its container --
+    a terminal's seats ended up outside the building."""
 
-    def test_matches_geo_transform_at_zero_pitch_roll(self):
-        # pitch/roll are a no-op for a real ground SceneryObject -- the
-        # result must be IDENTICAL to calling geo_transform directly for
-        # every offset/heading combination, not just agree by coincidence
-        # at heading 0.
+    def test_matches_geo_transform_with_z_forward(self):
         import geo_transform
         for hdg in (0.0, 37.0, 90.0, 180.0, 273.5):
             for x, z in ((10.0, 0.0), (0.0, -10.0), (5.0, -8.0), (-6.0, 4.0)):
                 lat, lon, dy = bgl_extractor.resolve_attach_offset(
                     x, 2.0, z, 47.5, 19.25, 0.0, 0.0, hdg)
-                exp_lat, exp_lon = geo_transform.local_offset_to_latlon(47.5, 19.25, hdg, x, z)
+                exp_lat, exp_lon = geo_transform.local_offset_to_latlon(47.5, 19.25, hdg, x, -z)
                 self.assertAlmostEqual(lat, exp_lat, places=9, msg=f"hdg={hdg} x={x} z={z}")
                 self.assertAlmostEqual(lon, exp_lon, places=9, msg=f"hdg={hdg} x={x} z={z}")
                 self.assertEqual(dy, 2.0)
 
-    def test_north_offset_at_heading_zero_increases_latitude(self):
-        # local -Z is north at heading 0 (this project's fixed convention).
-        lat, lon, _ = bgl_extractor.resolve_attach_offset(0.0, 0.0, -50.0, 47.5, 19.25, 0.0, 0.0, 0.0)
+    def test_forward_offset_at_heading_zero_is_north(self):
+        lat, lon, _ = bgl_extractor.resolve_attach_offset(0.0, 0.0, 50.0, 47.5, 19.25, 0.0, 0.0, 0.0)
         self.assertGreater(lat, 47.5)
         self.assertAlmostEqual(lon, 19.25, places=6)
 
-    def test_east_offset_at_heading_zero_increases_longitude(self):
+    def test_right_offset_at_heading_zero_is_east(self):
         lat, lon, _ = bgl_extractor.resolve_attach_offset(50.0, 0.0, 0.0, 47.5, 19.25, 0.0, 0.0, 0.0)
         self.assertGreater(lon, 19.25)
         self.assertAlmostEqual(lat, 47.5, places=6)
+
+    def test_facing_south_left_is_east_and_ahead_is_south(self):
+        from geo_transform import metres_per_degree
+        m_lat, m_lon = metres_per_degree(47.5)
+        lat, lon, _ = bgl_extractor.resolve_attach_offset(-400.0, 0.0, 100.0, 47.5, 19.25, 0.0, 0.0, 180.0)
+        self.assertAlmostEqual((lon - 19.25) * m_lon, 400.0, delta=0.5)
+        self.assertAlmostEqual((lat - 47.5) * m_lat, -100.0, delta=0.5)
+
+    def test_facing_east_ahead_is_east_and_right_is_south(self):
+        from geo_transform import metres_per_degree
+        m_lat, m_lon = metres_per_degree(47.5)
+        lat, lon, _ = bgl_extractor.resolve_attach_offset(0.0, 0.0, 30.0, 47.5, 19.25, 0.0, 0.0, 90.0)
+        self.assertAlmostEqual((lon - 19.25) * m_lon, 30.0, delta=0.05)
+        self.assertAlmostEqual(lat, 47.5, places=7)
+        lat, lon, _ = bgl_extractor.resolve_attach_offset(20.0, 0.0, 0.0, 47.5, 19.25, 0.0, 0.0, 90.0)
+        self.assertAlmostEqual((lat - 47.5) * m_lat, -20.0, delta=0.05)
 
 
 def _spb_guid_hex(guid_str: str) -> str:

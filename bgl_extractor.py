@@ -1210,25 +1210,20 @@ def resolve_attach_offset(x, y, z, anchor_lat, anchor_lon, anchor_pitch, anchor_
     container's own contact point) -- there's no separate lat/lon
     component to it.
 
+    OffsetXYZ is in MSFS's own frame: +X right, +Y up, +Z FORWARD of the
+    container -- at heading 0, +Z is north. geo_transform's local frame is
+    X-Plane's object frame, where -Z is north, so Z changes sign on the
+    way in. Passing it unchanged (as this did) mirrored every child
+    north<->south around its container's anchor, rotated by the
+    container's heading: seats 30 m forward of a terminal container
+    landed 30 m behind it, outside the building.
+
     Pitch/Roll are applied here as a local pre-rotation of the offset (a
     ground SceneryObject's own pitch/roll is essentially always 0 in
     practice, making this step a no-op for the overwhelming majority of
     real placements); the HEADING rotation + lat/lon conversion is handed
-    to geo_transform.local_offset_to_latlon -- the one place in this whole
-    project that convention is defined, and every other placement/
-    recentering/terrain-fit call already uses it.
-
-    BUG FIXED here: this function used to hand-roll its own heading
-    rotation (dx = x2*cy + z2*sy, dz = -x2*sy + z2*cy) instead of calling
-    geo_transform.rotate_xz. At heading 0 both agree on X, but the Z
-    (north/south) term came out with the OPPOSITE sign from geo_transform's
-    -- every SimPropAttach child (a building's separate "interior" object,
-    most apron lights/lamps, jetways/doors resolved via this path) was
-    mirrored north<->south around its own container's anchor, worse the
-    further the OffsetXYZ reaches and the more the container's own heading
-    rotates that mirroring into a sideways/diagonal miss -- e.g. a
-    building's separate interior model rendering out to the side of its
-    own exterior shell instead of inside it."""
+    to geo_transform.local_offset_to_latlon, the convention every other
+    placement/recentering/terrain-fit call uses."""
     p = math.radians(anchor_pitch)
     r = math.radians(anchor_roll)
     cx, sx = math.cos(p), math.sin(p)
@@ -1245,7 +1240,7 @@ def resolve_attach_offset(x, y, z, anchor_lat, anchor_lon, anchor_pitch, anchor_
     z2 = -y1 * sx + z1 * cx
 
     dy = y2
-    lat, lon = geo_transform.local_offset_to_latlon(anchor_lat, anchor_lon, anchor_hdg, x2, z2)
+    lat, lon = geo_transform.local_offset_to_latlon(anchor_lat, anchor_lon, anchor_hdg, x2, -z2)
     return lat, lon, dy
 
 

@@ -37,6 +37,7 @@ import gpu_accel
 import terrain_dem
 import terrain_fit
 import host_floor
+import runway_clutter
 import draped_merge
 import scenery_viewer
 import geo_transform
@@ -652,7 +653,19 @@ def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=0.5, cell_m
         xz = np.concatenate(xz_parts, axis=0)
         tris = np.concatenate(tri_parts, axis=0) if tri_parts else None
 
-        mask, x_min, z_min, cell = _rasterize_footprint_mask(xz, tris, cell_m)
+        # Rasterize in the WORLD frame (x east, z south: the object's local
+        # x/z turned by its heading), not the object's own: an exclusion is
+        # always a north/south/east/west box, so rectangles cut in the
+        # rotated local frame each had to grow into the box around their
+        # rotated corners -- at 45 degrees every thin strip became a
+        # diamond twice its own area, so a rotated building's exclusion
+        # came out far larger than an unrotated one's.
+        h = math.radians(heading_deg)
+        cos_h, sin_h = math.cos(h), math.sin(h)
+        world = np.column_stack((xz[:, 0] * cos_h - xz[:, 1] * sin_h,
+                                 xz[:, 0] * sin_h + xz[:, 1] * cos_h))
+
+        mask, x_min, z_min, cell = _rasterize_footprint_mask(world, tris, cell_m)
         if mask is None:
             continue
         grid_rects = _greedy_rects_from_mask(mask)
@@ -660,24 +673,16 @@ def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=0.5, cell_m
             continue
 
         m_lat, m_lon = geo_transform.metres_per_degree(base_lat)
-        pad_lat_deg = pad_m / m_lat
-        pad_lon_deg = pad_m / m_lon
         for (gy0, gx0, gy1, gx1) in grid_rects:
-            lx_min = x_min + gx0 * cell
-            lx_max = x_min + (gx1 + 1) * cell
-            lz_min = z_min + gy0 * cell
-            lz_max = z_min + (gy1 + 1) * cell
-            corners = [(lx_min, lz_min), (lx_max, lz_min), (lx_max, lz_max), (lx_min, lz_max)]
-            lats, lons = [], []
-            for cx, cz in corners:
-                la, lo = geo_transform.local_offset_to_latlon(base_lat, base_lon, heading_deg, cx, cz)
-                lats.append(la)
-                lons.append(lo)
+            east0 = x_min + gx0 * cell - pad_m
+            east1 = x_min + (gx1 + 1) * cell + pad_m
+            south0 = z_min + gy0 * cell - pad_m
+            south1 = z_min + (gy1 + 1) * cell + pad_m
             rects.append({
-                "west": min(lons) - pad_lon_deg,
-                "east": max(lons) + pad_lon_deg,
-                "south": min(lats) - pad_lat_deg,
-                "north": max(lats) + pad_lat_deg,
+                "west": base_lon + east0 / m_lon,
+                "east": base_lon + east1 / m_lon,
+                "south": base_lat - south1 / m_lat,
+                "north": base_lat - south0 / m_lat,
             })
     return rects
 
@@ -871,6 +876,28 @@ def pool_worker_count():
         return cpu_workers
     mem_workers = max(1, int(avail_gb / 1.5))
     return max(1, min(cpu_workers, mem_workers))
+
+
+def _drop_runway_clutter(cands, obj_dir, dsf_tiles, strips):
+    """Remove from dsf_tiles the solid parts of every placement
+    runway_clutter.py counts as flat clutter on a runway; draped parts
+    stay. Returns the number of placements dropped."""
+    if not strips:
+        return 0
+    drop = set()
+    count = 0
+    for c in cands:
+        stems = [s for s, (_e, _fa, draped, _r) in c["stem_entries"].items() if not draped]
+        if not stems or not runway_clutter.on_runway(c["abs_lat"], c["abs_lon"], strips):
+            continue
+        if not runway_clutter.is_low_flat([terrain_fit._load_ir(obj_dir, s) for s in stems]):
+            continue
+        drop.update(id(c["stem_entries"][s][0]) for s in stems)
+        count += 1
+    if drop:
+        for key, objects in dsf_tiles.items():
+            dsf_tiles[key] = [o for o in objects if id(o) not in drop]
+    return count
 
 
 def _place_props_on_host_floors(cands, obj_dir, xplane_root):
@@ -1559,6 +1586,8 @@ class PipelineOptions:
     # on flat ground. Normally X-Plane's terrain is kept and props follow
     # their buildings' floors instead (host_floor.py).
     flatten_airport: bool = False
+    # Drop flat objects lying on the runways (runway_clutter.py).
+    remove_runway_clutter: bool = True
 
 
 class PipelineHooks:
@@ -2464,6 +2493,18 @@ def run_pipeline(opts, hooks):
             except Exception as e:
                 hooks.log(f"(couldn't set props on their buildings' floors: {e})", "warning")
 
+        # Flat objects lying on a runway (covers, plates, flush fixtures)
+        # hover over X-Plane's runway ground: dropped (runway_clutter.py).
+        if opts.remove_runway_clutter and apt_native.is_usable(native_airport_layout):
+            try:
+                _dropped = _drop_runway_clutter(_anchor_cluster_candidates, obj_dir, dsf_tiles,
+                                                runway_clutter.runway_strips(native_airport_layout))
+                if _dropped:
+                    hooks.log(f"Removed {_dropped} flat object(s) lying on the runways (under "
+                              f"{runway_clutter.MAX_HEIGHT_M:g} m tall, no lights).", "info")
+            except Exception as e:
+                hooks.log(f"(couldn't check for flat objects on the runways: {e})", "warning")
+
         if agl_placement_count:
             hooks.log(f"{agl_placement_count} placement(s) use native DSF AGL height placement to fix floating/sunken SPB-attached or upper-floor objects.", "info")
         if _height_stats["msl"] or _height_stats["below_origin"]:
@@ -2763,6 +2804,8 @@ def run_pipeline(opts, hooks):
         # built separately below.
         shaped_rects = _per_object_exclusion_rects(obj_dir, _footprint_exclusion_candidates)
         _used_per_object_rects = bool(shaped_rects)
+        _footprint_rect_count = len(shaped_rects)
+        kept_package_rects = 0
         if not shaped_rects:
             if boundary_points:
                 shaped_rects.extend(_polygon_interior_exclusion_rects(boundary_points))
@@ -2796,6 +2839,20 @@ def run_pipeline(opts, hooks):
                 _non_road_categories = tuple(k for k in dsf_compiler.EXCLUSION_PROP_KEYS.keys() if k not in ("net", "str"))
                 for r in shaped_rects:
                     r["categories"] = _non_road_categories
+                # Per-object footprints only cover what this package
+                # places; the package's own exclusion rectangles are the
+                # areas its author cleared (a block around a terminal, a
+                # car park, a landscaped strip) and are often larger, so
+                # with footprints they are kept, not superseded.
+                if _used_per_object_rects:
+                    for r in all_exclusions:
+                        w, e = sorted((r["west"], r["east"]))
+                        so, n = sorted((r["south"], r["north"]))
+                        if e > w and n > so:
+                            shaped_rects.append({"west": w, "east": e, "south": so, "north": n,
+                                                 "categories": _non_road_categories})
+                    kept_package_rects = len(shaped_rects) - _footprint_rect_count
+                    superseded_count = len(all_exclusions) - kept_package_rects
                 all_exclusions = shaped_rects
             else:
                 reference_bbox["categories"] = tuple(dsf_compiler.EXCLUSION_PROP_KEYS.keys())
@@ -2803,6 +2860,8 @@ def run_pipeline(opts, hooks):
             source_parts = []
             if _used_per_object_rects:
                 source_parts.append("each converted object's own footprint edges (per-object, +0.5m each)")
+                if kept_package_rects:
+                    source_parts.append(f"the package's own {kept_package_rects} exclusion rectangle(s)")
             else:
                 if boundary_points and shaped_rects:
                     source_parts.append(f"{matched_apt_ident}'s default boundary shape ({len(boundary_points)} point(s))")

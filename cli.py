@@ -39,6 +39,9 @@ def build_parser():
                         "(default 2048, 0 = keep source sizes)")
     p.add_argument("--painted-lines", action="store_true",
                    help="apt.dat: paint the MSFS painted-line records")
+    p.add_argument("--keep-runway-objects", action="store_true",
+                   help="keep flat objects lying on the runways (covers, plates; removed by default "
+                        "because they hover over X-Plane's runway ground)")
     p.add_argument("--flatten", action="store_true",
                    help="apt.dat: flatten the terrain inside the airport boundary, as MSFS does "
                         "(fallback; by default X-Plane's terrain is kept)")
@@ -65,6 +68,7 @@ def main(argv=None):
         glass_opacity=max(1, min(100, a.glass_opacity)),
         max_texture=max(0, a.max_texture),
         flatten_airport=a.flatten,
+        remove_runway_clutter=not a.keep_runway_objects,
     )
     run_pipeline(opts, PipelineHooks())
     return 0

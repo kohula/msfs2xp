@@ -31,6 +31,13 @@ in this codebase.
   at its corners on sloped ground. X-Plane's terrain itself is left as it
   is; seats, people and other props standing on a building's floor are
   set on that floor's level rather than on the ground under each of them.
+- **Runway clutter**: flat objects lying on the runways (covers, plates,
+  flush fixtures under 0.5 m tall, without lights) are removed, since they
+  hover over X-Plane's runway ground (`--keep-runway-objects` / the GUI
+  checkbox keeps them).
+- **Exclusions**: each converted object's own footprint (cut into
+  north/east-aligned rectangles after rotation, +0.5 m), plus the
+  package's own exclusion rectangles.
 - **Flatten fallback** (off by default; GUI checkbox or `--flatten`): the
   apt.dat flattens the terrain inside the airport boundary (runways,
   taxiways, aprons, stands and the airport's own buildings and

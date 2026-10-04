@@ -287,6 +287,49 @@ class TestPerObjectExclusionRects(unittest.TestCase):
             self.assertGreater(lat_span_m, lon_span_m,
                                 "a 40m-long object at heading 90 must span more north/south than east/west")
 
+    def test_rotated_long_building_is_not_covered_by_its_whole_bounding_box(self):
+        """A 40 m x 2 m building at heading 45 runs diagonally. Exclusion
+        boxes are always north/south/east/west, so cutting the footprint
+        into rectangles in the building's own frame and boxing each one
+        covered the whole 30 m x 30 m square around the diagonal; cut in
+        the world frame, the boxes follow the diagonal as a staircase."""
+        with tempfile.TemporaryDirectory() as td:
+            obj_dir = Path(td)
+            self._make_sidecar(obj_dir, "Pier", x_range=(-20.0, 20.0), z_range=(-1.0, 1.0))
+            rects = main._per_object_exclusion_rects(obj_dir, [(["Pier"], 47.0, 19.0, 45.0)])
+            m_lat = 111320.0
+            m_lon = 111320.0 * math.cos(math.radians(47.0))
+
+            def world(east, north):
+                return 47.0 + north / m_lat, 19.0 + east / m_lon
+
+            # on the building (its local +x end turns to the south-east)
+            for t in (-12.0, 0.0, 12.0):
+                self.assertTrue(_covers(rects, *world(t, -t)))
+            # the empty corners of its bounding box, ~17 m off the building
+            self.assertFalse(_covers(rects, *world(12.0, 12.0)))
+            self.assertFalse(_covers(rects, *world(-12.0, -12.0)))
+            area = sum((r["north"] - r["south"]) * m_lat * (r["east"] - r["west"]) * m_lon for r in rects)
+            self.assertLess(area, 0.4 * (40.0 * math.sqrt(0.5) + 2.0) ** 2)
+
+    def test_thin_wall_between_grid_cell_centres_is_still_covered(self):
+        """A 0.3 m thick, 20 m long wall lying between two rows of 1 m
+        grid cell centres: a fill that only counts cells whose centre is
+        inside a triangle drops it entirely, leaving no exclusion."""
+        with tempfile.TemporaryDirectory() as td:
+            obj_dir = Path(td)
+            ir = mesh_ir.MeshIR(
+                name="Wall",
+                positions=np.array([[-10.0, 0.0, 0.1], [10.0, 0.0, 0.1], [10.0, 0.0, 0.4], [-10.0, 0.0, 0.4]]),
+                indices=np.array([0, 1, 2, 0, 2, 3], dtype=np.int64),
+            )
+            mesh_ir.save(ir, mesh_ir.sidecar_path_for(obj_dir / "Wall.obj"))
+            rects = main._per_object_exclusion_rects(obj_dir, [(["Wall"], 47.0, 19.0, 0.0)])
+            m_lat = 111320.0
+            m_lon = 111320.0 * math.cos(math.radians(47.0))
+            for east in (-9.0, 0.0, 9.0):
+                self.assertTrue(_covers(rects, 47.0 - 0.25 / m_lat, 19.0 + east / m_lon))
+
     def test_multiple_stems_for_one_placement_combine_into_one_hull(self):
         """generated_stems (multiple .obj siblings from one original model,
         e.g. per-material split) must combine into ONE footprint outline
