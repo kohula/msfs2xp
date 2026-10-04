@@ -235,159 +235,110 @@ class TestTerrainFit(unittest.TestCase):
             self.assertEqual(results[walls_stem], (walls_stem, False, "skipped_for_polygon_mode"))
             self.assertTrue(results[lights_stem][1], "lights companion is still corrected")
 
-    def test_large_building_on_steep_terrain_gets_the_precise_warp(self):
-        """CONFIRMED REAL BUG this pins: a large rigid building on
-        genuinely sloped terrain used to get ONE uniform shift (every
-        vertex moves by the same amount) -- correct for a bump/dip that
-        shifts the whole footprint's average elevation, but for a REAL
-        SLOPE across a large footprint, one averaged number necessarily
-        leaves one end of the building floating and the other sunk/
-        underground, no matter how robust the average is (confirmed real
-        symptom: large buildings partially underground). Past
-        _RIGID_WARP_SLOPE_THRESHOLD_M of real sampled slope, a rigid
-        group now gets the SAME per-vertex warp draped content gets
-        instead -- some shear risk to architectural detail is an accepted
-        trade-off there, since the alternative (part of the building
-        buried) is worse. Not TILTED/a rotation (a rotation only fixes a
-        genuine tilt, never a uniform anchor-offset error -- see the
-        module's own docstring)."""
+    def _build_split_box_glb(self, path: Path, name: str, half_size: float, height: float):
+        """A building as real models are built: every face its own
+        vertices -- four walls, a roof, and a ground-floor slab at y=0."""
+        b = GltfBuilder()
+        tex = b.add_image_data_uri((150, 150, 150, 255), name=f"{name}Tex")
+        mat = b.add_material(f"{name}Mat", base_color_texture_index=b.add_texture(tex))
+        hs = half_size
+        faces = [
+            ([(-hs, 0, -hs), (hs, 0, -hs), (hs, height, -hs), (-hs, height, -hs)], (0, 0, -1)),
+            ([(hs, 0, -hs), (hs, 0, hs), (hs, height, hs), (hs, height, -hs)], (1, 0, 0)),
+            ([(hs, 0, hs), (-hs, 0, hs), (-hs, height, hs), (hs, height, hs)], (0, 0, 1)),
+            ([(-hs, 0, hs), (-hs, 0, -hs), (-hs, height, -hs), (-hs, height, hs)], (-1, 0, 0)),
+            ([(-hs, height, -hs), (hs, height, -hs), (hs, height, hs), (-hs, height, hs)], (0, 1, 0)),
+            ([(-hs, 0, -hs), (hs, 0, -hs), (hs, 0, hs), (-hs, 0, hs)], (0, 1, 0)),
+        ]
+        positions, normals, indices = [], [], []
+        for quad, n in faces:
+            k = len(positions)
+            positions += quad
+            normals += [n] * 4
+            indices += [k, k + 1, k + 2, k, k + 2, k + 3]
+        mesh = b.add_mesh(positions, indices, normals=normals, uvs=[(0.0, 0.0)] * len(positions),
+                          material_index=mat)
+        b.add_node(mesh_index=mesh, name=name)
+        path.write_bytes(b.build())
+
+    def _fit_split_box(self, td, terrain, half_size, height):
+        terrain_fit._group_cache.clear()
+        terrain_fit._ir_cache.clear()
+        terrain_fit._group_transform_cache.clear()
+        xplane_root = td / "XPlaneRoot"
+        terrain(xplane_root)
+        obj_dir = td / "objects"
+        tex_dir = td / "textures"
+        obj_dir.mkdir()
+        tex_dir.mkdir()
+        glb = td / "building.glb"
+        self._build_split_box_glb(glb, "Building", half_size, height)
+        result = mesh_convert.convert(glb, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
+        stem = result[0].stem
+        self.assertNotIn("ATTR_draped", result[0].read_text(encoding="utf-8"), "test setup: expected rigid")
+        original = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{stem}.obj"))
+        result_stem, applied, reason = terrain_fit.get_or_create_fitted_group(
+            obj_dir, [stem], 47.5, 8.5, 0.0, xplane_root)[stem]
+        corrected = (mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{result_stem}.obj"))
+                     if result_stem != stem else original)
+        transform = terrain_fit.get_cached_transform(((stem,), 47.5, 8.5, 0.0, False))
+        return original, corrected, applied, reason, transform
+
+    def _assert_level_with_skirt(self, original, corrected, transform):
+        top = transform["vertical_shift"]
+        n = len(original.positions)
+        # every original vertex -- roof, floor, walls -- moves by the same
+        # amount: the building stays level
+        np.testing.assert_allclose(corrected.positions[:n, 1] - original.positions[:, 1], top, atol=1e-6)
+        np.testing.assert_allclose(corrected.positions[:n, [0, 2]], original.positions[:, [0, 2]], atol=1e-9)
+        # skirt pieces were added below the walls, reaching down toward the
+        # lower ground and never above the lifted base
+        skirt = corrected.positions[n:]
+        self.assertGreater(len(skirt), 0)
+        base = float(original.positions[:, 1].min()) + top
+        self.assertTrue(np.all(skirt[:, 1] <= base + 1e-6))
+        self.assertGreater(base - float(skirt[:, 1].min()), 1.0, "the low side's skirt must reach down")
+        self.assertEqual(len(corrected.indices) % 3, 0)
+        self.assertEqual(int(np.max(corrected.indices)) + 1, len(corrected.positions))
+
+    def test_tall_building_on_very_steep_ground_is_level_with_a_skirt(self):
+        """CONFIRMED REAL BUG: on steep ground the per-vertex warp bent a
+        whole building to the slope, roof included. A building there is
+        lifted level to the highest ground under it, and skirt pieces are
+        added below its walls down to the terrain."""
         with tempfile.TemporaryDirectory() as td:
-            td = Path(td)
-            xplane_root = td / "XPlaneRoot"
-            self._write_bumpy_terrain(xplane_root, 47, 8, bump_scale=1500.0)
-            obj_dir = td / "objects"
-            tex_dir = td / "textures"
-            obj_dir.mkdir()
-            tex_dir.mkdir()
+            original, corrected, applied, reason, transform = self._fit_split_box(
+                Path(td), lambda r: self._write_sloped_terrain(r, 47, 8, slope_per_post=3000.0), 15.0, 6.0)
+            self.assertTrue(applied, reason)
+            self.assertEqual(reason, "applied_skirt")
+            self._assert_level_with_skirt(original, corrected, transform)
 
-            building_glb = td / "building.glb"
-            self._build_box_glb(building_glb, "BigBuilding", "BuildingTex", half_size=15.0)
-            result = mesh_convert.convert(building_glb, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
-            stem = result[0].stem
-            self.assertNotIn("ATTR_draped", result[0].read_text(encoding="utf-8"),
-                              "test setup issue: expected this box fixture to convert as rigid")
-
-            original_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{stem}.obj"))
-
-            results = terrain_fit.get_or_create_fitted_group(obj_dir, [stem], 47.5, 8.5, 0.0, xplane_root)
-            result_stem, applied, reason = results[stem]
-            self.assertTrue(applied, f"a large rigid building on meaningfully sloped terrain must be corrected (reason={reason})")
-            self.assertEqual(reason, "applied_rigid_warp")
-            self.assertNotEqual(result_stem, stem, "a corrected copy should have been written")
-
-            corrected_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{result_stem}.obj"))
-            self.assertFalse(
-                np.allclose(original_ir.positions, corrected_ir.positions, atol=1e-6),
-                "expected the warp to actually move the geometry, not be a no-op"
-            )
-
-            # X/Z entirely unchanged (only Y moves) -- unlike a uniform
-            # shift, different (x, z) columns are free to move by
-            # DIFFERENT amounts, each following the real terrain sampled
-            # directly under it (this fixture's own box happens to sit
-            # exactly at the radially-symmetric bump's own center, so its
-            # 4 equidistant corners coincidentally warp by the identical
-            # amount here -- see test_oversized_footprint_on_real_slope_
-            # gets_the_warp_not_left_partially_underground, on a LINEAR
-            # slope instead, for a real per-vertex-varies assertion).
-            np.testing.assert_allclose(corrected_ir.positions[:, [0, 2]], original_ir.positions[:, [0, 2]], atol=1e-9)
-
-    def test_tall_building_gets_the_same_warp_as_a_short_one(self):
-        """Neither a uniform shift nor this module's per-vertex warp has
-        a rotation's "implied displacement scales with distance from the
-        pivot" problem (the old "excessive implied roof displacement"
-        guard existed only for the rotation this module no longer uses at
-        all) -- both key strictly off each vertex's own (x, z), never its
-        Y, so a roof directly above its own base moves by the identical
-        amount as that base regardless of how tall the building is. This
-        tower (150m instead of the passing 6m box's height, otherwise
-        identical fixture/terrain, both routed to applied_rigid_warp by
-        the real slope) proves that still holds under the warp too."""
+    def test_oversized_footprint_on_real_slope_is_level_and_not_buried(self):
         with tempfile.TemporaryDirectory() as td:
-            td = Path(td)
-            xplane_root = td / "XPlaneRoot"
-            self._write_sloped_terrain(xplane_root, 47, 8, slope_per_post=3000.0)
-            obj_dir = td / "objects"
-            tex_dir = td / "textures"
-            obj_dir.mkdir()
-            tex_dir.mkdir()
+            original, corrected, applied, reason, transform = self._fit_split_box(
+                Path(td), lambda r: self._write_sloped_terrain(r, 47, 8, slope_per_post=3000.0), 300.0, 6.0)
+            self.assertEqual(reason, "applied_skirt")
+            self._assert_level_with_skirt(original, corrected, transform)
 
-            tower_glb = td / "tower.glb"
-            self._build_box_glb(tower_glb, "TallTower", "TowerTex", half_size=15.0, height=150.0)
-            result = mesh_convert.convert(tower_glb, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
-            stem = result[0].stem
-            original_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{stem}.obj"))
-
-            results = terrain_fit.get_or_create_fitted_group(obj_dir, [stem], 47.5, 8.5, 0.0, xplane_root)
-            result_stem, applied, reason = results[stem]
-            self.assertTrue(applied)
-            self.assertEqual(reason, "applied_rigid_warp")
-
-            corrected_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{result_stem}.obj"))
-            roof_mask = original_ir.positions[:, 1] > 100.0
-            base_mask = original_ir.positions[:, 1] < 0.1
-            self.assertTrue(roof_mask.any() and base_mask.any(), "test setup issue")
-            roof_dy = corrected_ir.positions[roof_mask, 1] - original_ir.positions[roof_mask, 1]
-            base_dy = corrected_ir.positions[base_mask, 1] - original_ir.positions[base_mask, 1]
-            self.assertAlmostEqual(float(roof_dy.mean()), float(base_dy.mean()), places=5,
-                                    msg="roof and base share the same (x, z) columns, so the warp must move "
-                                        "them by the identical amount -- no rotation-scaling concern")
-
-    def test_oversized_footprint_on_real_slope_gets_the_warp_not_left_partially_underground(self):
-        """CONFIRMED REAL BUG this pins: a genuinely large SINGLE building
-        (not bundled-unrelated-content -- a real continuous terminal
-        structure) can have a large footprint (EGLC's own terminal
-        measured 380m wide). Giving an oversized footprint on real sloped
-        terrain ONE uniform shift (an earlier version of this test's own
-        expectation) has exactly the failure mode a real user reported:
-        one averaged number can only ever be exactly right for the
-        group's own AVERAGE terrain delta, so a 600m-wide building on a
-        genuine slope still comes out with one end floating and the other
-        sunk/underground -- worse the larger the footprint, not better.
-        Past _RIGID_WARP_SLOPE_THRESHOLD_M of real sampled slope, size
-        alone no longer exempts a group from the precise per-vertex warp
-        -- unlike the old rotation this replaced, a warp can't "swing" a
-        separately-anchored sibling (each vertex samples its own real
-        position independently), so there's no oversized-footprint risk
-        to guard against here at all."""
+    def test_flat_piece_on_steep_ground_still_follows_it(self):
+        """Low flat pieces (pavement, plates) have no roof to tilt: they
+        keep the per-vertex warp even on steep ground."""
         with tempfile.TemporaryDirectory() as td:
-            td = Path(td)
-            xplane_root = td / "XPlaneRoot"
-            self._write_sloped_terrain(xplane_root, 47, 8, slope_per_post=3000.0)
-            obj_dir = td / "objects"
-            tex_dir = td / "textures"
-            obj_dir.mkdir()
-            tex_dir.mkdir()
-
-            building_glb = td / "huge_building.glb"
-            self._build_box_glb(building_glb, "HugeBuilding", "HugeBuildingTex", half_size=300.0)
-            result = mesh_convert.convert(building_glb, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
-            stem = result[0].stem
-            self.assertNotIn("ATTR_draped", result[0].read_text(encoding="utf-8"),
-                              "test setup issue: expected this box fixture to convert as rigid")
-            original_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{stem}.obj"))
-
-            results = terrain_fit.get_or_create_fitted_group(obj_dir, [stem], 47.5, 8.5, 0.0, xplane_root)
-            result_stem, applied, reason = results[stem]
-            self.assertTrue(applied, "an oversized footprint must still be corrected, not left floating")
+            original, corrected, applied, reason, transform = self._fit_split_box(
+                Path(td), lambda r: self._write_sloped_terrain(r, 47, 8, slope_per_post=3000.0), 15.0, 0.4)
+            if original.draped:
+                self.skipTest("converter drapes this slab")
+            self.assertTrue(applied, reason)
             self.assertEqual(reason, "applied_rigid_warp")
-            self.assertNotEqual(result_stem, stem, "a corrected copy should have been written")
 
-            corrected_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{result_stem}.obj"))
-            roof_mask = original_ir.positions[:, 1] > 3.0
-            base_mask = original_ir.positions[:, 1] < 0.1
-            self.assertTrue(roof_mask.any() and base_mask.any(), "test setup issue")
-            roof_dy = corrected_ir.positions[roof_mask, 1] - original_ir.positions[roof_mask, 1]
-            base_dy = corrected_ir.positions[base_mask, 1] - original_ir.positions[base_mask, 1]
-            self.assertAlmostEqual(float(roof_dy.mean()), float(base_dy.mean()), places=5,
-                                    msg="roof and base share the same (x, z) columns, so still move together")
-            # The whole point: on a REAL slope this large, the warp must
-            # actually vary across the footprint (unlike a shift) -- one
-            # side of a 600m building sits measurably higher than the
-            # other on this fixture's slope.
-            dy = corrected_ir.positions[:, 1] - original_ir.positions[:, 1]
-            self.assertGreater(float(dy.max() - dy.min()), 1.0,
-                                msg="expected a real, footprint-scale variation in the correction on a 600m slope")
+    def test_building_on_gentle_ground_keeps_the_ordinary_fit(self):
+        """No skirt unless the ground is very steep: a big building on
+        gently uneven ground keeps the ordinary vertical shift."""
+        with tempfile.TemporaryDirectory() as td:
+            original, corrected, applied, reason, transform = self._fit_split_box(
+                Path(td), lambda r: self._write_bumpy_terrain(r, 47, 8, bump_scale=60.0), 15.0, 6.0)
+            self.assertNotEqual(reason, "applied_skirt")
+            self.assertEqual(len(corrected.positions), len(original.positions))
 
     def test_small_object_gets_the_precise_warp_no_size_disqualification(self):
         """CONFIRMED REAL BUG this pins: terrain_fit's own correction used

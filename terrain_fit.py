@@ -111,6 +111,14 @@ _NOISE_FLOOR_M = 0.10  # skip a group whose sampled corners all correct by less 
 _SHIFT_OUTLIER_MAD_K = 3.0  # modified-z-score cutoff (see _robust_vertical_shift) for rejecting a spiky sample
 _RIGID_WARP_MAX_SIDE_M = 10.0  # footprint this small or smaller: per-vertex warp, not a shift (see module docstring)
 _RIGID_WARP_SLOPE_THRESHOLD_M = 1.0  # sampled corner spread past this: warp even a large footprint
+# ...unless the object is taller than _SKIRT_MIN_HEIGHT_M: on ground that
+# steep, a warp tilts its roof. It is lifted level to the highest ground
+# under it instead, and a skirt is added below its walls down to the
+# terrain (see _add_skirt).
+_SKIRT_MIN_HEIGHT_M = 1.0
+_SKIRT_BAND_M = 0.25  # how far above the object's lowest point a wall edge still counts as its bottom
+_SKIRT_WALL_NY = 0.5  # a triangle whose normal's |y| is below this is a wall
+_SKIRT_MIN_DROP_M = 0.05  # no skirt piece where the wall already meets the ground
 
 _ir_cache = {}       # obj_stem -> loaded MeshIR, or None if no sidecar / TILTED / no geometry+lights
 _group_cache = {}     # (tuple(sorted(obj_stems)), lat_r, lon_r, hdg_r) -> {obj_stem: (result_stem, applied, reason)}
@@ -183,6 +191,81 @@ def _robust_vertical_shift(corner_samples, mad_k=_SHIFT_OUTLIER_MAD_K):
     if len(clean) == 0:
         clean = deltas
     return float(np.mean(clean))
+
+
+def _robust_max(corner_samples, mad_k=_SHIFT_OUTLIER_MAD_K):
+    """The highest terrain delta among corner_samples once the same MAD
+    outlier rejection as _robust_vertical_shift has thrown out spikes, or
+    None if there are no samples."""
+    if not corner_samples:
+        return None
+    deltas = np.array([d for _, _, d in corner_samples], dtype=np.float64)
+    if len(deltas) >= 3:
+        med = float(np.median(deltas))
+        mad = float(np.median(np.abs(deltas - med)))
+        if mad > 1e-9:
+            clean = deltas[np.abs(deltas - med) / (1.4826 * mad) <= mad_k]
+            if len(clean):
+                deltas = clean
+    return float(deltas.max())
+
+
+def _add_skirt(ir, top, y_min, delta_at):
+    """The object lifted level by `top` (the highest ground under it),
+    plus a skirt: for every bottom edge of a wall (a near-vertical
+    triangle's edge within _SKIRT_BAND_M of the object's lowest point), a
+    new quad from that edge down to the terrain under it (delta_at(x, z),
+    never above `top`). The original geometry is only translated, so
+    roof and floors stay level and nothing depends on the model's
+    normals. Returns (positions, normals, uvs, indices)."""
+    pos = ir.positions.copy()
+    pos[:, 1] += top
+    normals = np.asarray(ir.normals, dtype=np.float64) if len(ir.normals) == len(pos) else np.tile([0.0, 1.0, 0.0], (len(pos), 1))
+    uvs = np.asarray(ir.uvs, dtype=np.float64) if len(ir.uvs) == len(pos) else np.zeros((len(pos), 2))
+    tris = np.asarray(ir.indices, dtype=np.int64).reshape(-1, 3)
+    new_pos, new_nrm, new_uv, new_idx = [], [], [], []
+    done = set()
+    base = ir.positions[:, 1] <= y_min + _SKIRT_BAND_M
+    k = len(pos)
+    for tri in tris:
+        a, b, c = (int(i) for i in tri)
+        pa, pb, pc = ir.positions[a], ir.positions[b], ir.positions[c]
+        n = np.cross(pb - pa, pc - pa)
+        length = float(np.linalg.norm(n))
+        if length < 1e-9 or abs(n[1]) / length >= _SKIRT_WALL_NY:
+            continue
+        n = n / length
+        # edges in the triangle's own winding order keep the skirt facing
+        # the same way as the wall above it
+        for i, j in ((a, b), (b, c), (c, a)):
+            if not (base[i] and base[j]):
+                continue
+            key = (min(i, j), max(i, j))
+            if key in done:
+                continue
+            done.add(key)
+            drops = []
+            for v in (i, j):
+                d = delta_at(float(ir.positions[v, 0]), float(ir.positions[v, 2]))
+                drops.append(top if d is None else min(d, top))
+            if top - drops[0] < _SKIRT_MIN_DROP_M and top - drops[1] < _SKIRT_MIN_DROP_M:
+                continue
+            ti, tj = pos[i], pos[j]
+            bi = (ti[0], ir.positions[i, 1] + drops[0], ti[2])
+            bj = (tj[0], ir.positions[j, 1] + drops[1], tj[2])
+            new_pos += [tuple(ti), tuple(tj), bi, bj]
+            new_nrm += [tuple(n)] * 4
+            new_uv += [tuple(uvs[i]), tuple(uvs[j]), tuple(uvs[i]), tuple(uvs[j])]
+            # (j, i, i_below) and (j, i_below, j_below): a point below the
+            # edge needs the edge reversed to keep the wall's orientation
+            new_idx += [k + 1, k, k + 2, k + 1, k + 2, k + 3]
+            k += 4
+    if new_pos:
+        pos = np.vstack([pos, np.array(new_pos, dtype=np.float64)])
+        normals = np.vstack([normals, np.array(new_nrm, dtype=np.float64)])
+        uvs = np.vstack([uvs, np.array(new_uv, dtype=np.float64)])
+    indices = np.concatenate([np.asarray(ir.indices, dtype=np.int64), np.array(new_idx, dtype=np.int64)])
+    return pos, normals, uvs, indices
 
 
 def _apply_vertical_shift(ir, vertical_shift):
@@ -334,6 +417,18 @@ def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_d
                      ) if len(corner_samples) >= 2 else 0.0
     group_uses_rigid_warp = max_side <= _RIGID_WARP_MAX_SIDE_M or slope_spread > _RIGID_WARP_SLOPE_THRESHOLD_M
 
+    # Very steep ground under something tall: level + skirt instead of a
+    # warp that would tilt its roof.
+    rigid_geo = [loaded[s] for s in geo_stems if not loaded[s].draped]
+    rigid_y_min = min(float(ir.positions[:, 1].min()) for ir in rigid_geo) if rigid_geo else 0.0
+    rigid_y_max = max(float(ir.positions[:, 1].max()) for ir in rigid_geo) if rigid_geo else 0.0
+    skirt_top = None
+    if (rigid_geo and slope_spread > _RIGID_WARP_SLOPE_THRESHOLD_M
+            and rigid_y_max - rigid_y_min > _SKIRT_MIN_HEIGHT_M):
+        skirt_top = _robust_max(corner_samples)
+        vertical_shift = skirt_top
+        group_uses_rigid_warp = False
+
     # Cached regardless of whether vertical_shift ended up None (an
     # explicit "this group has no correction to offer" is as useful to a
     # cross-group lookup as a real one) -- see get_cached_transform /
@@ -390,11 +485,12 @@ def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_d
         # CUSTOM is an independent point, not mesh topology, so moving it
         # carries none of the shear/re-drape concerns above.
         warp_positions = bool(len(ir.positions)) and ir.draped and not skip_draped_positions
+        rigid_skirt = bool(len(ir.positions)) and not ir.draped and skirt_top is not None
         rigid_warp = bool(len(ir.positions)) and not ir.draped and group_uses_rigid_warp
         rigid_shift = (bool(len(ir.positions)) and not ir.draped and not group_uses_rigid_warp
-                       and vertical_shift is not None)
+                       and vertical_shift is not None and not rigid_skirt)
         warp_lights = bool(ir.lights)
-        if not warp_positions and not rigid_warp and not rigid_shift and not warp_lights:
+        if not warp_positions and not rigid_warp and not rigid_shift and not rigid_skirt and not warp_lights:
             if ir.draped and skip_draped_positions and len(ir.positions):
                 result[stem] = (stem, False, "skipped_for_polygon_mode")
             else:
@@ -410,11 +506,16 @@ def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_d
             # before; every other field (night/normal textures, glass,
             # draped layer group) carries over.
             ir, name=f"{stem}_tfit_{digest}",
-            tilted=False if (warp_positions or rigid_warp or rigid_shift) else ir.tilted,
+            tilted=False if (warp_positions or rigid_warp or rigid_shift or rigid_skirt) else ir.tilted,
             positions=np.zeros((0, 3)), normals=np.zeros((0, 3)), uvs=np.zeros((0, 2)),
             indices=np.zeros((0,), dtype=np.int64), lights=[],
         )
-        if warp_positions or rigid_warp:
+        if rigid_skirt:
+            corrected.positions, corrected.normals, corrected.uvs, corrected.indices = _add_skirt(
+                ir, skirt_top, rigid_y_min,
+                lambda x, z: _point_elevation_delta(base_lat, base_lon, heading_deg, x, z,
+                                                    xplane_root, origin_elev, point_cache))
+        elif warp_positions or rigid_warp:
             warped = ir.positions.copy()
             for i in range(len(warped)):
                 d = _point_elevation_delta(
@@ -446,7 +547,10 @@ def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_d
             new_lights = []
             for light in ir.lights:
                 px, py, pz = light.pos
-                d = _point_elevation_delta(base_lat, base_lon, heading_deg, px, pz, xplane_root, origin_elev, point_cache)
+                if skirt_top is not None:
+                    d = skirt_top  # lights move with the lifted body
+                else:
+                    d = _point_elevation_delta(base_lat, base_lon, heading_deg, px, pz, xplane_root, origin_elev, point_cache)
                 new_lights.append(mesh_ir.LightEntry(
                     pos=(px, py + (d or 0.0), pz), dir=light.dir, color=light.color,
                     cone_angle=light.cone_angle, size=light.size, dataref=light.dataref,
@@ -462,7 +566,9 @@ def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_d
             # never the .obj text, so a corrected draped stem without one
             # silently falls back to passthrough (never welded/deduped).
             mesh_ir.save(corrected, mesh_ir.sidecar_path_for(fitted_path))
-        if rigid_shift:
+        if rigid_skirt:
+            _reason = "applied_skirt"
+        elif rigid_shift:
             _reason = "applied_vertical_shift"
         elif rigid_warp and not warp_positions:
             _reason = "applied_rigid_warp"
