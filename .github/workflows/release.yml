@@ -81,15 +81,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Build MSFS2XP.exe
+      - name: Build MSFS2XP.exe and MSFS2XP-win64.zip
         shell: pwsh
         run: |
           python -m pip install -r requirements.txt pyinstaller
           python -m PyInstaller --noconfirm --clean MSFS2XP.spec
+          python -m PyInstaller --noconfirm --clean --distpath dist_folder --workpath build_folder MSFS2XP_folder.spec
+          Compress-Archive -Path dist_folder/MSFS2XP -DestinationPath dist/MSFS2XP-win64.zip
       - uses: actions/upload-artifact@v4
         with:
           name: windows
-          path: dist/MSFS2XP.exe
+          path: |
+            dist/MSFS2XP.exe
+            dist/MSFS2XP-win64.zip
 
   linux:
     needs: [version, test]
@@ -131,4 +135,5 @@ jobs:
           body_path: packaging/RELEASE_NOTES.md
           files: |
             artifacts/windows/MSFS2XP.exe
+            artifacts/windows/MSFS2XP-win64.zip
             artifacts/linux/MSFS2XP-x86_64.AppImage

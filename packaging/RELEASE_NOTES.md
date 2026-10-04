@@ -1,32 +1,39 @@
-Test build: fixes for objects standing at the wrong height and for the
-replacement picker's map.
+Test build: SimProp objects in the right place, tighter and more complete
+exclusions, no more flat objects hovering over the runways.
 
 ## What's new
 
-- **Props stay on their building's floor**: seats, people, counters and
-  other objects inside a building now take their height from the
-  building's floor instead of from the X-Plane ground under each of them.
-  Where the terrain under a terminal isn't level they were sunk into the
-  floor or floating above it. Objects on the open apron or under an open
-  canopy still sit on their own ground. X-Plane's terrain is not changed.
-- **SimProp container heights**: objects inside a container placed at an
-  absolute (sea-level) altitude got that whole altitude as their height
-  above ground; they are now placed relative to the airport elevation.
-- **Flatten fallback** (off by default): a new checkbox ("apt.dat: flatten
-  the terrain inside the airport", or `--flatten`) levels the terrain
-  inside the airport boundary, as MSFS does, for an airport where objects
-  still float or sink.
-- **Replacement picker map**: the "Where it is" map shows the airport's
-  pavement and objects again (it was blank apart from the red dot).
-- **Diagnostics**: the conversion log has a "Placement heights:" line
-  (objects placed at an absolute altitude, models with parts below their
-  ground point) and a line counting objects set on their building's floor
-  -- please include them when reporting floating or sunken objects.
+- **SimProp containers placed correctly**: everything inside a SimProp
+  container (seats, people, apron gear, jetways) was mirrored front-to-back
+  around the container -- a terminal's seats could end up outside the
+  building. Fixed.
+- **Exclusion zones**: a rotated building no longer gets an exclusion far
+  larger than itself (the footprint is now cut into rectangles after
+  rotating it, not before), and the package's own exclusion areas are kept
+  instead of being replaced by the per-object footprints, so areas the
+  scenery author cleared stay cleared.
+- **Runway clutter removed**: flat objects lying on the runways (covers,
+  plates and flush fixtures under 0.5 m tall, without lights), which hover
+  over X-Plane's runway ground, are removed. Aircraft, vehicles, signs,
+  lights and painted markings are kept. Checkbox "Remove flat objects
+  lying on the runways" (on by default) or `--keep-runway-objects`.
+
+Also in this test series (1.1.1): props stay on their building's floor,
+SimProp container heights, a flatten fallback checkbox (off by default),
+the replacement picker's map, and a "Placement heights:" log line.
 
 ## Windows
 
-Download `MSFS2XP.exe` and run it. The cache, scratch space and settings
-are kept next to the .exe.
+Two downloads, the same program:
+
+- `MSFS2XP-win64.zip` -- unzip it anywhere and run `MSFS2XP\MSFS2XP.exe`.
+  Recommended: Windows Defender's machine-learning check sometimes
+  blocks the single-file exe as "potentially unwanted" (a false positive
+  common to self-extracting Python apps); the folder version starts
+  faster too.
+- `MSFS2XP.exe` -- one file, as before.
+
+The cache, scratch space and settings are kept next to the .exe.
 
 ## Linux
 
