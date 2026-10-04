@@ -111,13 +111,6 @@ _NOISE_FLOOR_M = 0.10  # skip a group whose sampled corners all correct by less 
 _SHIFT_OUTLIER_MAD_K = 3.0  # modified-z-score cutoff (see _robust_vertical_shift) for rejecting a spiky sample
 _RIGID_WARP_MAX_SIDE_M = 10.0  # footprint this small or smaller: per-vertex warp, not a shift (see module docstring)
 _RIGID_WARP_SLOPE_THRESHOLD_M = 1.0  # sampled corner spread past this: warp even a large footprint
-# Anything taller than this is never warped (its roof would tilt with the
-# ground): it is lifted as one rigid body to the highest ground under its
-# footprint, and only the bottom edge of its walls is pulled down onto the
-# terrain -- a skirt. See _skirt_positions.
-_SKIRT_MIN_HEIGHT_M = 1.0
-_SKIRT_BAND_M = 0.25  # how far above the object's lowest point a vertex still counts as its bottom edge
-_SKIRT_WALL_NORMAL_Y = 0.5  # bottom vertices facing sideways (walls), not up/down (floors)
 
 _ir_cache = {}       # obj_stem -> loaded MeshIR, or None if no sidecar / TILTED / no geometry+lights
 _group_cache = {}     # (tuple(sorted(obj_stems)), lat_r, lon_r, hdg_r) -> {obj_stem: (result_stem, applied, reason)}
@@ -190,45 +183,6 @@ def _robust_vertical_shift(corner_samples, mad_k=_SHIFT_OUTLIER_MAD_K):
     if len(clean) == 0:
         clean = deltas
     return float(np.mean(clean))
-
-
-def _robust_max(corner_samples, mad_k=_SHIFT_OUTLIER_MAD_K):
-    """The highest terrain delta among corner_samples once the same MAD
-    outlier rejection as _robust_vertical_shift has thrown out spikes, or
-    None if there are no samples."""
-    if not corner_samples:
-        return None
-    deltas = np.array([d for _, _, d in corner_samples], dtype=np.float64)
-    if len(deltas) >= 3:
-        med = float(np.median(deltas))
-        mad = float(np.median(np.abs(deltas - med)))
-        if mad > 1e-9:
-            clean = deltas[np.abs(deltas - med) / (1.4826 * mad) <= mad_k]
-            if len(clean):
-                deltas = clean
-    return float(deltas.max())
-
-
-def _skirt_positions(ir, top, y_min, delta_at):
-    """A tall rigid object on uneven ground: every vertex moves up by
-    `top` (the highest ground under the footprint), except the bottom edge
-    of its walls -- vertices within _SKIRT_BAND_M of the object's lowest
-    point whose normal faces sideways -- which instead go down onto the
-    terrain right under them (delta_at(x, z), never above `top`). Walls
-    stretch down to the ground like a foundation; the roof and floors stay
-    level instead of tilting with the terrain."""
-    pos = ir.positions.copy()
-    pos[:, 1] += top
-    near_bottom = ir.positions[:, 1] <= y_min + _SKIRT_BAND_M
-    if len(ir.normals) == len(ir.positions):
-        n = np.asarray(ir.normals, dtype=np.float64)
-        length = np.maximum(np.linalg.norm(n, axis=1), 1e-12)
-        near_bottom &= np.abs(n[:, 1]) / length < _SKIRT_WALL_NORMAL_Y
-    for i in np.nonzero(near_bottom)[0]:
-        d = delta_at(float(ir.positions[i, 0]), float(ir.positions[i, 2]))
-        if d is not None:
-            pos[i, 1] = ir.positions[i, 1] + min(d, top)
-    return pos
 
 
 def _apply_vertical_shift(ir, vertical_shift):
@@ -380,18 +334,6 @@ def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_d
                      ) if len(corner_samples) >= 2 else 0.0
     group_uses_rigid_warp = max_side <= _RIGID_WARP_MAX_SIDE_M or slope_spread > _RIGID_WARP_SLOPE_THRESHOLD_M
 
-    # ...but only for low, flat things (pavement pieces, plates, mats):
-    # a warp bends whatever is on top too, so a building's roof would
-    # tilt with the ground. Anything taller gets the skirt instead.
-    rigid_geo = [loaded[s] for s in geo_stems if not loaded[s].draped]
-    rigid_y_min = min(float(ir.positions[:, 1].min()) for ir in rigid_geo) if rigid_geo else 0.0
-    rigid_y_max = max(float(ir.positions[:, 1].max()) for ir in rigid_geo) if rigid_geo else 0.0
-    skirt_top = None
-    if rigid_geo and rigid_y_max - rigid_y_min > _SKIRT_MIN_HEIGHT_M and corner_samples:
-        skirt_top = _robust_max(corner_samples)
-        vertical_shift = skirt_top
-        group_uses_rigid_warp = False
-
     # Cached regardless of whether vertical_shift ended up None (an
     # explicit "this group has no correction to offer" is as useful to a
     # cross-group lookup as a real one) -- see get_cached_transform /
@@ -448,12 +390,11 @@ def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_d
         # CUSTOM is an independent point, not mesh topology, so moving it
         # carries none of the shear/re-drape concerns above.
         warp_positions = bool(len(ir.positions)) and ir.draped and not skip_draped_positions
-        rigid_skirt = bool(len(ir.positions)) and not ir.draped and skirt_top is not None
         rigid_warp = bool(len(ir.positions)) and not ir.draped and group_uses_rigid_warp
         rigid_shift = (bool(len(ir.positions)) and not ir.draped and not group_uses_rigid_warp
-                       and vertical_shift is not None and not rigid_skirt)
+                       and vertical_shift is not None)
         warp_lights = bool(ir.lights)
-        if not warp_positions and not rigid_warp and not rigid_shift and not rigid_skirt and not warp_lights:
+        if not warp_positions and not rigid_warp and not rigid_shift and not warp_lights:
             if ir.draped and skip_draped_positions and len(ir.positions):
                 result[stem] = (stem, False, "skipped_for_polygon_mode")
             else:
@@ -469,19 +410,11 @@ def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_d
             # before; every other field (night/normal textures, glass,
             # draped layer group) carries over.
             ir, name=f"{stem}_tfit_{digest}",
-            tilted=False if (warp_positions or rigid_warp or rigid_shift or rigid_skirt) else ir.tilted,
+            tilted=False if (warp_positions or rigid_warp or rigid_shift) else ir.tilted,
             positions=np.zeros((0, 3)), normals=np.zeros((0, 3)), uvs=np.zeros((0, 2)),
             indices=np.zeros((0,), dtype=np.int64), lights=[],
         )
-        if rigid_skirt:
-            corrected.positions = _skirt_positions(
-                ir, skirt_top, rigid_y_min,
-                lambda x, z: _point_elevation_delta(base_lat, base_lon, heading_deg, x, z,
-                                                    xplane_root, origin_elev, point_cache))
-            corrected.normals = ir.normals
-            corrected.uvs = ir.uvs
-            corrected.indices = ir.indices
-        elif warp_positions or rigid_warp:
+        if warp_positions or rigid_warp:
             warped = ir.positions.copy()
             for i in range(len(warped)):
                 d = _point_elevation_delta(
@@ -513,10 +446,7 @@ def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_d
             new_lights = []
             for light in ir.lights:
                 px, py, pz = light.pos
-                if skirt_top is not None:
-                    d = skirt_top  # the lights move with the rigid body
-                else:
-                    d = _point_elevation_delta(base_lat, base_lon, heading_deg, px, pz, xplane_root, origin_elev, point_cache)
+                d = _point_elevation_delta(base_lat, base_lon, heading_deg, px, pz, xplane_root, origin_elev, point_cache)
                 new_lights.append(mesh_ir.LightEntry(
                     pos=(px, py + (d or 0.0), pz), dir=light.dir, color=light.color,
                     cone_angle=light.cone_angle, size=light.size, dataref=light.dataref,
@@ -532,9 +462,7 @@ def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_d
             # never the .obj text, so a corrected draped stem without one
             # silently falls back to passthrough (never welded/deduped).
             mesh_ir.save(corrected, mesh_ir.sidecar_path_for(fitted_path))
-        if rigid_skirt:
-            _reason = "applied_skirt"
-        elif rigid_shift:
+        if rigid_shift:
             _reason = "applied_vertical_shift"
         elif rigid_warp and not warp_positions:
             _reason = "applied_rigid_warp"

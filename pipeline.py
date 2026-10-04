@@ -879,6 +879,55 @@ def pool_worker_count():
     return max(1, min(cpu_workers, mem_workers))
 
 
+def _bake_negative_heights(dsf_tiles, obj_dir):
+    """Objects meant to reach below the ground -- a drain tile whose
+    channel and base sit under the surface, anything MSFS places below its
+    ground level -- end up with a negative height above ground (their
+    placement height, plus convert()'s recentering, which lifts every
+    model so its lowest point is y=0). X-Plane does not place an object
+    below the terrain from a negative AGL height: it stood on the ground
+    instead, its below-ground part showing above the pavement. So the
+    drop is baked into a copy of the geometry (`<stem>_dn<cm>`) placed at
+    height 0. Objects without a MeshIR sidecar (animated ones) keep the
+    AGL height. Returns (baked, left) placement counts."""
+    cache = {}
+    baked = left = 0
+    for objects in dsf_tiles.values():
+        for o in objects:
+            agl = o.get("agl", 0.0)
+            name = o.get("name")
+            if not name or agl > -0.01:
+                continue
+            if name not in cache:
+                ir = None
+                sidecar = mesh_ir.sidecar_path_for(obj_dir / f"{name}.obj")
+                if sidecar.exists():
+                    try:
+                        ir = mesh_ir.load(sidecar)
+                    except (OSError, EOFError, pickle.UnpicklingError):
+                        ir = None
+                cache[name] = ir
+            ir = cache[name]
+            if ir is None or ir.draped or not (len(ir.positions) or ir.lights):
+                left += 1
+                continue
+            new = f"{name}_dn{int(round(-agl * 100))}"
+            path = obj_dir / f"{new}.obj"
+            if not path.exists():
+                pos = ir.positions.copy()
+                if len(pos):
+                    pos[:, 1] += agl
+                lowered = dataclasses.replace(
+                    ir, name=new, positions=pos,
+                    lights=[dataclasses.replace(lt, pos=(lt.pos[0], lt.pos[1] + agl, lt.pos[2])) for lt in ir.lights])
+                mesh_ir.write_obj8(lowered, path)
+                mesh_ir.save(lowered, mesh_ir.sidecar_path_for(path))
+            o["name"] = new
+            o["agl"] = 0.0
+            baked += 1
+    return baked, left
+
+
 def _settle_flat_airport_objects(cands, obj_dir, dsf_tiles, ground):
     """runway_clutter.py: for every placement standing on the airport
     ground (not on a building's floor), drop the solid parts of small flat
@@ -2535,6 +2584,18 @@ def run_pipeline(opts, hooks):
                               f"ground sheet(s) onto the terrain.", "info")
             except Exception as e:
                 hooks.log(f"(couldn't check for flat objects on the airport ground: {e})", "warning")
+
+        # Negative heights (parts meant to be below the ground) are baked
+        # into the geometry: X-Plane won't sink an object below the
+        # terrain from its AGL height.
+        try:
+            _baked, _left = _bake_negative_heights(dsf_tiles, obj_dir)
+            if _baked or _left:
+                hooks.log(f"{_baked} placement(s) reaching below the ground lowered into the terrain"
+                          + (f" ({_left} animated one(s) left on their negative AGL height)" if _left else "")
+                          + ".", "info")
+        except Exception as e:
+            hooks.log(f"(couldn't lower below-ground objects: {e})", "warning")
 
         if agl_placement_count:
             hooks.log(f"{agl_placement_count} placement(s) use native DSF AGL height placement to fix floating/sunken SPB-attached or upper-floor objects.", "info")

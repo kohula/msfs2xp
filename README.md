@@ -26,11 +26,12 @@ in this codebase.
 - **Ground content**: draped pavement, painted lines and markings,
   merged across overlapping placements to avoid X-Plane's draw-order
   z-fighting between same-layer draped surfaces.
-- **Terrain fit**: against real sampled X-Plane terrain. A building stays
-  level: it is lifted to the highest ground under its footprint and only
-  the bottom edge of its walls is pulled down onto the terrain (a skirt),
-  so it neither floats nor sinks at its corners and its roof doesn't tilt.
-  Low flat pieces follow the ground. X-Plane's terrain itself is left as it
+- **Terrain fit**: large buildings get a correction against real sampled
+  X-Plane terrain, so a big footprint doesn't float or sink at its corners
+  on sloped ground. Objects meant to reach below the ground (a drain tile's
+  channel, anything MSFS places below its ground level) have that drop
+  baked into their geometry, since X-Plane won't sink an object below the
+  terrain from a negative height. X-Plane's terrain itself is left as it
   is; seats, people and other props standing on a building's floor are
   set on that floor's level rather than on the ground under each of them.
 - **Flat objects on the airport ground**: covers, plates and flush
