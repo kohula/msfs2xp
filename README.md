@@ -28,10 +28,10 @@ in this codebase.
   z-fighting between same-layer draped surfaces.
 - **Terrain fit**: large buildings get a correction against real sampled
   X-Plane terrain, so a big footprint doesn't float or sink at its corners
-  on sloped ground. Where the ground under something taller than 1 m
-  varies by more than 1 m, it is lifted level to the highest ground and a
-  skirt is added below its walls down to the terrain, instead of bending
-  it (and its roof) to the slope. Objects meant to reach below the ground (a drain tile's
+  on sloped ground. Where the ground under a building is steep (over a
+  3 % gradient), it is lifted level to the highest ground and a skirt is
+  added below its walls down to the terrain, instead of bending it (and
+  its roof) to the slope. Objects meant to reach below the ground (a drain tile's
   channel, anything MSFS places below its ground level) have that drop
   baked into their geometry, since X-Plane won't sink an object below the
   terrain from a negative height. X-Plane's terrain itself is left as it

@@ -331,6 +331,23 @@ class TestTerrainFit(unittest.TestCase):
             self.assertTrue(applied, reason)
             self.assertEqual(reason, "applied_rigid_warp")
 
+    def test_large_building_on_a_gentle_slope_is_not_skirted(self):
+        """The ground drops several metres under a 600 m building, but at
+        a 1 % gradient: that is not steep, so it keeps the ordinary fit."""
+        with tempfile.TemporaryDirectory() as td:
+            original, corrected, applied, reason, transform = self._fit_split_box(
+                Path(td), lambda r: self._write_sloped_terrain(r, 47, 8, slope_per_post=190.0), 300.0, 6.0)
+            self.assertTrue(applied, reason)
+            self.assertNotEqual(reason, "applied_skirt")
+            self.assertEqual(len(corrected.positions), len(original.positions))
+
+    def test_gradient_of_the_ground_under_a_footprint(self):
+        flat = [(x, z, 0.0) for x in (-10, 0, 10) for z in (-10, 0, 10)]
+        self.assertAlmostEqual(terrain_fit._ground_gradient(flat), 0.0)
+        ramp = [(x, z, 0.05 * x) for x in (-10, 0, 10) for z in (-10, 0, 10)]
+        self.assertAlmostEqual(terrain_fit._ground_gradient(ramp), 0.05)
+        self.assertEqual(terrain_fit._ground_gradient([(0, 0, 1.0), (1, 0, 2.0)]), 0.0)
+
     def test_building_on_gentle_ground_keeps_the_ordinary_fit(self):
         """No skirt unless the ground is very steep: a big building on
         gently uneven ground keeps the ordinary vertical shift."""

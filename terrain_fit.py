@@ -111,11 +111,16 @@ _NOISE_FLOOR_M = 0.10  # skip a group whose sampled corners all correct by less 
 _SHIFT_OUTLIER_MAD_K = 3.0  # modified-z-score cutoff (see _robust_vertical_shift) for rejecting a spiky sample
 _RIGID_WARP_MAX_SIDE_M = 10.0  # footprint this small or smaller: per-vertex warp, not a shift (see module docstring)
 _RIGID_WARP_SLOPE_THRESHOLD_M = 1.0  # sampled corner spread past this: warp even a large footprint
-# ...unless the object is taller than _SKIRT_MIN_HEIGHT_M: on ground that
-# steep, a warp tilts its roof. It is lifted level to the highest ground
-# under it instead, and a skirt is added below its walls down to the
-# terrain (see _add_skirt).
+# A building on a steep slope is not warped either: that tilts its roof.
+# It is lifted level to the highest ground under it instead, and a skirt is
+# added below its walls down to the terrain (see _add_skirt). Steep means
+# the ground's gradient (a plane fitted to the footprint's terrain samples)
+# is over _SKIRT_MIN_GRADIENT -- not merely that the ground varies by a
+# metre somewhere under a large footprint, which is a gentle slope a big
+# building sits on fine with the ordinary fit.
 _SKIRT_MIN_HEIGHT_M = 1.0
+_SKIRT_MIN_GRADIENT = 0.03  # 3 % (~1.7 degrees): about 1 m across a 30 m building
+_SKIRT_MIN_SPREAD_M = 0.3  # ...and at least this much drop under it
 _SKIRT_BAND_M = 0.25  # how far above the object's lowest point a wall edge still counts as its bottom
 _SKIRT_WALL_NY = 0.5  # a triangle whose normal's |y| is below this is a wall
 _SKIRT_MIN_DROP_M = 0.05  # no skirt piece where the wall already meets the ground
@@ -208,6 +213,19 @@ def _robust_max(corner_samples, mad_k=_SHIFT_OUTLIER_MAD_K):
             if len(clean):
                 deltas = clean
     return float(deltas.max())
+
+
+def _ground_gradient(corner_samples):
+    """Steepness (rise over run) of the plane best fitting corner_samples
+    [(local_x, local_z, delta), ...]; 0 with fewer than 3 usable samples."""
+    if len(corner_samples) < 3:
+        return 0.0
+    a = np.array([[x, z, 1.0] for x, z, _ in corner_samples], dtype=np.float64)
+    d = np.array([v for _, _, v in corner_samples], dtype=np.float64)
+    if np.linalg.matrix_rank(a) < 3:
+        return 0.0
+    (gx, gz, _), *_ = np.linalg.lstsq(a, d, rcond=None)
+    return float(np.hypot(gx, gz))
 
 
 def _add_skirt(ir, top, y_min, delta_at):
@@ -417,14 +435,15 @@ def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_d
                      ) if len(corner_samples) >= 2 else 0.0
     group_uses_rigid_warp = max_side <= _RIGID_WARP_MAX_SIDE_M or slope_spread > _RIGID_WARP_SLOPE_THRESHOLD_M
 
-    # Very steep ground under something tall: level + skirt instead of a
-    # warp that would tilt its roof.
+    # Steep ground under something tall: level + skirt instead of a warp
+    # that would tilt its roof.
     rigid_geo = [loaded[s] for s in geo_stems if not loaded[s].draped]
     rigid_y_min = min(float(ir.positions[:, 1].min()) for ir in rigid_geo) if rigid_geo else 0.0
     rigid_y_max = max(float(ir.positions[:, 1].max()) for ir in rigid_geo) if rigid_geo else 0.0
     skirt_top = None
-    if (rigid_geo and slope_spread > _RIGID_WARP_SLOPE_THRESHOLD_M
-            and rigid_y_max - rigid_y_min > _SKIRT_MIN_HEIGHT_M):
+    if (rigid_geo and slope_spread > _SKIRT_MIN_SPREAD_M
+            and rigid_y_max - rigid_y_min > _SKIRT_MIN_HEIGHT_M
+            and _ground_gradient(corner_samples) > _SKIRT_MIN_GRADIENT):
         skirt_top = _robust_max(corner_samples)
         vertical_shift = skirt_top
         group_uses_rigid_warp = False
