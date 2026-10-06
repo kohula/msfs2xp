@@ -923,58 +923,6 @@ def _write_placement_report(path, cands, obj_dir, dsf_tiles, airport_alt):
             ])
 
 
-def _clip_below_ground(positions, normals, uvs, indices, eps=1e-4):
-    """Triangles cut at the ground plane y=0: parts below it removed, a
-    triangle crossing it trimmed exactly at y=0 (winding kept). Returns
-    (positions, normals, uvs, indices) as numpy arrays."""
-    positions = np.asarray(positions, dtype=np.float64)
-    normals = np.asarray(normals, dtype=np.float64) if len(normals) == len(positions) else np.tile([0.0, 1.0, 0.0], (len(positions), 1))
-    uvs = np.asarray(uvs, dtype=np.float64) if len(uvs) == len(positions) else np.zeros((len(positions), 2))
-    out_p, out_n, out_t, out_i = [], [], [], []
-    keep_index = {}
-
-    def keep(i):
-        if i not in keep_index:
-            keep_index[i] = len(out_p)
-            out_p.append(positions[i])
-            out_n.append(normals[i])
-            out_t.append(uvs[i])
-        return keep_index[i]
-
-    def cut(i, j):
-        yi, yj = positions[i, 1], positions[j, 1]
-        t = yi / (yi - yj)
-        out_p.append(positions[i] + (positions[j] - positions[i]) * t)
-        out_p[-1][1] = 0.0
-        n = normals[i] + (normals[j] - normals[i]) * t
-        out_n.append(n / max(np.linalg.norm(n), 1e-12))
-        out_t.append(uvs[i] + (uvs[j] - uvs[i]) * t)
-        return len(out_p) - 1
-
-    for tri in np.asarray(indices, dtype=np.int64).reshape(-1, 3):
-        tri = [int(v) for v in tri]
-        above = [positions[v, 1] >= -eps for v in tri]
-        if all(above):
-            out_i += [keep(v) for v in tri]
-            continue
-        if not any(above):
-            continue
-        # walk the triangle's edges in order, keeping the part above y=0
-        poly = []
-        for k in range(3):
-            a, b = tri[k], tri[(k + 1) % 3]
-            if above[k]:
-                poly.append(keep(a))
-            if above[k] != above[(k + 1) % 3]:
-                poly.append(cut(a, b))
-        for k in range(1, len(poly) - 1):
-            out_i += [poly[0], poly[k], poly[k + 1]]
-    if not out_p:
-        return np.zeros((0, 3)), np.zeros((0, 3)), np.zeros((0, 2)), np.zeros((0,), dtype=np.int64)
-    return (np.array(out_p, dtype=np.float64), np.array(out_n, dtype=np.float64),
-            np.array(out_t, dtype=np.float64), np.array(out_i, dtype=np.int64))
-
-
 def _bake_negative_heights(dsf_tiles, obj_dir):
     """Objects meant to reach below the ground -- a drain tile whose
     channel and base sit under the surface, anything MSFS places below its
@@ -984,10 +932,8 @@ def _bake_negative_heights(dsf_tiles, obj_dir):
     below the terrain from a negative AGL height: it stood on the ground
     instead, its below-ground part showing above the pavement. So the
     drop is baked into a copy of the geometry (`<stem>_dn<cm>`) placed at
-    height 0, with everything that ends up below the ground cut off
-    (_clip_below_ground) -- nothing of it can show where X-Plane's ground
-    dips below the anchor's. Objects without a MeshIR sidecar (animated
-    ones) keep the AGL height. Returns (baked, left) placement counts."""
+    height 0. Objects without a MeshIR sidecar (animated ones) keep the
+    AGL height. Returns (baked, left) placement counts."""
     cache = {}
     baked = left = 0
     for objects in dsf_tiles.values():
@@ -1015,23 +961,14 @@ def _bake_negative_heights(dsf_tiles, obj_dir):
                 pos = ir.positions.copy()
                 if len(pos):
                     pos[:, 1] += agl
-                pos, nrm, uv, idx = _clip_below_ground(pos, ir.normals, ir.uvs, ir.indices)
-                lights = [dataclasses.replace(lt, pos=(lt.pos[0], lt.pos[1] + agl, lt.pos[2])) for lt in ir.lights]
-                lights = [lt for lt in lights if lt.pos[1] >= 0.0]
-                if not len(idx) and not lights:
-                    o["_underground"] = True  # nothing of it is above the ground
-                    baked += 1
-                    continue
-                lowered = dataclasses.replace(ir, name=new, positions=pos, normals=nrm, uvs=uv,
-                                              indices=idx, lights=lights)
+                lowered = dataclasses.replace(
+                    ir, name=new, positions=pos,
+                    lights=[dataclasses.replace(lt, pos=(lt.pos[0], lt.pos[1] + agl, lt.pos[2])) for lt in ir.lights])
                 mesh_ir.write_obj8(lowered, path)
                 mesh_ir.save(lowered, mesh_ir.sidecar_path_for(path))
             o["name"] = new
             o["agl"] = 0.0
             baked += 1
-    for key, objects in dsf_tiles.items():
-        if any(o.get("_underground") for o in objects):
-            dsf_tiles[key] = [o for o in objects if not o.get("_underground")]
     return baked, left
 
 

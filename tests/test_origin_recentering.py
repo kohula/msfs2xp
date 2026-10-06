@@ -112,13 +112,13 @@ class TestOriginRecentering(unittest.TestCase):
             self.assertAlmostEqual(offset["x"], 0.0, places=6)
             self.assertAlmostEqual(offset["z"], 0.0, places=6)
 
-    def test_negative_y_geometry_gets_lifted_and_agl_delta_is_negative(self):
-        """A genuinely 3-D object (so it isn't flattened by the file-wide
-        flat/draped path) with real geometry down to y=-2 should get
-        lifted so its lowest vertex is at y=0, with a matching NEGATIVE
-        offset["y"] (main.py adds this straight into the placement's own
-        "agl" field to pull the object back down by the same amount at
-        placement time, keeping its final rendered position unchanged)."""
+    def test_negative_y_geometry_keeps_its_zero_point(self):
+        """A genuinely 3-D object with real geometry down to y=-2 (a drain
+        tile's channel, a foundation) keeps MSFS's zero point: its origin
+        stands on the ground and the part below y=0 stays below it. It was
+        lifted so its LOWEST point was y=0, relying on a negative AGL
+        height to pull it back down -- where that didn't hold, the object
+        hovered by its below-ground depth."""
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
 
@@ -136,20 +136,14 @@ class TestOriginRecentering(unittest.TestCase):
             result, offset = self._convert(td, box)
             text = result[0].read_text(encoding="utf-8")
             ys = [float(l.split()[2]) for l in text.splitlines() if l.startswith("VT ")]
-            self.assertAlmostEqual(min(ys), 0.0, places=3)
-            self.assertAlmostEqual(max(ys), 6.0, places=3)  # 4 - (-2), unchanged span
-            self.assertAlmostEqual(offset["y"], -2.0, places=3)
+            self.assertAlmostEqual(min(ys), -2.0, places=3)
+            self.assertAlmostEqual(max(ys), 4.0, places=3)
+            self.assertAlmostEqual(offset["y"], 0.0, places=6)
 
-    def test_positive_y_geometry_gets_dropped_and_agl_delta_is_positive(self):
-        """The mirror case: a genuinely 3-D object whose lowest vertex sits
-        ABOVE its own local origin (y=+3 here, nothing at or below y=0 at
-        all) must get shifted DOWN so its lowest vertex lands at y=0, with
-        a matching POSITIVE offset["y"] (main.py adds this into the
-        placement's own "agl" field to push the object back UP by the same
-        amount at placement time, keeping its final rendered position
-        unchanged). Before this generalization, min_y >= -0.01 meant this
-        object was left completely untouched -- no shift, no recorded
-        offset -- permanently baking its +3 baseline into the mesh."""
+    def test_positive_y_geometry_keeps_its_zero_point(self):
+        """The mirror case: an object whose lowest vertex sits ABOVE its
+        own origin (y=+3) is placed as authored too -- origin on the
+        ground, geometry 3 m up -- with no height offset to compensate."""
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
 
@@ -167,9 +161,9 @@ class TestOriginRecentering(unittest.TestCase):
             result, offset = self._convert(td, box)
             text = result[0].read_text(encoding="utf-8")
             ys = [float(l.split()[2]) for l in text.splitlines() if l.startswith("VT ")]
-            self.assertAlmostEqual(min(ys), 0.0, places=3)
-            self.assertAlmostEqual(max(ys), 6.0, places=3)  # 9 - 3, unchanged span
-            self.assertAlmostEqual(offset["y"], 3.0, places=3)
+            self.assertAlmostEqual(min(ys), 3.0, places=3)
+            self.assertAlmostEqual(max(ys), 9.0, places=3)
+            self.assertAlmostEqual(offset["y"], 0.0, places=6)
 
     def test_recenter_uses_median_not_bbox_midpoint_so_sparse_outliers_dont_drag_it(self):
         """CONFIRMED REAL BUG: a real converted LHBP ATC tower shell glTF

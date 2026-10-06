@@ -3381,15 +3381,16 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
     recenter_x = recenter_z = 0.0
     recenter_agl_delta = 0.0
     if bbox_mins_x:
-        min_y = min(bbox_mins_y)
-        # Symmetric in both directions -- re-zero min_y whether it's
-        # above OR below 0 (a multi-figure prop's pivot authored at the
-        # formation's center, not any one figure's feet, sits above 0;
-        # a dip below 0 is the more common case). Folded into the
-        # placement's AGL offset either way. Epsilon matches
-        # dsf_compiler's own AGL-routing threshold (abs(agl) >= 0.01).
-        y_lift = -min_y if abs(min_y) >= 0.01 else 0.0
-        recenter_agl_delta = -y_lift
+        # No vertical re-zeroing: MSFS stands an object on the ground at
+        # its own y=0, and so does X-Plane (an OBJ's origin goes on the
+        # terrain). Lifting every model so its LOWEST point was y=0 and
+        # compensating with a negative AGL height relied on that height
+        # surviving to the DSF and being honoured -- where it didn't, the
+        # object's lowest point (a drain tile's channel, a foundation)
+        # stood on the ground and everything above it hovered. Parts below
+        # y=0 now simply stay below the ground, as in MSFS.
+        y_lift = 0.0
+        recenter_agl_delta = 0.0
 
         # Horizontal (XZ) re-centering only for genuinely rigid files --
         # draped/flat files are very often several separate MSFS objects
