@@ -323,6 +323,20 @@ def _closed(vertices):
     return vertices, False
 
 
+def _counter_clockwise(vertices):
+    """[(lat, lon), ...] as an outer ring wound counter-clockwise seen from
+    above, which apt.dat requires of pavement and boundary rings (WED:
+    "Taxiway ... is wound clock wise"). MSFS keeps apron outlines in
+    either direction."""
+    area = 0.0
+    n = len(vertices)
+    for i in range(n):
+        lat0, lon0 = vertices[i]
+        lat1, lon1 = vertices[(i + 1) % n]
+        area += lon0 * lat1 - lon1 * lat0
+    return list(reversed(vertices)) if area < 0 else list(vertices)
+
+
 def _line_rows(layout, plane, painted_lines, report):
     rows = []
     for ls in layout.light_strings:
@@ -378,6 +392,7 @@ def _pavement_rows(layout, report):
         verts, _ = _closed(list(poly.vertices))
         if len(verts) < 3:
             continue
+        verts = _counter_clockwise(verts)
         rows.append(f"110 {TRANSPARENT} 0.25 0.00 Apron")
         for lat, lon in verts[:-1]:
             rows.append(f"111 {lat:.8f} {lon:.8f}")
@@ -448,6 +463,7 @@ def _boundary_rows(layout, extra_points=()):
     ring = airport_boundary(layout, extra_points)
     if not ring:
         return []
+    ring = _counter_clockwise(ring)
     rows = ["130 Airport Boundary"]
     for lat, lon in ring[:-1]:
         rows.append(f"111 {lat:.8f} {lon:.8f}")

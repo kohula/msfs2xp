@@ -182,5 +182,39 @@ class TestRunwayEnds(unittest.TestCase):
         self.assertTrue(math.isclose(plat, slat, abs_tol=1e-9))
 
 
+class TestRingWinding(unittest.TestCase):
+    """apt.dat pavement and boundary rings must be counter-clockwise (WED:
+    "Taxiway 'Apron' is wound clock wise")."""
+
+    @staticmethod
+    def _area(rows, start_code):
+        i = next(k for k, r in enumerate(rows) if r.startswith(start_code))
+        pts = []
+        for r in rows[i + 1:]:
+            code = r.split()[0]
+            if code not in ("111", "112", "113", "114"):
+                break
+            lat, lon = float(r.split()[1]), float(r.split()[2])
+            pts.append((lon, lat))
+            if code in ("113", "114"):
+                break
+        return sum(x0 * y1 - x1 * y0 for (x0, y0), (x1, y1) in zip(pts, pts[1:] + pts[:1]))
+
+    def test_clockwise_apron_is_written_counter_clockwise(self):
+        layout = _layout()
+        for poly in layout.aprons:
+            poly.vertices = list(reversed(poly.vertices))
+        rows, _ = apt_native.build_native_airport(layout)
+        self.assertGreater(self._area(rows, "110 "), 0)
+
+    def test_counter_clockwise_apron_is_kept(self):
+        rows, _ = apt_native.build_native_airport(_layout())
+        self.assertGreater(self._area(rows, "110 "), 0)
+
+    def test_boundary_is_counter_clockwise(self):
+        rows, _ = apt_native.build_native_airport(_layout())
+        self.assertGreater(self._area(rows, "130 "), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

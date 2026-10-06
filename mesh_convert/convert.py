@@ -1247,21 +1247,44 @@ def find_base_color_texture(mat):
     if "ASOBO_material_detail_map" in exts:
         detail = exts["ASOBO_material_detail_map"]
         if "detailColorTexture" in detail:
-            return detail["detailColorTexture"]
+            return _with_detail_uv_scale(detail["detailColorTexture"], detail)
 
     return None
 
 
+def _with_detail_uv_scale(texture_info, detail):
+    """A detail map tiles at its own UVScale over the model's UVs; used as
+    the only colour texture it must keep that tiling (as a
+    KHR_texture_transform), or one tile gets stretched across the whole
+    surface."""
+    scale = detail.get("UVScale")
+    if isinstance(scale, (int, float)):
+        scale = [float(scale), float(scale)]
+    if not (isinstance(scale, (list, tuple)) and len(scale) >= 2) or list(scale[:2]) == [1.0, 1.0]:
+        return texture_info
+    info = dict(texture_info)
+    exts = dict(info.get("extensions") or {})
+    transform = dict(exts.get("KHR_texture_transform") or {})
+    transform.setdefault("scale", [float(scale[0]), float(scale[1])])
+    offset = detail.get("UVOffset")
+    if isinstance(offset, (list, tuple)) and len(offset) >= 2:
+        transform.setdefault("offset", [float(offset[0]), float(offset[1])])
+    exts["KHR_texture_transform"] = transform
+    info["extensions"] = exts
+    return info
+
+
 def find_normal_texture(mat):
+    """The material's own normal map, or None. An ASOBO_material_detail_map
+    detailNormalTexture is NOT a substitute: it is a small tile MSFS
+    repeats many times across the surface (at the detail map's UVScale,
+    under a blend mask). Read at the model's own UVs it stretched one
+    tile over a whole wall, which X-Plane then lit as a huge, high-
+    contrast blotch pattern."""
     if not mat or not isinstance(mat, dict):
         return None
     if "normalTexture" in mat:
         return mat["normalTexture"]
-    exts = mat.get("extensions", {})
-    if "ASOBO_material_detail_map" in exts:
-        detail = exts["ASOBO_material_detail_map"]
-        if "detailNormalTexture" in detail:
-            return detail["detailNormalTexture"]
     return None
 
 

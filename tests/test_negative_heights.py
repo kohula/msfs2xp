@@ -36,9 +36,11 @@ class TestBakeNegativeHeights(unittest.TestCase):
             self.assertEqual(entry["agl"], 0.0)
             self.assertEqual(entry["name"], "drain_dn120")
             lowered = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / "drain_dn120.obj"))
-            # the surface is back at ground level, the channel under it
+            # the surface is back at ground level; the channel that was
+            # under it is cut off
             self.assertAlmostEqual(float(lowered.positions[:, 1].max()), 0.0, places=6)
-            self.assertAlmostEqual(float(lowered.positions[:, 1].min()), -1.2, places=6)
+            self.assertAlmostEqual(float(lowered.positions[:, 1].min()), 0.0, places=6)
+            self.assertEqual(len(lowered.indices), 6)
             self.assertAlmostEqual(lowered.lights[0].pos[1], 0.3, places=6)
             self.assertTrue((obj_dir / "drain_dn120.obj").exists())
 
@@ -73,6 +75,34 @@ class TestBakeNegativeHeights(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestClipBelowGround(unittest.TestCase):
+    def test_a_triangle_crossing_the_ground_is_trimmed_at_it(self):
+        pos = np.array([[0, -1, 0], [2, 1, 0], [0, 1, 2]], dtype=float)
+        p, n, t, i = pipeline._clip_below_ground(pos, np.tile([0, 0, 1.0], (3, 1)),
+                                                 np.array([[0, 0], [1, 0], [0, 1.0]]), np.array([0, 1, 2]))
+        self.assertTrue(np.all(p[:, 1] >= -1e-9))
+        self.assertEqual(len(i), 6)  # the part above becomes a quad: two triangles
+        self.assertAlmostEqual(float(p[:, 1].min()), 0.0)
+        # winding kept: same facing as the original triangle
+        a, b, c = pos
+        n0 = np.cross(b - a, c - a)
+        for k in range(0, len(i), 3):
+            q0, q1, q2 = p[i[k]], p[i[k + 1]], p[i[k + 2]]
+            self.assertGreater(float(np.dot(np.cross(q1 - q0, q2 - q0), n0)), 0.0)
+
+    def test_fully_underground_object_is_removed(self):
+        with tempfile.TemporaryDirectory() as td:
+            obj_dir = Path(td)
+            ir = _tile("pit")
+            ir.lights = []
+            mesh_ir.save(ir, mesh_ir.sidecar_path_for(obj_dir / "pit.obj"))
+            pit = {"name": "pit", "agl": -2.0}  # 1.2 m tall, sunk 2 m: nothing above ground
+            other = {"name": "pit", "agl": 0.0}
+            tiles = {(51, 0): [pit, other]}
+            self.assertEqual(pipeline._bake_negative_heights(tiles, obj_dir), (1, 0))
+            self.assertEqual(tiles[(51, 0)], [other])
 
 
 class TestPlacementReport(unittest.TestCase):
