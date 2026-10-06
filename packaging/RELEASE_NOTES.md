@@ -1,19 +1,23 @@
-Diagnostic test build: same conversion as 1.1.4, plus a report of every
-placement's height.
+Test build: models keep MSFS's zero point, detail-map texture fix, WED
+winding errors fixed.
 
 ## What's new
 
-- **`msfs2xp_placements.csv`** in the output scenery folder: one row per
-  converted object -- model name, title, source, position, MSFS altitude
-  and whether it is above ground or above sea level, the airport
-  elevation, the resulting height above ground, the converter's re-basing
-  lift, the model's height, the terrain-fit outcome, whether it was set
-  on a building's floor, and what each part finally became. Open it in a
-  spreadsheet and filter by model name or position to see why an object
-  floats or sinks.
-
-Everything from 1.1.4 is unchanged: terrain fit as in 1.1.2, a skirt
-only on steep ground, below-ground drops built into the geometry.
+- **Models keep MSFS's zero point**: the converter used to lift every
+  model so its lowest point stood on the ground and compensate with a
+  negative height. Where that compensation got lost, an object with parts
+  below zero (a drain tile's channel, a foundation) stood on its lowest
+  point and hovered. Models now stand on the ground at their own zero
+  point, as in MSFS; anything below it stays below the ground.
+- **Detail-map textures**: a material without its own normal map used the
+  MSFS detail map's small tiling normal map, stretched over the whole
+  surface -- walls came out as a large black-and-white blotch pattern, and
+  signs looked oddly metallic. Detail-map normals are no longer used; a
+  detail colour texture used on its own keeps its tiling.
+- **apt.dat apron and boundary outlines** are always written
+  counter-clockwise (WED: "Taxiway 'Apron' is wound clock wise").
+- `msfs2xp_placements.csv` (from 1.1.5) is still written: one row per
+  converted object with how its height was worked out.
 
 ## Windows
 
