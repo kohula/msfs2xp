@@ -998,6 +998,20 @@ def _decompress_and_write_riff_model(data: bytes, container_off: int, container_
     file_stem = f"{base}_{guid_hex}"
 
     out_path = out_dir / f"{file_stem}.glb"
+    # The model's own XML (ModelInfo: behaviours, self-playing animations,
+    # a jetway's IK rig) beside it, under the name mesh_convert and the
+    # jetway pass look for.
+    if xml and xml.strip():
+        xml_path = out_dir / f"{file_stem}.xml"
+        xml_tmp = xml_path.with_name(f"{xml_path.name}.tmp_{os.getpid()}_{threading.get_ident()}_{uuid.uuid4().hex[:8]}")
+        try:
+            xml_tmp.write_text(xml.rstrip("\x00"), encoding="utf-8")
+            os.replace(xml_tmp, xml_path)
+        except OSError:
+            try:
+                xml_tmp.unlink()
+            except OSError:
+                pass
     # Atomic write: the same GUID model can legitimately appear in
     # multiple .bgl files (a shared library object), which the GPU
     # fork's process pool may now parse concurrently -- a plain
@@ -2006,6 +2020,9 @@ def _parse_one_bgl(bgl_path_str, models_dir_str, scan_terrain_vectors=True):
                 dst = models_dir / name
                 shutil.copy2(src_dir / name, dst)
                 extracted.append(dst)
+                xml_name = Path(name).with_suffix(".xml").name
+                if (src_dir / xml_name).exists():
+                    shutil.copy2(src_dir / xml_name, models_dir / xml_name)
             result = dict(result)
             result["extracted_models"] = extracted
             result["logs"] = list(result["logs"]) + [(f"      [cache] {bgl.name}: reused previous parse result", "info")]
@@ -2021,6 +2038,8 @@ def _parse_one_bgl(bgl_path_str, models_dir_str, scan_terrain_vectors=True):
             for p in result["extracted_models"]:
                 shutil.copy2(p, dest_dir / p.name)
                 model_filenames.append(p.name)
+                if p.with_suffix(".xml").exists():
+                    shutil.copy2(p.with_suffix(".xml"), dest_dir / p.with_suffix(".xml").name)
             cacheable = dict(result)
             cacheable["extracted_models"] = []  # paths are run-specific; filenames cached separately
             cache_utils.set("bgl_parse", (cacheable, model_filenames), *key_parts)

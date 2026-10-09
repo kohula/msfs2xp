@@ -1396,6 +1396,81 @@ def untextured_swatch_color(rgba, metallic):
     return (int(round(r * k)), int(round(g * k)), int(round(b * k)), a)
 
 
+_FLAT_GLOW_STD = 6.0      # an emissive map this even (0..255) carries no lamp pattern
+_FLAT_GLOW_DARK = 8.0     # ...and one this dark lights nothing anyway
+_FLAT_GLOW_DIM = 110.0    # under this, an even glow is a grey wash, not a lit panel
+
+
+def is_flat_glow(path, glass=False):
+    """True for a night texture that would only wash the surface in an even
+    dim glow: vehicle bodies glowing grey at night, a tower cab's panes
+    greying the whole view out of them. A real lit pattern -- windows,
+    signs, lamps -- varies across the image and is kept, as is an even
+    bright glow (a lit sign face, or a pane showing a lit room behind it:
+    dropping those left building interiors dark). `glass` is accepted for
+    the caller's clarity; the rule is the same."""
+    try:
+        with Image.open(path) as img:
+            if getattr(img, "format", "") == "DDS":
+                return False
+            lum = np.asarray(img.convert("L").resize((64, 64), Image.BILINEAR), dtype=np.float32)
+    except Exception:
+        return False
+    mean, std = float(lum.mean()), float(lum.std())
+    if std > _FLAT_GLOW_STD or mean <= _FLAT_GLOW_DARK:
+        return False
+    return mean < _FLAT_GLOW_DIM
+
+
+_LAMP_WORDS = ("lamp", "light", "bulb", "lantern", "led", "spot", "flood", "luminaire")
+_NOT_LAMP_WORDS = ("window", "sign", "screen", "glass", "facade", "billboard", "poster", "logo", "text",
+                   "letter", "interior", "room")
+_HEAD_MAX_M = 1.2        # a lamp head is at most this across
+_HEAD_CELL_M = 0.4       # vertices this close belong to one head
+_MAX_HEAD_GLOWS = 24
+
+
+def lamp_head_points(builders):
+    """Centres (output frame) of small glowing lamp heads: clusters of a
+    lamp-named emissive material's vertices, each at most _HEAD_MAX_M
+    across."""
+    points = []
+    for b in builders.values():
+        if not getattr(b, "vertices", None) or b.anim_pivot is not None:
+            continue
+        name = b.name.lower()
+        if not (getattr(b, "emissive_texture_name", None) or name.endswith(("emis", "emissive", "_lit"))):
+            continue
+        if not any(w in name for w in _LAMP_WORDS) or any(w in name for w in _NOT_LAMP_WORDS):
+            continue
+        v = np.asarray(b.vertices, dtype=np.float64)
+        cells = {}
+        for i, key in enumerate(map(tuple, np.floor(v / _HEAD_CELL_M).astype(np.int64))):
+            cells.setdefault(key, []).append(i)
+        seen = set()
+        for start in cells:
+            if start in seen:
+                continue
+            group, stack = [], [start]
+            seen.add(start)
+            while stack:
+                c = stack.pop()
+                group.extend(cells[c])
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        for dz in (-1, 0, 1):
+                            n = (c[0] + dx, c[1] + dy, c[2] + dz)
+                            if n in cells and n not in seen:
+                                seen.add(n)
+                                stack.append(n)
+            g = v[group]
+            if float((g.max(axis=0) - g.min(axis=0)).max()) > _HEAD_MAX_M:
+                continue
+            c = g.mean(axis=0)
+            points.append((float(c[0]), float(c[1]), float(c[2])))
+    return points
+
+
 def find_emissive_texture(mat):
     if not mat or not isinstance(mat, dict):
         return None
@@ -2020,7 +2095,7 @@ def draw_distance_m(builders):
 
 
 def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.0, yaw=0.0, roll=0.0,
-            disable_proximity_animation=False, glass_opacity=DEFAULT_GLASS_OPACITY):
+            disable_proximity_animation=False, glass_opacity=DEFAULT_GLASS_OPACITY, head_glow=True):
     global _EXPORTED_COUNT
     glb_path = Path(glb_path)
     objects_dir = Path(objects_dir)
@@ -2937,6 +3012,9 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                                     builder.emissive_texture_name = apply_emissive_factor(
                                         textures_dir / builder.emissive_texture_name, emissive_factor[:3]
                                     )
+                                if builder.emissive_texture_name and is_flat_glow(
+                                        textures_dir / builder.emissive_texture_name, builder.is_glass):
+                                    builder.emissive_texture_name = None
                                 if time_behavior is not None and time_behavior[0] == "blink":
                                     # A periodic blink (beacon/lamp bulb)
                                     # gets a flicker driven by a custom
@@ -3420,9 +3498,11 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
             if not any(abs(_p[0] - q[0]) < 1.0 and abs(_p[2] - q[2]) < 1.0 for q in _syn_pts):
                 _syn_pts.append(_p)
         for (_cx, _cy, _cz) in _syn_pts[:6]:
-            _pw = apply_global_rotation(np.array([[_cx, _cy, _cz]], dtype=np.float64))[0]
+            # builder vertices are already in the output frame (turned by
+            # the global pitch/yaw/roll): no second turn, which put the
+            # light across the model's origin from its lens
             light_entries.append({
-                "pos": (float(_pw[0]), float(_pw[1]), float(_pw[2])),
+                "pos": (float(_cx), float(_cy), float(_cz)),
                 "dir": (0.0, 0.0, 0.0) if _syn_flash else (0.0, -1.0, 0.0),
                 "color": (1.0, 0.93, 0.78),
                 "cone_angle": 360.0 if _syn_flash else 150.0,
@@ -3433,6 +3513,21 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
         if light_entries:
             logger.info(f"{model_name}: synthesized {len(light_entries)} night "
                         f"light(s) from an emissive-only fixture (no macro_light in source).")
+
+    # --- Lamp heads that glow but light nothing ---
+    # Buildings, canopies and posts carry small lamp heads drawn with a
+    # glowing material and no light of their own: at night their lens is
+    # lit (TEXTURE_LIT) but seen from any distance there is nothing. Each
+    # one gets a small glow (no ground spill) at the lens.
+    if head_glow and not light_entries:
+        for (_cx, _cy, _cz) in lamp_head_points(builders)[:_MAX_HEAD_GLOWS]:
+            light_entries.append({
+                "pos": (_cx, _cy, _cz), "dir": (0.0, -1.0, 0.0), "color": (1.0, 0.92, 0.78),
+                "cone_angle": 360.0, "intensity": 1.0, "day_night_cycle": True,
+                "flash_frequency": 0.0, "glow_only": True,
+            })
+        if light_entries:
+            logger.info(f"{model_name}: {len(light_entries)} glowing lamp head(s) given a night glow.")
 
     # Bounding extremes across every absolute-frame point in this model:
     # each rigid/draped/translate-animated builder's own vertex bbox, each
@@ -4013,6 +4108,16 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                 # could not drive the light. Result: every apron/pole light
                 # dark even with HDR on.
                 param_light = "full_custom_halo" if not is_night_only else "full_custom_halo_night"
+
+                if entry.get("glow_only"):
+                    # a lamp head seen from afar: the halo, no ground spill
+                    f.write(f"LIGHT_PARAM {param_light} {px:.5f} {py:.5f} {pz:.5f} "
+                            f"{r:.4f} {g:.4f} {b:.4f} 1.0 0.500 0.00000 -1.00000 0.00000 1.0000\n")
+                    light_ir_entries.append(mesh_ir_module.LightEntry(
+                        pos=(px, py, pz), dir=(0.0, -1.0, 0.0), color=(r, g, b),
+                        cone_angle=360.0, size=0.5, dataref=param_light,
+                    ))
+                    continue
 
                 # Zero-length aim is undefined; an up-pointing pole/flood
                 # fixture came through with its emitter axis un-transformed

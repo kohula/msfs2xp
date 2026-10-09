@@ -19,6 +19,7 @@ import pickle
 import dataclasses
 import datetime
 from pathlib import Path
+from glob import escape as glob_escape
 from dataclasses import dataclass
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -39,6 +40,8 @@ import gpu_accel
 import terrain_dem
 import terrain_fit
 import host_floor
+import jetway_rig
+import pole_lights
 import runway_clutter
 import draped_merge
 import scenery_viewer
@@ -1058,6 +1061,33 @@ def _write_placement_report(path, cands, obj_dir, dsf_tiles, airport_alt):
             ])
 
 
+_TFIT_SUFFIX = re.compile(r"_tfit_[0-9a-f]+$")
+
+
+def _move_helper_lights(dsf_tiles, obj_dir, converted_stems_map):
+    """pole_lights.move_to_poles over the placed objects: a helper light is
+    a placed model that converted into a lights-only object and nothing
+    else."""
+    light_only = {stems[0] for stems in converted_stems_map.values()
+                  if len(stems) == 1 and stems[0].endswith("_lights")}
+    helpers = {o["name"] for objects in dsf_tiles.values() for o in objects
+               if o.get("name") and _TFIT_SUFFIX.sub("", o["name"]) in light_only}
+    if not helpers:
+        return 0, 0
+    cache = {}
+
+    def load(name):
+        if name not in cache:
+            sidecar = mesh_ir.sidecar_path_for(obj_dir / f"{name}.obj")
+            try:
+                cache[name] = mesh_ir.load(sidecar) if sidecar.exists() else None
+            except (OSError, EOFError, pickle.UnpicklingError):
+                cache[name] = None
+        return cache[name]
+
+    return pole_lights.move_to_poles(dsf_tiles, load, helpers)
+
+
 def _bake_negative_heights(dsf_tiles, obj_dir):
     """Objects meant to reach below the ground -- a drain tile whose
     channel and base sit under the surface, anything MSFS places below its
@@ -1308,8 +1338,16 @@ def _package_version(package_module):
     return hashlib.blake2b("".join(hashes).encode("utf-8"), digest_size=8).hexdigest()
 
 
+def _model_xml_identity(glb_path):
+    xml = Path(glb_path).parent / f"{re.sub(r'_LOD[0-9]+$', '', Path(glb_path).stem, flags=re.IGNORECASE)}.xml"
+    try:
+        return cache_utils.file_identity(xml) if xml.is_file() else "noxml"
+    except OSError:
+        return "noxml"
+
+
 def cached_convert(glb_path, obj_dir, tex_dir, ext_tex_dir, pitch, yaw, roll, disable_cache=False,
-                    static_doors=False, glass_opacity=mesh_convert_glass_default):
+                    static_doors=False, glass_opacity=mesh_convert_glass_default, head_glow=True):
     """Disk-cached wrapper around mesh_convert.convert -- this is the
     picklable function submitted to the mesh-conversion process pool. On a
     cache hit it skips the actual GLTF parse/vertex processing/OBJ write
@@ -1350,6 +1388,9 @@ def cached_convert(glb_path, obj_dir, tex_dir, ext_tex_dir, pitch, yaw, roll, di
         "|".join(str(p) for p in ext_tex_dir) if isinstance(ext_tex_dir, (list, tuple)) else (str(ext_tex_dir) if ext_tex_dir else ""),
         str(static_doors),
         f"glass{int(glass_opacity)}",
+        f"glow{int(bool(head_glow))}",
+        # the model's XML (behaviours, self-playing animations) is an input too
+        _model_xml_identity(glb_path),
     )
     obj_dir = Path(obj_dir)
     tex_dir = Path(tex_dir)
@@ -1379,7 +1420,7 @@ def cached_convert(glb_path, obj_dir, tex_dir, ext_tex_dir, pitch, yaw, roll, di
 
     result_paths = mesh_convert.convert(glb_path, obj_dir, tex_dir, ext_tex_dir, pitch, yaw, roll,
                                          disable_proximity_animation=static_doors,
-                                         glass_opacity=glass_opacity)
+                                         glass_opacity=glass_opacity, head_glow=head_glow)
 
     if result_paths and not disable_cache:
         try:
@@ -1855,6 +1896,13 @@ class PipelineOptions:
     # An empty no_autodgs.txt in the pack: the openSAM plugin then adds no
     # docking guidance or marshaller of its own at the airport.
     no_autodgs: bool = True
+    # The package's rigged jetways become working X-Plane 12 jetways with
+    # their own look (jetway_rig.py) instead of static objects.
+    usable_jetways: bool = True
+    # Small glowing lamp heads with no light of their own get a night glow.
+    head_glow: bool = True
+    # Lights hung in open air beside a lamp post move onto the post's lamp.
+    pole_lights: bool = True
 
 
 class PipelineHooks:
@@ -2228,7 +2276,7 @@ def _run_pipeline(opts, hooks):
                     executor.submit(
                         cached_convert,
                         m, obj_dir, tex_dir, external_textures_root, "0.0", "180.0", "0.0",
-                        opts.disable_cache, opts.static_doors, opts.glass_opacity
+                        opts.disable_cache, opts.static_doors, opts.glass_opacity, opts.head_glow
                     ): m.stem for m in model_files
                 }
                 
@@ -2402,6 +2450,49 @@ def _run_pipeline(opts, hooks):
             hooks.log(f"Cleared {_tfit_cleared} terrain-fit copy(ies) from a previous run "
                      f"so this run's source-.obj fixes actually reach the DSF.", "info")
 
+        # Jetways: an MSFS jetway model with a readable rig becomes a
+        # working X-Plane 12 jetway with its own look (jetway_rig.py) --
+        # placed by an apt.dat 1500 row naming its object, not as a static
+        # object. Needs the package's own airport record (the apt.dat it
+        # goes in) and an X-Plane 12 apt.dat; otherwise it stays static.
+        jetway_models = {}
+        jetway_instances = []
+        if (opts.usable_jetways and opts.xp_version != "xp11"
+                and apt_native.is_usable(native_airport_layout) and total_models):
+            _model_by_stem = {m.stem: m for m in model_files}
+            _ext_roots = [pkg] + ([Path(msfs_install_root)] if msfs_install_root else [])
+            for _stem in sorted(converted_stems_map):
+                _src = _model_by_stem.get(_stem)
+                if _src is None:
+                    continue
+                _xml = _src.parent / f"{re.sub(r'_LOD[0-9]+$', '', _src.stem, flags=re.IGNORECASE)}.xml"
+                try:
+                    _xml_text = _xml.read_text(encoding="utf-8", errors="replace") if _xml.is_file() else ""
+                except OSError:
+                    _xml_text = ""
+                if not jetway_rig.is_jetway_xml(_xml_text):
+                    continue
+                try:
+                    _jw = jetway_rig.build(_src, _xml_text, obj_dir, tex_dir, _ext_roots, f"{_stem}_jetway",
+                                           opts.glass_opacity)
+                except Exception as e:
+                    _jw = None
+                    hooks.log(f"Jetway {_stem}: rig not converted ({e}) -- placed as a static object.", "warning")
+                if _jw is None:
+                    hooks.log(f"Jetway {_stem}: its rig couldn't be read -- placed as a static object.", "warning")
+                    continue
+                jetway_models[_stem] = _jw
+                # its static parts are never placed: keep them out of the pack
+                for _part_stem in converted_stems_map.get(_stem, []):
+                    for _f in obj_dir.glob(f"{glob_escape(_part_stem)}.*"):
+                        try:
+                            _f.unlink()
+                        except OSError:
+                            pass
+            if jetway_models:
+                hooks.log(f"{len(jetway_models)} jetway model(s) converted into working X-Plane jetways "
+                          f"(their own look, docking with X-Plane's jetway command).", "info")
+
         dsf_tiles = {}
         matched_count = 0
         unmatched_guid_samples = set()
@@ -2464,7 +2555,7 @@ def _run_pipeline(opts, hooks):
             _tf_jobs = []
             for _p in all_placements:
                 _os = _resolve_original_stem(_p)
-                if not (_os and _os in converted_stems_map):
+                if not (_os and _os in converted_stems_map) or _os in jetway_models:
                     continue
                 _mx, _my, _mz = offsets.get(_os.lower(), (0.0, 0.0, 0.0))
                 _alat, _alon = geo_transform.local_offset_to_latlon(
@@ -2525,6 +2616,10 @@ def _run_pipeline(opts, hooks):
 
         for p in all_placements:
             original_stem = _resolve_original_stem(p)
+            if original_stem in jetway_models:
+                jetway_instances.append((jetway_models[original_stem], p["lat"], p["lon"], p["hdg"]))
+                matched_count += 1
+                continue
             offset = offsets.get(original_stem.lower(), (0.0, 0.0, 0.0)) if original_stem else None
 
             if original_stem and original_stem in converted_stems_map:
@@ -2844,6 +2939,17 @@ def _run_pipeline(opts, hooks):
                               f"ground sheet(s) onto the terrain.", "info")
             except Exception as e:
                 hooks.log(f"(couldn't check for flat objects on the airport ground: {e})", "warning")
+
+        # Lights hung beside a lamp post shine from its lamp (pole_lights.py).
+        if opts.pole_lights:
+            try:
+                _moved, _merged = _move_helper_lights(dsf_tiles, obj_dir, converted_stems_map)
+                if _moved or _merged:
+                    hooks.log(f"{_moved} helper light(s) moved onto the lamp of their post"
+                              + (f", {_merged} more on an already lit lamp left out" if _merged else "")
+                              + ".", "info")
+            except Exception as e:
+                hooks.log(f"(couldn't move helper lights onto their posts: {e})", "warning")
 
         # Negative heights (parts meant to be below the ground) are baked
         # into the geometry: X-Plane won't sink an object below the
@@ -3428,6 +3534,10 @@ def _run_pipeline(opts, hooks):
                 native_airport_layout, stock_block=matched_apt_block,
                 runway_surface=opts.runway_surface, painted_lines=opts.native_painted_lines,
                 flatten=opts.flatten_airport, boundary_points=airport_boundary_points)
+            if jetway_instances:
+                _stands = [sp for sp in native_airport_layout.parkings if apt_native.is_aircraft_stand(sp.kind)]
+                rows += jetway_rig.rows_for(jetway_instances, stands=_stands)
+                apt_report["working jetways"] = len(jetway_instances)
             note = f"native {native_airport_layout.ident}" + (f", flows/metadata from {matched_apt_ident}"
                                                               if matched_apt_block else "")
             apt_dat.write_airport_lines(apt_path, rows, source_note=note)

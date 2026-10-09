@@ -378,6 +378,7 @@ class ModularPythonConverterApp:
         self.exclusions_var = tk.BooleanVar(value=True)
         self.write_log_file_var = tk.BooleanVar(value=False)
         self.no_autodgs_var = tk.BooleanVar(value=True)
+        self.usable_jetways_var = tk.BooleanVar(value=True)
         # How opaque blended MSFS glass is drawn (MSFS glass relies on
         # reflections X-Plane doesn't draw, so its own alpha is near zero).
         self.glass_opacity_var = tk.IntVar(value=50)
@@ -558,6 +559,7 @@ class ModularPythonConverterApp:
                     self.exclusions_var.set(data.get("exclusions", True))
                     self.write_log_file_var.set(data.get("write_log_file", False))
                     self.no_autodgs_var.set(data.get("no_autodgs", True))
+                    self.usable_jetways_var.set(data.get("usable_jetways", True))
                     self.glass_opacity_var.set(int(data.get("glass_opacity", 50)))
                     self.max_texture_var.set(int(data.get("max_texture", 2048)))
                     geom = data.get("geometry")
@@ -588,6 +590,7 @@ class ModularPythonConverterApp:
                     "exclusions": self.exclusions_var.get(),
                     "write_log_file": self.write_log_file_var.get(),
                     "no_autodgs": self.no_autodgs_var.get(),
+                    "usable_jetways": self.usable_jetways_var.get(),
                     "glass_opacity": self._glass_opacity(),
                     "max_texture": self._max_texture(),
                     "geometry": self.root.geometry()
@@ -735,6 +738,11 @@ class ModularPythonConverterApp:
         _styled_checkbutton(
             main_page, "Flat objects on the airport ground: remove small ones, drape large sheets",
             self.remove_runway_clutter_var
+        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=2)
+        row += 1
+        _styled_checkbutton(
+            main_page, "Working jetways (X-Plane 12): the airport's own jetways dock to your aircraft",
+            self.usable_jetways_var
         ).grid(row=row, column=0, columnspan=4, sticky="w", pady=2)
         row += 1
         glass_row = tk.Frame(main_page, bg=self.card_bg)
@@ -945,6 +953,7 @@ class ModularPythonConverterApp:
             exclusions=self.exclusions_var.get(),
             write_log_file=self.write_log_file_var.get(),
             no_autodgs=self.no_autodgs_var.get(),
+            usable_jetways=self.usable_jetways_var.get(),
             glass_opacity=max(1, min(100, self._glass_opacity())),
             max_texture=self._max_texture(),
         )

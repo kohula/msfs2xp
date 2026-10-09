@@ -254,14 +254,15 @@ def bbox_is_near(candidate, trusted, max_km):
 
 
 def strip_jetway_rows(block_lines):
-    """Drops row code 1500 (jetways) -- the one specific row family that
+    """Drops row codes 1500 (jetways) and 1501 (a jetway's own object) --
+    the one specific row family that
     doesn't exist at all in the pre-1200 apt.dat spec and is what X-Plane
     actually complains about ("no jetways in pre 1200 apt.dat files") when
     a file declares an older version but contains one. Deliberately narrow:
     only removes exactly that row family rather than guessing at every row
     code the 1200 spec added, since getting that guess wrong risks quietly
     breaking a legacy-header file in some OTHER way instead."""
-    return [line for line in block_lines if line.split(None, 1)[:1] != ["1500"]]
+    return [line for line in block_lines if line.split(None, 1)[:1] not in (["1500"], ["1501"])]
 
 
 def _linear_feature_node_is_lit(node_line):

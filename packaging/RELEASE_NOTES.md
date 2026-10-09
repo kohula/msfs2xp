@@ -1,23 +1,43 @@
-Test build: models keep MSFS's zero point, detail-map texture fix, WED
-winding errors fixed.
+Test build: working jetways with the airport's own look, fewer exclusion
+zones, night lighting, self-moving parts, new options.
 
 ## What's new
 
-- **Models keep MSFS's zero point**: the converter used to lift every
-  model so its lowest point stood on the ground and compensate with a
-  negative height. Where that compensation got lost, an object with parts
-  below zero (a drain tile's channel, a foundation) stood on its lowest
-  point and hovered. Models now stand on the ground at their own zero
-  point, as in MSFS; anything below it stays below the ground.
-- **Detail-map textures**: a material without its own normal map used the
-  MSFS detail map's small tiling normal map, stretched over the whole
-  surface -- walls came out as a large black-and-white blotch pattern, and
-  signs looked oddly metallic. Detail-map normals are no longer used; a
-  detail colour texture used on its own keeps its tiling.
-- **apt.dat apron and boundary outlines** are always written
-  counter-clockwise (WED: "Taxiway 'Apron' is wound clock wise").
-- `msfs2xp_placements.csv` (from 1.1.5) is still written: one row per
-  converted object with how its height was worked out.
+- **Working jetways (X-Plane 12)**: an airport's own jetways keep their
+  MSFS look and now dock to your aircraft. Each rigged MSFS jetway is
+  split into its moving parts (rotunda, tunnel, telescoping sections, cab,
+  wheel leg) and written as one X-Plane jetway object driven by X-Plane's
+  own jetway animation; apt.dat gets a jetway row for each one. Where a
+  stand has two or three, the extra ones go to the second door. Switch off
+  on the Main page (or `--static-jetways`) to keep them static. Needs the
+  package's own airport record; with the XP11 legacy apt.dat they stay
+  static.
+- **Fewer exclusion zones**: objects close together share one zone, tiny
+  props get none of their own, and the package's own exclusion boxes are
+  merged in -- thousands of rectangles become a few hundred. Exclusions
+  can be switched off completely (Main page, `--no-exclusions`).
+- **Lights**: MSFS lights aimed at the ground were pointing at the sky;
+  MSFS 2024's newer light type is converted (those lamps were dark);
+  helper lights hung beside a lamp post now shine from the post's lamp
+  (`--no-pole-lights`); small glowing lamp heads with no light of their
+  own get a night glow (`--no-head-glow`); a light made for a lamp
+  fixture now sits at its lens instead of across the model from it.
+- **Night glow**: an even, dim night texture is left off -- vehicles no
+  longer glow grey and tower-cab glass no longer greys the view. Lit
+  windows and signs stay lit.
+- **Parts that move by themselves** (radar dishes, fans) turn in a loop.
+- **Materials**: normal maps use the material's own strength (no more
+  blotchy glass); untextured parts use their own colour instead of
+  another part's texture, and bare white metal is drawn dark grey.
+- **openSAM**: an empty `no_autodgs.txt` is written with the apt.dat, so
+  openSAM adds no docking guidance of its own (Advanced page,
+  `--opensam-dgs` to skip).
+- **Program**: the version is shown at the top right; options are split
+  into Main and Advanced (several options were hidden below the card's
+  edge before); an optional `.log` file of the run (`--log-file`); the
+  max texture size no longer resets to 0 when the window opens.
+- Models embedded in the scenery now keep their own XML, so their
+  behaviours, self-moving parts and jetway rigs are read too.
 
 ## Windows
 
