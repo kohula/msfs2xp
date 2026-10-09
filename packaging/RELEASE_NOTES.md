@@ -1,43 +1,37 @@
-Test build: working jetways with the airport's own look, fewer exclusion
-zones, night lighting, self-moving parts, new options.
+Test build: jetways dock in X-Plane 12, exclusion zones reduced, light
+and material fixes, new options.
 
 ## What's new
 
-- **Working jetways (X-Plane 12)**: an airport's own jetways keep their
-  MSFS look and now dock to your aircraft. Each rigged MSFS jetway is
-  split into its moving parts (rotunda, tunnel, telescoping sections, cab,
-  wheel leg) and written as one X-Plane jetway object driven by X-Plane's
-  own jetway animation; apt.dat gets a jetway row for each one. Where a
-  stand has two or three, the extra ones go to the second door. Switch off
-  on the Main page (or `--static-jetways`) to keep them static. Needs the
-  package's own airport record; with the XP11 legacy apt.dat they stay
-  static.
-- **Fewer exclusion zones**: objects close together share one zone, tiny
-  props get none of their own, and the package's own exclusion boxes are
-  merged in -- thousands of rectangles become a few hundred. Exclusions
-  can be switched off completely (Main page, `--no-exclusions`).
-- **Lights**: MSFS lights aimed at the ground were pointing at the sky;
-  MSFS 2024's newer light type is converted (those lamps were dark);
-  helper lights hung beside a lamp post now shine from the post's lamp
-  (`--no-pole-lights`); small glowing lamp heads with no light of their
-  own get a night glow (`--no-head-glow`); a light made for a lamp
-  fixture now sits at its lens instead of across the model from it.
-- **Night glow**: an even, dim night texture is left off -- vehicles no
-  longer glow grey and tower-cab glass no longer greys the view. Lit
-  windows and signs stay lit.
-- **Parts that move by themselves** (radar dishes, fans) turn in a loop.
-- **Materials**: normal maps use the material's own strength (no more
-  blotchy glass); untextured parts use their own colour instead of
-  another part's texture, and bare white metal is drawn dark grey.
-- **openSAM**: an empty `no_autodgs.txt` is written with the apt.dat, so
-  openSAM adds no docking guidance of its own (Advanced page,
-  `--opensam-dgs` to skip).
-- **Program**: the version is shown at the top right; options are split
-  into Main and Advanced (several options were hidden below the card's
-  edge before); an optional `.log` file of the run (`--log-file`); the
-  max texture size no longer resets to 0 when the window opens.
-- Models embedded in the scenery now keep their own XML, so their
-  behaviours, self-moving parts and jetway rigs are read too.
+- **Jetways**: rigged MSFS jetway models are converted into X-Plane 12
+  jetways that keep the scenery's own model and textures. Each one is
+  written as an animated object on X-Plane's jetway datarefs and listed
+  in apt.dat (1500/1501 rows), so X-Plane's jetway command docks it.
+  Stands with more than one jetway assign the extra ones to door 2.
+  Main page tick box, or `--static-jetways` for the old static objects.
+  Requires the package's airport record and the XP12 apt.dat.
+- **Exclusion zones**: footprints are now merged into one grid with small
+  gaps closed, so far fewer rectangles are written. Can be turned off
+  (Main page, `--no-exclusions`).
+- **Lights**: ASOBO light direction corrected (local +Z); the MSFS 2024
+  light extension (ASOBO_advanced_light) is read; lights-only models
+  next to a lamp post are attached to its lamp (`--keep-bare-lights` to
+  disable); emissive lamps without a light source get a halo
+  (`--no-lamp-glow` to disable); synthesized fixture lights are placed
+  correctly.
+- **Emissive maps** that are near-constant and dim are dropped (they only
+  added a grey wash at night).
+- **AutoPlay animations** from the model XML are written as looping
+  animations.
+- **Materials**: normal map strength (glTF `scale`) is applied; untextured
+  materials use their own colour, darkened by their metallic factor.
+- **openSAM**: `no_autodgs.txt` is written next to apt.dat
+  (`--opensam-dgs` to skip).
+- **Program**: version shown in the window; options split into Main and
+  Advanced (some were hidden before); optional `.log` file
+  (`--log-file`); max texture size no longer resets to 0.
+- Embedded models now keep their XML, so their behaviours, animations
+  and jetway rigs are read.
 
 ## Windows
 

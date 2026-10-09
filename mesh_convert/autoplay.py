@@ -1,16 +1,14 @@
-"""Parts MSFS moves by itself: radar dishes, fans, turning signs.
+"""Looping (AutoPlay) animations.
 
-A model's XML marks such an animation as
+A model XML entry
     <Animation name="..." type="Standard" typeParam="AutoPlay" .../>
-and MSFS plays it in a loop for as long as the object is shown. Converted,
-it becomes an X-Plane animation on the always-running sim clock
-(sim/time/total_running_time_sec) that repeats with the clip's length
-(ANIM_keyframe_loop).
+marks a glTF clip that plays continuously with no trigger. It is written
+as an OBJ8 animation on sim/time/total_running_time_sec, wrapped with
+ANIM_keyframe_loop set to the clip length.
 
-X-Plane turns a part about one fixed axis per ANIM_rotate block, so a
-rotation channel is converted only when every key turns the part about the
-same axis (a dish on its mast, a fan on its hub); anything else stays
-still in its rest pose, as before. Angles are unwrapped so a full turn is
+An ANIM_rotate block has one fixed axis, so a rotation channel is
+converted only when all of its keys share an axis (within
+_AXIS_TOLERANCE_DEG); otherwise the part stays in its rest pose. Angles are unwrapped so a full turn is
 one continuous 0..360 sweep, and keys that a straight line through their
 neighbours already gives are dropped.
 """

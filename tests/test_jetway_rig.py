@@ -20,9 +20,9 @@ RIG_XML = """<ModelInfo>
   <IKChain Name="IK_MainHandle"><Start>Rotation_Base</Start><End>Pivot</End></IKChain>
   <IKChain Name="IK_WheelsGroundLock"><Start>Bone07</Start><End>Wheel_Ctrl_Orient</End></IKChain>
   <IKConstraint><Node>Rotation_Base</Node><Heading/></IKConstraint>
-  <IKConstraint><Node>Bone01</Node><Bank min="-6" max="6"/></IKConstraint>
-  <IKConstraint><Node>Bone02</Node><X min="0.5" max="9.0"/></IKConstraint>
-  <IKConstraint><Node>Bone03</Node><X min="0.5" max="10.0"/></IKConstraint>
+  <IKConstraint><Node>Bone01</Node><Bank min="-5" max="5"/></IKConstraint>
+  <IKConstraint><Node>Bone02</Node><X min="0.5" max="8.5"/></IKConstraint>
+  <IKConstraint><Node>Bone03</Node><X min="0.5" max="10.5"/></IKConstraint>
   <IKConstraint><Node>RotationEndBone</Node><Heading/></IKConstraint>
   <IKConstraint><Node>Bone07</Node></IKConstraint>
   <IKConstraint><Node>Bone08</Node><X/></IKConstraint>
@@ -87,7 +87,7 @@ class TestReadRig(unittest.TestCase):
         chains, constraints = jetway_rig.read_ik(RIG_XML)
         self.assertEqual(chains["IK_MainHandle"], ("Rotation_Base", "Pivot"))
         self.assertEqual(constraints["bone02"].axis, "x")
-        self.assertEqual((constraints["bone03"].lo, constraints["bone03"].hi), (0.5, 10.0))
+        self.assertEqual((constraints["bone03"].lo, constraints["bone03"].hi), (0.5, 10.5))
         self.assertTrue(jetway_rig.is_jetway_xml(RIG_XML))
         self.assertFalse(jetway_rig.is_jetway_xml("<ModelInfo><LODS/></ModelInfo>"))
 
@@ -129,12 +129,12 @@ class TestJetwayObject(unittest.TestCase):
         for d in ("jw_cabin_rotation", "jw_bogie_elevation", "jw_bogie_rotation"):
             self.assertIn(d, drefs)
         self.assertEqual(text.count("ANIM_begin"), text.count("ANIM_end"))
-        # the sections share the extension by their travel: 8.5/18 and 9.5/18
+        # the sections share the extension by their travel: 8/18 and 10/18
         # of (38 - 16.5) m at full reach, along -Z
         keys = [l.split() for l in text.splitlines() if l.startswith("ANIM_trans_key 38.0000")]
         self.assertEqual(len(keys), 2)
-        self.assertAlmostEqual(float(keys[0][4]), -21.5 * 8.5 / 18.0, places=3)
-        self.assertAlmostEqual(float(keys[1][4]), -21.5 * 9.5 / 18.0, places=3)
+        self.assertAlmostEqual(float(keys[0][4]), -21.5 * 8.0 / 18.0, places=3)
+        self.assertAlmostEqual(float(keys[1][4]), -21.5 * 10.0 / 18.0, places=3)
         self.assertIn("TEXTURE ../textures/Jetway_Glass_jetway_atlas.png", text)
         self.assertIn("ATTR_blend", text)
 

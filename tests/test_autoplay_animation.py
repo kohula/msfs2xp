@@ -1,7 +1,6 @@
 """
-Parts MSFS moves by itself (an <Animation ... typeParam="AutoPlay"/> in the
-model XML: radar dishes, fans) loop in X-Plane on the sim clock instead of
-standing still.
+An AutoPlay clip (<Animation ... typeParam="AutoPlay"/> in the model XML)
+becomes a looping OBJ8 animation on the sim clock.
 """
 import math
 import sys

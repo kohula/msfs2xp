@@ -55,11 +55,11 @@ def build_parser():
     p.add_argument("--static-jetways", action="store_true",
                    help="keep the package's jetways as static objects instead of working X-Plane 12 "
                         "jetways with their own look")
-    p.add_argument("--no-pole-lights", action="store_true",
-                   help="leave helper lights where the package hangs them instead of moving them onto "
-                        "the lamp of the post beside them")
-    p.add_argument("--no-head-glow", action="store_true",
-                   help="no night glow for small glowing lamp heads that have no light of their own")
+    p.add_argument("--keep-bare-lights", action="store_true",
+                   help="leave lights-only models where they are placed instead of attaching them to "
+                        "the lamp post next to them")
+    p.add_argument("--no-lamp-glow", action="store_true",
+                   help="no night halo on small emissive lamps that have no light source")
     p.add_argument("--opensam-dgs", action="store_true",
                    help="don't write no_autodgs.txt: let the openSAM plugin add its own docking "
                         "guidance at the airport")
@@ -92,8 +92,8 @@ def main(argv=None):
         write_log_file=a.log_file,
         no_autodgs=not a.opensam_dgs,
         usable_jetways=not a.static_jetways,
-        pole_lights=not a.no_pole_lights,
-        head_glow=not a.no_head_glow,
+        attach_bare_lights=not a.keep_bare_lights,
+        lamp_glow=not a.no_lamp_glow,
     )
     run_pipeline(opts, PipelineHooks())
     return 0

@@ -1,12 +1,8 @@
 """
 extract_image's DDS passthrough: X-Plane's OBJ8 TEXTURE line supports
 .dds natively, so decoding a source DDS to PNG is pure waste when
-nothing about the texture needs to change afterward -- confirmed real
-gap found comparing this project's output against a different MSFS->
-X-Plane converter's: every one of our textures paid a full decode+
-re-encode cost even when unmodified (~7x size/VRAM penalty on one real
-texture, for zero quality gain), while the other tool passes DDS
-through unchanged in the common case.
+nothing about the texture needs to change afterward: decoding every
+texture cost ~7x size/VRAM on one real texture, for zero quality gain.
 
 allow_dds_passthrough is opt-in per call site, not a blanket toggle:
 whichever caller knows whether apply_color_factor/apply_alpha_factor/

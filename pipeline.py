@@ -41,7 +41,7 @@ import terrain_dem
 import terrain_fit
 import host_floor
 import jetway_rig
-import pole_lights
+import lamp_posts
 import runway_clutter
 import draped_merge
 import scenery_viewer
@@ -1064,15 +1064,15 @@ def _write_placement_report(path, cands, obj_dir, dsf_tiles, airport_alt):
 _TFIT_SUFFIX = re.compile(r"_tfit_[0-9a-f]+$")
 
 
-def _move_helper_lights(dsf_tiles, obj_dir, converted_stems_map):
-    """pole_lights.move_to_poles over the placed objects: a helper light is
+def _attach_bare_lights(dsf_tiles, obj_dir, converted_stems_map):
+    """lamp_posts.attach_to_lamps over the placed objects: a bare light is
     a placed model that converted into a lights-only object and nothing
     else."""
     light_only = {stems[0] for stems in converted_stems_map.values()
                   if len(stems) == 1 and stems[0].endswith("_lights")}
-    helpers = {o["name"] for objects in dsf_tiles.values() for o in objects
-               if o.get("name") and _TFIT_SUFFIX.sub("", o["name"]) in light_only}
-    if not helpers:
+    bare = {o["name"] for objects in dsf_tiles.values() for o in objects
+            if o.get("name") and _TFIT_SUFFIX.sub("", o["name"]) in light_only}
+    if not bare:
         return 0, 0
     cache = {}
 
@@ -1085,7 +1085,7 @@ def _move_helper_lights(dsf_tiles, obj_dir, converted_stems_map):
                 cache[name] = None
         return cache[name]
 
-    return pole_lights.move_to_poles(dsf_tiles, load, helpers)
+    return lamp_posts.attach_to_lamps(dsf_tiles, load, bare)
 
 
 def _bake_negative_heights(dsf_tiles, obj_dir):
@@ -1347,7 +1347,7 @@ def _model_xml_identity(glb_path):
 
 
 def cached_convert(glb_path, obj_dir, tex_dir, ext_tex_dir, pitch, yaw, roll, disable_cache=False,
-                    static_doors=False, glass_opacity=mesh_convert_glass_default, head_glow=True):
+                    static_doors=False, glass_opacity=mesh_convert_glass_default, lamp_glow=True):
     """Disk-cached wrapper around mesh_convert.convert -- this is the
     picklable function submitted to the mesh-conversion process pool. On a
     cache hit it skips the actual GLTF parse/vertex processing/OBJ write
@@ -1388,7 +1388,7 @@ def cached_convert(glb_path, obj_dir, tex_dir, ext_tex_dir, pitch, yaw, roll, di
         "|".join(str(p) for p in ext_tex_dir) if isinstance(ext_tex_dir, (list, tuple)) else (str(ext_tex_dir) if ext_tex_dir else ""),
         str(static_doors),
         f"glass{int(glass_opacity)}",
-        f"glow{int(bool(head_glow))}",
+        f"glow{int(bool(lamp_glow))}",
         # the model's XML (behaviours, self-playing animations) is an input too
         _model_xml_identity(glb_path),
     )
@@ -1420,7 +1420,7 @@ def cached_convert(glb_path, obj_dir, tex_dir, ext_tex_dir, pitch, yaw, roll, di
 
     result_paths = mesh_convert.convert(glb_path, obj_dir, tex_dir, ext_tex_dir, pitch, yaw, roll,
                                          disable_proximity_animation=static_doors,
-                                         glass_opacity=glass_opacity, head_glow=head_glow)
+                                         glass_opacity=glass_opacity, lamp_glow=lamp_glow)
 
     if result_paths and not disable_cache:
         try:
@@ -1899,10 +1899,10 @@ class PipelineOptions:
     # The package's rigged jetways become working X-Plane 12 jetways with
     # their own look (jetway_rig.py) instead of static objects.
     usable_jetways: bool = True
-    # Small glowing lamp heads with no light of their own get a night glow.
-    head_glow: bool = True
-    # Lights hung in open air beside a lamp post move onto the post's lamp.
-    pole_lights: bool = True
+    # Small emissive lamps without a light source get a night halo.
+    lamp_glow: bool = True
+    # A lights-only model placed near a lamp post is attached to its lamp.
+    attach_bare_lights: bool = True
 
 
 class PipelineHooks:
@@ -2276,7 +2276,7 @@ def _run_pipeline(opts, hooks):
                     executor.submit(
                         cached_convert,
                         m, obj_dir, tex_dir, external_textures_root, "0.0", "180.0", "0.0",
-                        opts.disable_cache, opts.static_doors, opts.glass_opacity, opts.head_glow
+                        opts.disable_cache, opts.static_doors, opts.glass_opacity, opts.lamp_glow
                     ): m.stem for m in model_files
                 }
                 
@@ -2940,16 +2940,16 @@ def _run_pipeline(opts, hooks):
             except Exception as e:
                 hooks.log(f"(couldn't check for flat objects on the airport ground: {e})", "warning")
 
-        # Lights hung beside a lamp post shine from its lamp (pole_lights.py).
-        if opts.pole_lights:
+        # Bare lights next to a lamp post go into its lamp (lamp_posts.py).
+        if opts.attach_bare_lights:
             try:
-                _moved, _merged = _move_helper_lights(dsf_tiles, obj_dir, converted_stems_map)
+                _moved, _merged = _attach_bare_lights(dsf_tiles, obj_dir, converted_stems_map)
                 if _moved or _merged:
-                    hooks.log(f"{_moved} helper light(s) moved onto the lamp of their post"
-                              + (f", {_merged} more on an already lit lamp left out" if _merged else "")
+                    hooks.log(f"{_moved} separately placed light(s) attached to the lamp post beside them"
+                              + (f", {_merged} duplicate(s) on an already lit lamp removed" if _merged else "")
                               + ".", "info")
             except Exception as e:
-                hooks.log(f"(couldn't move helper lights onto their posts: {e})", "warning")
+                hooks.log(f"(couldn't attach separate lights to lamp posts: {e})", "warning")
 
         # Negative heights (parts meant to be below the ground) are baked
         # into the geometry: X-Plane won't sink an object below the

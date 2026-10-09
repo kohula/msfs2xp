@@ -1,9 +1,6 @@
 """
-Which way converted lights shine. MSFS's own lights (ASOBO_macro_light,
-and MSFS 2024's ASOBO_advanced_light) shine along their node's +Z axis; a
-standard KHR_lights_punctual light along -Z. A lamp-post spot is a node
-turned ~110 degrees about X so its +Z points at the ground: read the
-wrong way round it lit the sky.
+Light aim: ASOBO lights (ASOBO_macro_light, ASOBO_advanced_light) point
+down their node's local +Z, KHR_lights_punctual lights down local -Z.
 """
 import math
 import sys
@@ -56,11 +53,11 @@ def _light_lines(extensions, rotation, khr_defs=None):
 
 
 class TestLightDirection(unittest.TestCase):
-    def test_msfs_light_turned_down_shines_down(self):
+    def test_asobo_light_aims_along_plus_z(self):
         lines = _light_lines({"ASOBO_macro_light": {"color": [1, 1, 1], "cone_angle": 45, "intensity": 10}},
-                             _about_x(110.0))
+                             _about_x(125.0))
         self.assertEqual(len(lines), 1)
-        self.assertLess(float(lines[0][11]), -0.9)
+        self.assertAlmostEqual(float(lines[0][11]), -math.sin(math.radians(125.0)), places=3)
 
     def test_msfs_2024_advanced_light_is_converted(self):
         ext = {"ASOBO_advanced_light": {"color": [1, 0.9, 0.85], "intensity": 4000, "day_night_cycle": True,

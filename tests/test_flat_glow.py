@@ -1,8 +1,7 @@
 """
-Night textures that only wash a surface in an even glow are left off:
-an even dim glow (vehicles glowing grey at night, a tower cab's panes
-greying the view). Lit patterns and bright even glows -- sign faces, a
-pane showing a lit room -- stay.
+Near-constant dim emissive maps (a flat grey wash at night) are dropped;
+structured maps and near-constant bright ones (sign faces, lit rooms
+behind panes) are kept.
 """
 import tempfile
 import unittest

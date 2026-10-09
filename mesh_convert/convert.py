@@ -346,7 +346,7 @@ def _rest_open_rotation_values(values):
 
 
 def _set_autoplay_keys(builder, node_anim, frame, anim_ancestor_world, apply_global_rotation):
-    """Animation keys for a part MSFS moves by itself (autoplay.py): the
+    """Animation keys for a looping (AutoPlay) clip (autoplay.py): the
     clip's own key table on the sim clock, looping with the clip's length.
     frame turns the animated node's parent frame into the output frame.
     Leaves the builder still (no keys) when a rotation doesn't keep to one
@@ -1329,10 +1329,10 @@ def make_normal_metalness(textures_dir, normal_name, comp_name, metallic_factor,
     its alpha as shininess -- an RGB normal map has alpha 255, so every
     normal-mapped surface was drawn fully glossy.
 
-    normal_scale is the material's normalTexture "scale": MSFS draws the
-    map's bumps that much weaker (or stronger). X-Plane has no such
-    factor, so it is baked into red/green; at full strength the faint
-    ripples of a glass pane meant to be all but flat showed as blotches.
+    normal_scale is glTF's normalTexture "scale" (x/y of the sampled
+    normal are multiplied by it). OBJ8 has no equivalent, so it is baked
+    into red/green here; ignoring it rendered low-strength maps at full
+    strength.
     Returns the new texture name, or `normal_name` unchanged if it can't
     be read."""
     textures_dir = Path(textures_dir)
@@ -1385,12 +1385,11 @@ UNTEXTURED_METAL_DARKENING = 0.65
 
 
 def untextured_swatch_color(rgba, metallic):
-    """The flat colour an untextured material is drawn with. MSFS shades a
-    metal surface by what it reflects, so bare metal reads as a darker
-    version of its colour; X-Plane, with no normal map to carry the
-    metalness, draws the colour as plain paint -- white metal panels came
-    out glowing white. Metal is darkened accordingly (white fully metal ->
-    dark grey)."""
+    """The flat colour an untextured material is drawn with. In PBR, a
+    metallic surface's base colour is its reflectance, not a diffuse
+    colour; without a normal/metalness map X-Plane treats it as diffuse,
+    so a high-metallic material reads far too bright. The colour is scaled
+    down by its metallic factor to approximate the PBR result."""
     r, g, b, a = rgba
     k = 1.0 - UNTEXTURED_METAL_DARKENING * max(0.0, min(1.0, metallic))
     return (int(round(r * k)), int(round(g * k)), int(round(b * k)), a)
@@ -1402,12 +1401,11 @@ _FLAT_GLOW_DIM = 110.0    # under this, an even glow is a grey wash, not a lit p
 
 
 def is_flat_glow(path, glass=False):
-    """True for a night texture that would only wash the surface in an even
-    dim glow: vehicle bodies glowing grey at night, a tower cab's panes
-    greying the whole view out of them. A real lit pattern -- windows,
-    signs, lamps -- varies across the image and is kept, as is an even
-    bright glow (a lit sign face, or a pane showing a lit room behind it:
-    dropping those left building interiors dark). `glass` is accepted for
+    """True for an emissive map that is near-constant and dim: as
+    TEXTURE_LIT it only adds a flat grey wash over the whole surface at
+    night. Maps with structure (window/sign/lamp patterns) are kept, and so
+    is a near-constant bright map (lit sign face, lit room behind a pane --
+    dropping those darkened building interiors). `glass` is accepted for
     the caller's clarity; the rule is the same."""
     try:
         with Image.open(path) as img:
@@ -1427,7 +1425,7 @@ _NOT_LAMP_WORDS = ("window", "sign", "screen", "glass", "facade", "billboard", "
                    "letter", "interior", "room")
 _HEAD_MAX_M = 1.2        # a lamp head is at most this across
 _HEAD_CELL_M = 0.4       # vertices this close belong to one head
-_MAX_HEAD_GLOWS = 24
+_MAX_LAMP_HALOS = 24
 
 
 def lamp_head_points(builders):
@@ -1705,13 +1703,12 @@ def extract_image(gltf, buffers, image_index, glb_path, textures_dir, external_t
     real DDS file, write them straight through as a .dds instead of
     decoding to PNG. X-Plane's OBJ8 TEXTURE line supports .dds natively,
     so decoding is pure waste when nothing about the texture needs to
-    change afterward -- CONFIRMED REAL GAP found comparing this project's
-    output against a different MSFS->X-Plane converter's: every one of
-    OUR textures paid a full decode+re-encode cost even when unmodified,
-    a real (~7x observed on one texture) size/VRAM penalty for zero
-    quality gain, while the other tool passes DDS through unchanged in
-    the common case and only re-encodes when a real modification (a
-    baked color/alpha/emissive factor) needs to be applied.
+    change afterward: every texture used to pay a full decode+re-encode
+    cost even when unmodified, a real (~7x observed on one texture)
+    size/VRAM penalty for zero quality gain. DDS is now passed through
+    unchanged in the common case and only re-encoded when a real
+    modification (a baked color/alpha/emissive factor) needs to be
+    applied.
 
     The CALLER decides this, not this function: it's the caller (the
     material-processing loop in convert()) that knows whether apply_
@@ -2095,7 +2092,7 @@ def draw_distance_m(builders):
 
 
 def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.0, yaw=0.0, roll=0.0,
-            disable_proximity_animation=False, glass_opacity=DEFAULT_GLASS_OPACITY, head_glow=True):
+            disable_proximity_animation=False, glass_opacity=DEFAULT_GLASS_OPACITY, lamp_glow=True):
     global _EXPORTED_COUNT
     glb_path = Path(glb_path)
     objects_dir = Path(objects_dir)
@@ -2397,12 +2394,12 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
         pos_world = (base_world @ np.array([0.0, 0.0, 0.0, 1.0]))[:3]
         pos_world = apply_global_rotation(pos_world.reshape(1, 3))[0]
 
-        # Aim direction: a KHR_lights_punctual light points down its node's
-        # local -Z axis (glTF's convention), but MSFS's own lights shine
-        # along +Z -- a lamp-post spot is a node turned ~110 degrees about
-        # X so that its +Z points down at the ground; read as -Z it aimed
-        # at the sky. Rotated by the node's world rotation (scale stripped
-        # out) plus the file's global pitch/yaw/roll.
+        # Aim direction: KHR_lights_punctual lights point down the node's
+        # local -Z (glTF convention); ASOBO lights point down local +Z.
+        # Using -Z for both inverted every ASOBO spot (a downward
+        # floodlight came out aiming up). Rotated by the node's world
+        # rotation (scale stripped out) plus the file's global
+        # pitch/yaw/roll.
         rot3 = base_world[:3, :3]
         col_norms = np.linalg.norm(rot3, axis=0)
         col_norms[col_norms == 0] = 1.0
@@ -2548,7 +2545,7 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                             animated_node_id = node_idx
                         elif (node_anim.get("clip", "").lower() in autoplay_clips
                               and node_anim.get("clip_length", 0.0) > 0.0):
-                            # moves by itself in MSFS (radar, fan): see autoplay.py
+                            # a looping AutoPlay clip: see autoplay.py
                             animated_node_id = node_idx
                             node_is_autoplay = True
 
@@ -3514,20 +3511,20 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
             logger.info(f"{model_name}: synthesized {len(light_entries)} night "
                         f"light(s) from an emissive-only fixture (no macro_light in source).")
 
-    # --- Lamp heads that glow but light nothing ---
-    # Buildings, canopies and posts carry small lamp heads drawn with a
-    # glowing material and no light of their own: at night their lens is
-    # lit (TEXTURE_LIT) but seen from any distance there is nothing. Each
-    # one gets a small glow (no ground spill) at the lens.
-    if head_glow and not light_entries:
-        for (_cx, _cy, _cz) in lamp_head_points(builders)[:_MAX_HEAD_GLOWS]:
+    # --- Emissive lamps without a light source ---
+    # A lamp modelled only as an emissive material shows its TEXTURE_LIT
+    # up close but nothing from a distance, since X-Plane only draws a
+    # halo for real lights. Each small lamp cluster gets a halo-only
+    # light (no ground spill) at its centre.
+    if lamp_glow and not light_entries:
+        for (_cx, _cy, _cz) in lamp_head_points(builders)[:_MAX_LAMP_HALOS]:
             light_entries.append({
                 "pos": (_cx, _cy, _cz), "dir": (0.0, -1.0, 0.0), "color": (1.0, 0.92, 0.78),
                 "cone_angle": 360.0, "intensity": 1.0, "day_night_cycle": True,
                 "flash_frequency": 0.0, "glow_only": True,
             })
         if light_entries:
-            logger.info(f"{model_name}: {len(light_entries)} glowing lamp head(s) given a night glow.")
+            logger.info(f"{model_name}: {len(light_entries)} emissive lamp(s) given a night halo.")
 
     # Bounding extremes across every absolute-frame point in this model:
     # each rigid/draped/translate-animated builder's own vertex bbox, each
@@ -4110,7 +4107,7 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                 param_light = "full_custom_halo" if not is_night_only else "full_custom_halo_night"
 
                 if entry.get("glow_only"):
-                    # a lamp head seen from afar: the halo, no ground spill
+                    # halo only: S kept small so it lights no ground
                     f.write(f"LIGHT_PARAM {param_light} {px:.5f} {py:.5f} {pz:.5f} "
                             f"{r:.4f} {g:.4f} {b:.4f} 1.0 0.500 0.00000 -1.00000 0.00000 1.0000\n")
                     light_ir_entries.append(mesh_ir_module.LightEntry(

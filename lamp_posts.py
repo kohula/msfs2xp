@@ -1,16 +1,13 @@
-"""Helper lights shine from the lamp of the post they belong to.
+"""Bare lights placed next to a lamp post are attached to its lamp.
 
-Scenery authors light aprons and car parks with helper lights: a model
-that is a light and nothing else, hung in open air near a lamp post. The
-posts themselves carry no light, only a lamp head drawn with a glowing
-material. Placed as the package has them, the helper lights leave pools
-of light with no visible source beside dark-looking posts, so each helper
-light that hangs near a lamp head, at about its height, is moved onto
-that lamp head.
+Some packages draw the lamp posts and add the light separately: a model
+holding nothing but a light, placed in the air somewhere near the post's
+top. Converted where they were placed, such lights hang beside the post
+instead of in it. A bare light that is near a glowing lamp head at about
+its height is moved into that head.
 
-Each lamp head takes one light: a second helper light reaching the same
-head is dropped (stacked, they lit the foot of the post like daylight),
-and a head that already has a light of its own takes none.
+One light per lamp head: when a second bare light finds the same head it
+is removed, and a head whose post brings its own light keeps only that.
 """
 
 import math
@@ -19,7 +16,7 @@ import numpy as np
 
 import geo_transform
 
-REACH_M = 12.0          # a helper light this close (horizontally) to a lamp head belongs to it
+REACH_M = 12.0          # a bare light this close (horizontally) to a lamp head is attached to it
 HEIGHT_TOL_M = 5.0      # ...when it hangs within this of the lamp's height
 MIN_HANG_M = 3.0        # lights lower than this are ground lights, never moved
 HEAD_MIN_Y_M = 4.0      # a lamp head sits at least this high on its model
@@ -75,15 +72,15 @@ def _metres(a, b):
     return (b[0] - a[0]) * m_lat, (b[1] - a[1]) * m_lon, b[2] - a[2]
 
 
-def move_to_poles(dsf_tiles, load_ir, helper_names):
-    """Moves helper-light placements (entry names in helper_names) in
-    dsf_tiles onto lamp heads. load_ir(name) gives an entry's MeshIR or
+def attach_to_lamps(dsf_tiles, load_ir, bare_names):
+    """Moves bare-light placements (entry names in bare_names) in
+    dsf_tiles into lamp heads. load_ir(name) gives an entry's MeshIR or
     None. Returns (moved, dropped)."""
     heads, own = [], []
     for objects in dsf_tiles.values():
         for e in objects:
             name = e.get("name")
-            if not name or name in helper_names:
+            if not name or name in bare_names:
                 continue
             ir = load_ir(name)
             if ir is None:
@@ -115,7 +112,7 @@ def move_to_poles(dsf_tiles, load_ir, helper_names):
     for tile, objects in dsf_tiles.items():
         keep = []
         for e in objects:
-            if e.get("name") not in helper_names:
+            if e.get("name") not in bare_names:
                 keep.append(e)
                 continue
             ir = load_ir(e["name"])

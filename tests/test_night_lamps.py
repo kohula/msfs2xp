@@ -1,8 +1,7 @@
 """
-Night lamps: glowing lamp heads with no light of their own get a small
-glow; a light made for an emissive-only fixture sits at its lens with the
-pipeline's 180-degree turn too; and a model that is only a light (MSFS's
-stock hanging lights) still converts into a light that shines down.
+Lamps: emissive lamp clusters without a light source get a halo-only
+light; a synthesized fixture light is placed in the output frame (no
+second global rotation); a lights-only model converts to a light.
 """
 import math
 import sys
@@ -46,7 +45,7 @@ def _canopy_with_lamps():
 
 
 class TestLampHeads(unittest.TestCase):
-    def test_each_head_glows(self):
+    def test_each_lamp_gets_a_halo(self):
         lines = _run(_canopy_with_lamps(), "Canopy.glb")
         self.assertEqual(len(lines), 3)
         xs = sorted(round(float(l[2]), 2) for l in lines)
@@ -56,7 +55,7 @@ class TestLampHeads(unittest.TestCase):
             self.assertAlmostEqual(float(l[9]), 0.5)  # small: a glow, no ground pool
 
     def test_switch_off(self):
-        self.assertEqual(_run(_canopy_with_lamps(), "Canopy.glb", head_glow=False), [])
+        self.assertEqual(_run(_canopy_with_lamps(), "Canopy.glb", lamp_glow=False), [])
 
     def test_lit_windows_are_not_lamps(self):
         b = MatBuilder("Facade_Window_Emis")
@@ -79,7 +78,7 @@ class TestFixtureLightPlace(unittest.TestCase):
 
 
 class TestLightOnlyModel(unittest.TestCase):
-    def test_hanging_light_converts_and_shines_down(self):
+    def test_lights_only_model_converts(self):
         b = GltfBuilder()
         h = math.radians(90.0) / 2.0
         b.add_node(name="Light", translation=(0, 0, 0), rotation=(math.sin(h), 0, 0, math.cos(h)),
