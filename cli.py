@@ -11,7 +11,7 @@ import argparse
 import multiprocessing
 import sys
 
-from pipeline import PipelineHooks, PipelineOptions, run_pipeline
+from pipeline import LOG_FILE_NAME, PipelineHooks, PipelineOptions, app_version, run_pipeline
 
 
 def build_parser():
@@ -47,6 +47,12 @@ def build_parser():
     p.add_argument("--flatten", action="store_true",
                    help="apt.dat: flatten the terrain inside the airport boundary, as MSFS does "
                         "(fallback; by default X-Plane's terrain is kept)")
+    p.add_argument("--no-exclusions", action="store_true",
+                   help="write no exclusion zones at all: default X-Plane objects, forests and roads "
+                        "stay under the converted scenery")
+    p.add_argument("--log-file", action="store_true",
+                   help=f"also write the run's log to {LOG_FILE_NAME} in the output folder")
+    p.add_argument("--version", action="version", version=f"MSFS2XP {app_version()}")
     return p
 
 
@@ -71,6 +77,8 @@ def main(argv=None):
         max_texture=max(0, a.max_texture),
         flatten_airport=a.flatten,
         remove_runway_clutter=not a.keep_runway_objects,
+        exclusions=not a.no_exclusions,
+        write_log_file=a.log_file,
     )
     run_pipeline(opts, PipelineHooks())
     return 0

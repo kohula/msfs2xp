@@ -13,7 +13,7 @@ from PIL import Image, ImageTk
 import app_paths
 import cache_utils
 import pick_replacements
-from pipeline import PipelineOptions, PipelineHooks, run_pipeline, wipe_cache_and_temp
+from pipeline import LOG_FILE_NAME, PipelineOptions, PipelineHooks, app_version, run_pipeline, wipe_cache_and_temp
 
 # Settings live with the cache (next to the program, or the per-user
 # folder when that's read-only -- see app_paths). An older build kept them
@@ -375,6 +375,8 @@ class ModularPythonConverterApp:
         self.native_painted_lines_var = tk.BooleanVar(value=False)
         self.flatten_airport_var = tk.BooleanVar(value=False)
         self.remove_runway_clutter_var = tk.BooleanVar(value=True)
+        self.exclusions_var = tk.BooleanVar(value=True)
+        self.write_log_file_var = tk.BooleanVar(value=False)
         # How opaque blended MSFS glass is drawn (MSFS glass relies on
         # reflections X-Plane doesn't draw, so its own alpha is near zero).
         self.glass_opacity_var = tk.IntVar(value=50)
@@ -447,7 +449,11 @@ class ModularPythonConverterApp:
                                     fg="#a0a0a0", font=("Segoe UI", 9, "bold"))
         self.title_label.pack(side=tk.LEFT, padx=12)
 
-        for widget in (self.title_bar, self.title_label):
+        self.version_label = tk.Label(self.title_bar, text=_version_text(), bg=self.title_bg,
+                                      fg="#55555e", font=("Segoe UI", 8))
+        self.version_label.pack(side=tk.RIGHT, padx=14)
+
+        for widget in (self.title_bar, self.title_label, self.version_label):
             widget.bind("<Button-1>", self._start_drag)
             widget.bind("<B1-Motion>", self._do_drag)
             widget.bind("<Double-Button-1>", lambda e: self.toggle_maximize())
@@ -548,6 +554,8 @@ class ModularPythonConverterApp:
                     self.native_painted_lines_var.set(data.get("native_painted_lines", False))
                     self.flatten_airport_var.set(data.get("flatten_airport", False))
                     self.remove_runway_clutter_var.set(data.get("remove_runway_clutter", True))
+                    self.exclusions_var.set(data.get("exclusions", True))
+                    self.write_log_file_var.set(data.get("write_log_file", False))
                     self.glass_opacity_var.set(int(data.get("glass_opacity", 50)))
                     self.max_texture_var.set(int(data.get("max_texture", 2048)))
                     geom = data.get("geometry")
@@ -575,6 +583,8 @@ class ModularPythonConverterApp:
                     "native_painted_lines": self.native_painted_lines_var.get(),
                     "flatten_airport": self.flatten_airport_var.get(),
                     "remove_runway_clutter": self.remove_runway_clutter_var.get(),
+                    "exclusions": self.exclusions_var.get(),
+                    "write_log_file": self.write_log_file_var.get(),
                     "glass_opacity": self._glass_opacity(),
                     "max_texture": self._max_texture(),
                     "geometry": self.root.geometry()
@@ -656,14 +666,13 @@ class ModularPythonConverterApp:
                       bg_color=self.card_bg, width=85, height=30).grid(row=4, column=2, padx=(5, 0), pady=4)
 
         # --- OPTIONS CARD ---
+        # Two pages in one fixed-height card: the options most runs touch,
+        # and the rest under "Advanced".
         options_card = RoundedCard(left_col, bg_color=self.bg_dark, card_bg=self.card_bg, radius=12, height=222)
         options_card.pack(fill=tk.X, pady=(0, 12))
 
         options_inner = options_card.inner
-        options_inner.columnconfigure(3, weight=1)
-
-        tk.Label(options_inner, text="OPTIONS", bg=self.card_bg, fg="#3b82f6", font=("Segoe UI", 10, "bold")).grid(
-            row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
+        options_inner.columnconfigure(0, weight=1)
 
         def _styled_checkbutton(parent, text, variable):
             return tk.Checkbutton(
@@ -677,55 +686,56 @@ class ModularPythonConverterApp:
                 activebackground=self.card_bg, activeforeground="#ffffff", selectcolor=self.bg_dark,
                 highlightthickness=0, bd=0, font=("Segoe UI", 9), anchor="w")
 
-        tk.Label(options_inner, text="Target X-Plane:", bg=self.card_bg, fg="#a0a0a0", font=("Segoe UI", 9)).grid(
-            row=1, column=0, sticky="e", padx=(0, 10), pady=4)
-        _styled_radiobutton(options_inner, "XP11.50+ / XP12 (modern apt.dat)", self.xp_version_var, "xp12").grid(
-            row=1, column=1, sticky="w", pady=4)
-        _styled_radiobutton(options_inner, "XP11 legacy (pre-11.50)", self.xp_version_var, "xp11").grid(
-            row=1, column=2, sticky="w", pady=4)
+        header = tk.Frame(options_inner, bg=self.card_bg)
+        header.grid(row=0, column=0, sticky="we", pady=(0, 6))
+        tk.Label(header, text="OPTIONS", bg=self.card_bg, fg="#3b82f6", font=("Segoe UI", 10, "bold")).pack(
+            side=tk.LEFT)
 
-        _styled_checkbutton(
-            options_inner, "Clean run (wipe cache + temp files first)", self.clean_run_var
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=4)
-        _styled_checkbutton(
-            options_inner, "Disable cache for this run", self.disable_cache_var
-        ).grid(row=2, column=2, sticky="w", pady=4)
-        RoundedButton(options_inner, text="Clear Cache Now", command=self.clear_cache_now,
-                      bg_color=self.card_bg, width=140, height=28).grid(row=2, column=3, sticky="e", pady=4)
+        main_page = tk.Frame(options_inner, bg=self.card_bg)
+        advanced_page = tk.Frame(options_inner, bg=self.card_bg)
+        for page in (main_page, advanced_page):
+            page.grid(row=1, column=0, sticky="nwe")
+            page.columnconfigure(3, weight=1)
+        pages = {"Main": main_page, "Advanced": advanced_page}
+        tabs = {}
 
+        def show_page(name):
+            for page_name, page in pages.items():
+                if page_name == name:
+                    page.grid()
+                else:
+                    page.grid_remove()
+            for tab_name, tab in tabs.items():
+                tab.config(fg="#ffffff" if tab_name == name else "#6b6b75")
+
+        for name in ("Advanced", "Main"):  # packed right to left
+            tab = tk.Label(header, text=name, bg=self.card_bg, fg="#6b6b75", cursor="hand2",
+                           font=("Segoe UI", 9, "bold"))
+            tab.pack(side=tk.RIGHT, padx=(10, 0))
+            tab.bind("<Button-1>", lambda e, n=name: show_page(n))
+            tabs[name] = tab
+
+        # Main page
+        row = 0
+        tk.Label(main_page, text="Target X-Plane:", bg=self.card_bg, fg="#a0a0a0", font=("Segoe UI", 9)).grid(
+            row=row, column=0, sticky="w", padx=(0, 10), pady=2)
+        _styled_radiobutton(main_page, "XP11.50+ / XP12 (modern apt.dat)", self.xp_version_var, "xp12").grid(
+            row=row, column=1, sticky="w", pady=2)
+        _styled_radiobutton(main_page, "XP11 legacy (pre-11.50)", self.xp_version_var, "xp11").grid(
+            row=row, column=2, columnspan=2, sticky="w", padx=(10, 0), pady=2)
+        row += 1
         _styled_checkbutton(
-            options_inner, "Static doors (disable proximity- and business-hours-triggered animations)", self.static_doors_var
-        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=4)
+            main_page, "Exclusion zones (hide X-Plane's own objects, forests and roads under the scenery)",
+            self.exclusions_var
+        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=2)
+        row += 1
         _styled_checkbutton(
-            options_inner, "Approximate name-matching for unresolved base-game objects (heuristic)",
-            self.approximate_substitution_var
-        ).grid(row=4, column=0, columnspan=4, sticky="w", pady=4)
-        _styled_checkbutton(
-            options_inner, "Scan for TerrainVectorDb ground-polygon materials (diagnostic log only, no geometry)",
-            self.scan_terrain_vectors_var
-        ).grid(row=5, column=0, columnspan=4, sticky="w", pady=4)
-        _styled_checkbutton(
-            options_inner, "Convert draped pavement/markings to real .pol DSF polygons (experimental)",
-            self.pol_polygons_var
-        ).grid(row=6, column=0, columnspan=4, sticky="w", pady=4)
-        _styled_checkbutton(
-            options_inner, "apt.dat: draw X-Plane runways with markings (for packages without runway models)",
-            self.native_runways_var
-        ).grid(row=7, column=0, columnspan=4, sticky="w", pady=4)
-        _styled_checkbutton(
-            options_inner, "apt.dat: paint the MSFS painted lines (if the draped models don't carry them)",
-            self.native_painted_lines_var
-        ).grid(row=8, column=0, columnspan=4, sticky="w", pady=4)
-        _styled_checkbutton(
-            options_inner, "apt.dat: flatten the terrain inside the airport, as MSFS does (fallback if objects still float/sink)",
-            self.flatten_airport_var
-        ).grid(row=9, column=0, columnspan=4, sticky="w", pady=4)
-        _styled_checkbutton(
-            options_inner, "Flat objects on the airport ground: remove small ones, drape large sheets (they hover otherwise)",
+            main_page, "Flat objects on the airport ground: remove small ones, drape large sheets",
             self.remove_runway_clutter_var
-        ).grid(row=10, column=0, columnspan=4, sticky="w", pady=4)
-        glass_row = tk.Frame(options_inner, bg=self.card_bg)
-        glass_row.grid(row=11, column=0, columnspan=4, sticky="w", pady=4)
+        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=2)
+        row += 1
+        glass_row = tk.Frame(main_page, bg=self.card_bg)
+        glass_row.grid(row=row, column=0, columnspan=4, sticky="w", pady=2)
         tk.Label(glass_row, text="Glass opacity % (100 = solid):", bg=self.card_bg, fg="#cccccc",
                  font=("Segoe UI", 9)).pack(side=tk.LEFT)
         tk.Spinbox(glass_row, from_=1, to=100, increment=5, width=5, textvariable=self.glass_opacity_var,
@@ -733,9 +743,46 @@ class ModularPythonConverterApp:
                    insertbackground="#ffffff").pack(side=tk.LEFT, padx=(8, 0))
         tk.Label(glass_row, text="Max texture size px:", bg=self.card_bg, fg="#cccccc",
                  font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(16, 0))
+        # A Spinbox with a list of values resets its variable to the first
+        # one (0) when it is created: put the chosen size back afterwards.
+        max_texture = self._max_texture()
         tk.Spinbox(glass_row, values=(0, 512, 1024, 2048, 4096, 8192), width=6, textvariable=self.max_texture_var,
                    bg="#1c1c1e", fg="#ffffff", buttonbackground="#2a2a2e", relief=tk.FLAT,
                    insertbackground="#ffffff").pack(side=tk.LEFT, padx=(8, 0))
+        self.max_texture_var.set(max_texture)
+        row += 1
+        _styled_checkbutton(
+            main_page, f"Write a .log file of the run into the output folder ({LOG_FILE_NAME})",
+            self.write_log_file_var
+        ).grid(row=row, column=0, columnspan=4, sticky="w", pady=2)
+        row += 1
+        cache_row = tk.Frame(main_page, bg=self.card_bg)
+        cache_row.grid(row=row, column=0, columnspan=4, sticky="we", pady=2)
+        _styled_checkbutton(cache_row, "Clean run (wipe cache + temp files first)", self.clean_run_var).pack(
+            side=tk.LEFT)
+        _styled_checkbutton(cache_row, "No cache this run", self.disable_cache_var).pack(side=tk.LEFT, padx=(14, 0))
+        RoundedButton(cache_row, text="Clear Cache Now", command=self.clear_cache_now,
+                      bg_color=self.card_bg, width=120, height=24).pack(side=tk.RIGHT)
+
+        # Advanced page
+        advanced = (
+            ("Static doors (disable proximity- and business-hours-triggered animations)", self.static_doors_var),
+            ("apt.dat: draw X-Plane runways with markings (for packages without runway models)",
+             self.native_runways_var),
+            ("apt.dat: paint the MSFS painted lines (if the draped models don't carry them)",
+             self.native_painted_lines_var),
+            ("apt.dat: flatten the terrain inside the airport, as MSFS does (if objects still float/sink)",
+             self.flatten_airport_var),
+            ("Approximate name-matching for unresolved base-game objects (heuristic)",
+             self.approximate_substitution_var),
+            ("Convert draped pavement/markings to real .pol DSF polygons (experimental)", self.pol_polygons_var),
+            ("Scan for TerrainVectorDb ground-polygon materials (diagnostic log only)",
+             self.scan_terrain_vectors_var),
+        )
+        for i, (text, var) in enumerate(advanced):
+            _styled_checkbutton(advanced_page, text, var).grid(row=i, column=0, columnspan=4, sticky="w", pady=2)
+
+        show_page("Main")
 
         # --- PROGRESS CARD ---
         prog_card = RoundedCard(left_col, bg_color=self.bg_dark, card_bg=self.card_bg, radius=12, height=210)
@@ -890,6 +937,8 @@ class ModularPythonConverterApp:
             native_painted_lines=self.native_painted_lines_var.get(),
             flatten_airport=self.flatten_airport_var.get(),
             remove_runway_clutter=self.remove_runway_clutter_var.get(),
+            exclusions=self.exclusions_var.get(),
+            write_log_file=self.write_log_file_var.get(),
             glass_opacity=max(1, min(100, self._glass_opacity())),
             max_texture=self._max_texture(),
         )
@@ -899,6 +948,11 @@ class ModularPythonConverterApp:
             self.log(f"Pipeline failed: {e}", "error")
         finally:
             self.root.after(0, lambda: self.start_btn.set_state("normal"))
+
+
+def _version_text():
+    v = app_version()
+    return f"v{v}" if v[:1].isdigit() else v
 
 
 class _GuiHooks(PipelineHooks):

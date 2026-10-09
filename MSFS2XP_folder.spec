@@ -15,6 +15,7 @@ from PyInstaller.utils.hooks import collect_all
 # crashes) without it configured.
 datas = [
     ('iconfin.ico', '.'),
+    ('packaging/VERSION', '.'),
     ('spb2xml/decompiler.py', 'spb2xml'),
     ('spb2xml/propdefs.py', 'spb2xml'),
     ('spb2xml/textdecode.py', 'spb2xml'),

@@ -17,6 +17,7 @@ import hashlib
 import logging
 import pickle
 import dataclasses
+import datetime
 from pathlib import Path
 from dataclasses import dataclass
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -536,64 +537,19 @@ def _rasterize_footprint_mask(xz, tris, cell_m, max_cells=2_000_000):
     return mask, x_min, z_min, _cell
 
 
-def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=0.5, cell_m=1.0):
-    """Exclusion rectangles that cover each converted object's OWN
-    footprint using close to the MINIMUM real area needed -- not one
-    shared airport-wide set, not one bounding box per object, and not even
-    one rectangle per convex-hull edge (that still over-covers a concave
-    or multi-armed footprint: the local axis-aligned box around one
-    diagonal hull edge, or the hull itself, both cover ground a concave
-    notch -- e.g. the gap between an X-shaped building's two arms -- never
-    actually occupies. A solid, simply-convex object like a plain square
-    building doesn't need 4 separate edge-hugging rects either; one
-    minimal rectangle already covers it exactly).
+def _placement_world_footprints(obj_dir, footprint_candidates):
+    """For each placement in footprint_candidates ([(generated_stems,
+    base_lat, base_lon, heading_deg), ...]): (base_lat, base_lon, pts,
+    tris) -- pts the placement's real geometry turned into the world frame
+    (metres east, metres south of its anchor), tris its triangles as
+    indices into pts (None when the sidecars carry no faces). Placements
+    with no sidecar or no geometry are skipped.
 
-    Rasterizes the object's REAL triangles (not just its hull) onto a
-    cell_m-resolution local grid (_rasterize_footprint_mask), then greedy-
-    rectangles the occupied mask -- the SAME scanline-run-then-extend-
-    while-identical decomposition already used for the road/rail and
-    airport-boundary-interior exclusions (_greedy_rects_from_mask): a run
-    of occupied cells on one grid line only grows into a taller rectangle
-    while the WHOLE run stays identically occupied on the next line, so
-    two parts that diverge (an X's arms) split into separate rectangles
-    right where they stop lining up, while a uniform strip merges into one
-    rectangle instead of fragmenting. Each grid rectangle's own corners are
-    rotated into real-world lat/lon FIRST (geo_transform.local_offset_to_
-    latlon, same convention used everywhere else in this pipeline), and
-    only THEN is the resulting real-world west/east/south/north box padded
-    by pad_m -- CONFIRMED REAL BUG this order fixes: X-Plane's exclusion-
-    zone format is itself always an axis-aligned lat/lon box (there's no
-    rotated-rectangle exclusion primitive to emit), so for any placement
-    heading that isn't a multiple of 90 degrees, the box has to grow
-    somewhat just to cover a rotated footprint's corners at all -- but
-    padding the LOCAL rectangle before that rotation let the pad amount
-    get diagonally amplified by the same rotation (up to ~1.4x at 45
-    degrees) on top of that unavoidable growth, silently covering more
-    real ground than pad_m the more an object was rotated. Padding the
-    already-rotated real-world box instead adds exactly pad_m of margin
-    in every cardinal direction regardless of heading.
-
-    footprint_candidates: [(generated_stems, base_lat, base_lon,
-    heading_deg), ...] -- one entry per real placement (base_lat/base_lon
-    are that placement's own already mid_x/mid_z-recentering-compensated
-    anchor, matching the local coordinate frame each generated stem's
-    .meshir.pkl sidecar was written in). Every named stem's sidecar (if
-    any) contributes its real local triangles to ONE shared raster per
-    placement -- objectwise, not per material sub-object, so a multi-part
-    building's footprint is the union of all its parts, not several
-    independently-hulled pieces.
-
-    Terrain-fit's own corrected copies aren't needed here: rigid shift and
-    draped Y-warps don't materially change an object's own XZ footprint,
-    and reading the pre-terrain-fit original avoids a dependency on
-    terrain-fit having already run for this stem.
-
-    Skips stems with no sidecar or no real geometry (lights-only/animated-
-    only objects have no footprint to exclude). Returns [] if nothing
-    produced a usable footprint at all, so the caller can fall back to
-    the airport-wide shape.
-    """
-    rects = []
+    All of a placement's stems (per-material siblings of one model) form
+    one footprint. Stray vertices (flag_stray_vertices) are dropped with
+    every triangle using them, so one corrupt point far from the model
+    doesn't stretch its footprint. Terrain-fit copies aren't needed: they
+    don't change an object's footprint."""
     sidecar_cache = {}
     for generated_stems, base_lat, base_lon, heading_deg in footprint_candidates:
         xz_parts = []
@@ -609,21 +565,6 @@ def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=0.5, cell_m
                     try:
                         ir = mesh_ir.load(sidecar)
                         if len(ir.positions):
-                            # CONFIRMED REAL BUG this filter fixes: a
-                            # single corrupted/leftover stray vertex (the
-                            # exact same failure mode compute_file_
-                            # flatness_and_reference's own max_radius had
-                            # to guard against, see flag_stray_vertices'
-                            # docstring) sitting hundreds of meters outside
-                            # a primitive's real bulk extent used to blow
-                            # up this stem's own x_min/x_max/z_min/z_max
-                            # unfiltered -- producing a wildly oversized
-                            # exclusion rectangle for that one object while
-                            # every other, unaffected object stayed tight.
-                            # Whole triangles referencing a stray vertex
-                            # are dropped (not just the vertex itself, to
-                            # keep index buffers consistent), same as
-                            # convert()'s own equivalent filter.
                             not_stray = ~flag_stray_vertices(ir.positions)
                             if not_stray.all():
                                 positions = ir.positions[:, [0, 2]]
@@ -631,15 +572,9 @@ def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=0.5, cell_m
                             elif not_stray.any():
                                 positions = ir.positions[not_stray][:, [0, 2]]
                                 new_index = np.cumsum(not_stray) - 1
-                                kept_tris = []
-                                for tri in np.asarray(ir.indices, dtype=np.int64).reshape(-1, 3):
-                                    a, b, c = tri
-                                    if not_stray[a] and not_stray[b] and not_stray[c]:
-                                        kept_tris.append((new_index[a], new_index[b], new_index[c]))
-                                indices = [i for tri in kept_tris for i in tri]
-                            # else: every vertex flagged stray (degenerate
-                            # sidecar) -- positions/indices stay None,
-                            # same as "no usable geometry" below.
+                                tri = np.asarray(ir.indices, dtype=np.int64).reshape(-1, 3)
+                                keep = not_stray[tri].all(axis=1)
+                                indices = new_index[tri[keep]].ravel()
                     except (OSError, EOFError, pickle.UnpicklingError):
                         positions, indices = None, None
                 sidecar_cache[stem] = (positions, indices)
@@ -653,39 +588,239 @@ def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=0.5, cell_m
             continue
         xz = np.concatenate(xz_parts, axis=0)
         tris = np.concatenate(tri_parts, axis=0) if tri_parts else None
-
-        # Rasterize in the WORLD frame (x east, z south: the object's local
-        # x/z turned by its heading), not the object's own: an exclusion is
-        # always a north/south/east/west box, so rectangles cut in the
-        # rotated local frame each had to grow into the box around their
-        # rotated corners -- at 45 degrees every thin strip became a
-        # diamond twice its own area, so a rotated building's exclusion
-        # came out far larger than an unrotated one's.
+        # The object's local x/z turned by its heading: x east, z south.
+        # Exclusions are always north/south/east/west boxes, so footprints
+        # are cut into rectangles in this frame, never the object's own.
         h = math.radians(heading_deg)
         cos_h, sin_h = math.cos(h), math.sin(h)
         world = np.column_stack((xz[:, 0] * cos_h - xz[:, 1] * sin_h,
                                  xz[:, 0] * sin_h + xz[:, 1] * cos_h))
+        yield base_lat, base_lon, world, tris
 
-        mask, x_min, z_min, cell = _rasterize_footprint_mask(world, tris, cell_m)
-        if mask is None:
-            continue
-        grid_rects = _greedy_rects_from_mask(mask)
-        if not grid_rects:
-            continue
 
-        m_lat, m_lon = geo_transform.metres_per_degree(base_lat)
-        for (gy0, gx0, gy1, gx1) in grid_rects:
-            east0 = x_min + gx0 * cell - pad_m
-            east1 = x_min + (gx1 + 1) * cell + pad_m
-            south0 = z_min + gy0 * cell - pad_m
-            south1 = z_min + (gy1 + 1) * cell + pad_m
-            rects.append({
-                "west": base_lon + east0 / m_lon,
-                "east": base_lon + east1 / m_lon,
-                "south": base_lat - south1 / m_lat,
-                "north": base_lat - south0 / m_lat,
-            })
+def _close_mask(mask, r):
+    """Morphological closing by `r` cells: gaps up to ~2r cells wide
+    between occupied areas are filled, outer edges stay where they were."""
+    if r <= 0:
+        return mask
+    return ~_dilate_mask(~_dilate_mask(mask, r), r)
+
+
+def _merge_rects_with_slack(rects, mask, slack):
+    """Fewer, larger rectangles: two touching rectangles are replaced by
+    the box around both whenever at most `slack` of that box is empty
+    (False in mask). Rectangles are (row0, col0, row1, col1) inclusive."""
+    if slack <= 0 or len(rects) < 2:
+        return rects
+    ny, nx = mask.shape
+    sat = np.zeros((ny + 1, nx + 1), dtype=np.int64)
+    sat[1:, 1:] = mask.astype(np.int64).cumsum(axis=0).cumsum(axis=1)
+
+    def filled(y0, x0, y1, x1):
+        return int(sat[y1 + 1, x1 + 1] - sat[y0, x1 + 1] - sat[y1 + 1, x0] + sat[y0, x0])
+
+    bucket = 16
+    rects = list(rects)
+    changed = True
+    while changed:
+        changed = False
+        alive = [True] * len(rects)
+        cells = {}
+        for i, (y0, x0, y1, x1) in enumerate(rects):
+            for by in range(y0 // bucket, y1 // bucket + 1):
+                for bx in range(x0 // bucket, x1 // bucket + 1):
+                    cells.setdefault((by, bx), []).append(i)
+        for i in range(len(rects)):
+            if not alive[i]:
+                continue
+            y0, x0, y1, x1 = rects[i]
+            near = set()
+            for by in range(max(y0 - 1, 0) // bucket, (y1 + 1) // bucket + 1):
+                for bx in range(max(x0 - 1, 0) // bucket, (x1 + 1) // bucket + 1):
+                    near.update(cells.get((by, bx), ()))
+            for j in sorted(near):
+                if j == i or not alive[j]:
+                    continue
+                s0, t0, s1, t1 = rects[j]
+                if s0 > y1 + 1 or y0 > s1 + 1 or t0 > x1 + 1 or x0 > t1 + 1:
+                    continue
+                b = (min(y0, s0), min(x0, t0), max(y1, s1), max(x1, t1))
+                area = (b[2] - b[0] + 1) * (b[3] - b[1] + 1)
+                if area - filled(*b) <= slack * area:
+                    y0, x0, y1, x1 = rects[i] = b
+                    alive[j] = False
+                    changed = True
+        rects = [r for r, a in zip(rects, alive) if a]
     return rects
+
+
+def _join_aligned_rects(rects):
+    """Joins rectangles (row0, col0, row1, col1) that continue each other
+    exactly -- same rows and touching columns, or the reverse -- as happens
+    where a block boundary cut one area in two."""
+    rects = list(rects)
+    changed = True
+    while changed:
+        changed = False
+        for along_rows in (True, False):
+            groups = {}
+            for r in rects:
+                groups.setdefault((r[0], r[2]) if along_rows else (r[1], r[3]), []).append(r)
+            out = []
+            for group in groups.values():
+                group.sort(key=lambda r: r[1] if along_rows else r[0])
+                cur = group[0]
+                for r in group[1:]:
+                    if (r[1] == cur[3] + 1) if along_rows else (r[0] == cur[2] + 1):
+                        cur = (min(cur[0], r[0]), min(cur[1], r[1]), max(cur[2], r[2]), max(cur[3], r[3]))
+                        changed = True
+                    else:
+                        out.append(cur)
+                        cur = r
+                out.append(cur)
+            rects = out
+    return rects
+
+
+# How the pipeline draws exclusions (see _per_object_exclusion_rects):
+# 3 m cells, gaps up to ~10 m between objects closed, objects under 3 m
+# across left out, rectangles joined where at most 30% of the joined box
+# is empty ground, 1 m margin. On a busy test airport this cut ~9000
+# rectangles to ~320 for ~3% more excluded area.
+EXCLUSION_GRID = {"cell_m": 3.0, "close_m": 10.0, "min_side_m": 3.0, "slack": 0.3, "pad_m": 1.0}
+_EXCLUSION_BLOCK_CELLS = 1024
+_EXCLUSION_MAX_RECT_BLOCKS = 64  # a package rectangle larger than this many blocks is kept as given
+
+
+def _per_object_exclusion_rects(obj_dir, footprint_candidates, pad_m=0.5, cell_m=1.0,
+                                close_m=0.0, min_side_m=0.0, slack=0.0, extra_rects=(), stats=None):
+    """Exclusion rectangles covering the ground the converted objects
+    stand on, and not the empty ground between them.
+
+    Every placement's real triangles (_placement_world_footprints) are
+    drawn into one shared grid of cell_m cells in the world frame, along
+    with extra_rects (the package's own exclusion boxes, {west, east,
+    south, north}). Then:
+
+    - close_m: gaps up to about this wide between neighbouring objects
+      are filled (morphological closing), so a cluster of buildings and
+      their props becomes one area instead of dozens of islands;
+    - min_side_m: objects smaller than this across (a bench, a sign) are
+      not drawn on their own: default scenery around them doesn't clash;
+    - the area is cut into north/south/east/west rectangles
+      (_greedy_rects_from_mask), and touching rectangles are joined where
+      the box around them is at most `slack` empty ground
+      (_merge_rects_with_slack);
+    - each rectangle is padded by pad_m on every side, in the world frame,
+      so the margin is the same at any heading.
+
+    The grid is processed in blocks of _EXCLUSION_BLOCK_CELLS cells, so a
+    scenery with objects kilometres apart doesn't allocate one huge grid.
+    Returns [] when nothing has a usable footprint. stats (a dict), if
+    given, gets "footprints": how many placements were drawn.
+    """
+    shapes = []
+    found = 0
+    for base_lat, base_lon, world, tris in _placement_world_footprints(obj_dir, footprint_candidates):
+        found += 1
+        span = world.max(axis=0) - world.min(axis=0)
+        if min_side_m > 0 and float(span.max()) < min_side_m:
+            continue
+        shapes.append((base_lat, base_lon, world, tris))
+    if stats is not None:
+        stats["footprints"] = found
+    boxes = []
+    for r in extra_rects or ():
+        w, e = sorted((r["west"], r["east"]))
+        s, n = sorted((r["south"], r["north"]))
+        if e > w and n > s:
+            boxes.append((w, e, s, n))
+    if not shapes and not boxes:
+        return []
+
+    if shapes:
+        ref_lat, ref_lon = shapes[0][0], shapes[0][1]
+    else:
+        ref_lat, ref_lon = (boxes[0][2] + boxes[0][3]) / 2.0, (boxes[0][0] + boxes[0][1]) / 2.0
+    m_lat, m_lon = geo_transform.metres_per_degree(ref_lat)
+    m_lon = max(m_lon, 1e-6)
+
+    # Everything in one frame: metres east and metres south of ref.
+    items = []  # (kind, data, e0, e1, s0, s1)
+    for base_lat, base_lon, world, tris in shapes:
+        pts = world + np.array([(base_lon - ref_lon) * m_lon, -(base_lat - ref_lat) * m_lat])
+        lo, hi = pts.min(axis=0), pts.max(axis=0)
+        items.append(("mesh", (pts, tris), lo[0], hi[0], lo[1], hi[1]))
+    kept_as_given = []
+    block_m = cell_m * _EXCLUSION_BLOCK_CELLS
+    for w, e, s, n in boxes:
+        e0, e1 = (w - ref_lon) * m_lon, (e - ref_lon) * m_lon
+        s0, s1 = -(n - ref_lat) * m_lat, -(s - ref_lat) * m_lat
+        if (e1 - e0) * (s1 - s0) > _EXCLUSION_MAX_RECT_BLOCKS * block_m * block_m:
+            kept_as_given.append({"west": w, "east": e, "south": s, "north": n})
+            continue
+        items.append(("box", None, e0, e1, s0, s1))
+
+    close_r = int(math.ceil(close_m / (2.0 * cell_m))) if close_m > 0 else 0
+    margin = close_r + 2
+    margin_m = margin * cell_m
+    blocks = {}
+    for idx, (_kind, _data, e0, e1, s0, s1) in enumerate(items):
+        for bx in range(int(math.floor((e0 - margin_m) / block_m)), int(math.floor((e1 + margin_m) / block_m)) + 1):
+            for by in range(int(math.floor((s0 - margin_m) / block_m)), int(math.floor((s1 + margin_m) / block_m)) + 1):
+                blocks.setdefault((by, bx), []).append(idx)
+
+    n_cells = _EXCLUSION_BLOCK_CELLS
+    grid_rects = []
+    for (by, bx), members in sorted(blocks.items()):
+        origin_e = bx * block_m - margin_m
+        origin_s = by * block_m - margin_m
+        size = n_cells + 2 * margin
+        img = Image.new("L", (size, size), 0)
+        draw = ImageDraw.Draw(img)
+        for idx in members:
+            kind, data, e0, e1, s0, s1 = items[idx]
+            if kind == "box":
+                draw.rectangle([(e0 - origin_e) / cell_m, (s0 - origin_s) / cell_m,
+                                (e1 - origin_e) / cell_m, (s1 - origin_s) / cell_m], fill=255)
+                continue
+            pts, tris = data
+            px = (pts[:, 0] - origin_e) / cell_m
+            py = (pts[:, 1] - origin_s) / cell_m
+            if tris is not None and len(tris):
+                for a, b, c in tris:
+                    draw.polygon([(px[a], py[a]), (px[b], py[b]), (px[c], py[c])], fill=255)
+            else:
+                hull = _convex_hull_2d(np.column_stack((px, py)))
+                if len(hull) >= 3:
+                    draw.polygon([(float(x), float(y)) for x, y in hull], fill=255)
+                elif len(hull) == 2:
+                    draw.line([tuple(map(float, hull[0])), tuple(map(float, hull[1]))], fill=255, width=1)
+                elif len(hull) == 1:
+                    draw.point([tuple(map(float, hull[0]))], fill=255)
+        mask = np.asarray(img, dtype=bool)
+        if not mask.any():
+            continue
+        mask = _close_mask(mask, close_r)[margin:margin + n_cells, margin:margin + n_cells]
+        if not mask.any():
+            continue
+        rects = _merge_rects_with_slack(_greedy_rects_from_mask(mask), mask, slack)
+        row0, col0 = by * n_cells, bx * n_cells
+        grid_rects.extend((y0 + row0, x0 + col0, y1 + row0, x1 + col0) for y0, x0, y1, x1 in rects)
+
+    out = []
+    for gy0, gx0, gy1, gx1 in _join_aligned_rects(grid_rects):
+        east0 = gx0 * cell_m - pad_m
+        east1 = (gx1 + 1) * cell_m + pad_m
+        south0 = gy0 * cell_m - pad_m
+        south1 = (gy1 + 1) * cell_m + pad_m
+        out.append({
+            "west": ref_lon + east0 / m_lon,
+            "east": ref_lon + east1 / m_lon,
+            "south": ref_lat - south1 / m_lat,
+            "north": ref_lat - south0 / m_lat,
+        })
+    return out + kept_as_given
 
 
 # Vulkan Format Mapping for KTX2
@@ -1659,6 +1794,8 @@ def clean_previous_output(out, log):
         for name in ("apt.dat", "apt.dat.xp11"):
             if (nav / name).is_file():
                 _rm(nav / name)
+    if (out / LOG_FILE_NAME).is_file():
+        _rm(out / LOG_FILE_NAME)
     for folder, suffixes in _GENERATED_OUTPUT.items():
         d = out / folder
         if d.is_dir():
@@ -1708,6 +1845,12 @@ class PipelineOptions:
     # Flat objects on the airport ground: drop small ones, drape large
     # sheets (runway_clutter.py).
     remove_runway_clutter: bool = True
+    # Exclusion zones (default X-Plane objects, forests, roads... removed
+    # under the converted scenery). Off: none at all are written, not even
+    # the package's own.
+    exclusions: bool = True
+    # Also write the run's log to a .log file in the output folder.
+    write_log_file: bool = False
 
 
 class PipelineHooks:
@@ -1736,12 +1879,78 @@ class PipelineHooks:
         by default (nothing to show it on)."""
 
 
+LOG_FILE_NAME = "msfs2xp_conversion.log"
+
+
+class _LogFileHooks:
+    """Passes everything on to `inner` and keeps a copy of every log line,
+    for PipelineOptions.write_log_file."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.lines = []
+
+    def log(self, text, level="info"):
+        stamp = datetime.datetime.now().strftime("%H:%M:%S")
+        tag = "" if level in ("info", "header") else f"[{level}] "
+        self.lines.append(f"{stamp} {tag}{text}")
+        self.inner.log(text, level)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def write(self, path, opts):
+        head = [f"MSFS2XP {app_version()} -- conversion log, "
+                f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                f"Package: {opts.pkg_dir}", f"Output:  {opts.out_dir}",
+                "Options: " + ", ".join(f"{f.name}={getattr(opts, f.name)!r}"
+                                        for f in dataclasses.fields(opts)
+                                        if f.name not in ("pkg_dir", "out_dir")), ""]
+        Path(path).write_text("\n".join(head + self.lines) + "\n", encoding="utf-8")
+
+
+def app_version():
+    """The release version (packaging/VERSION, bundled next to the code in
+    the packaged builds), or "dev" when it can't be found."""
+    roots = [Path(__file__).resolve().parent]
+    if getattr(sys, "_MEIPASS", None):
+        roots.insert(0, Path(sys._MEIPASS))
+    for root in roots:
+        for candidate in (root / "VERSION", root / "packaging" / "VERSION"):
+            try:
+                text = candidate.read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+            if text:
+                return text
+    return "dev"
+
+
 def run_pipeline(opts, hooks):
-    pkg = Path(opts.pkg_dir)
     out = Path(opts.out_dir)
     if out.name.lower() in ("custom scenery", "global scenery") or out.resolve() == Path(out.resolve().anchor):
         raise ValueError(f"Output folder {out} must be a scenery pack folder of its own "
                          f"(e.g. 'Custom Scenery/My Airport'), not {out.name or out}.")
+    if not opts.write_log_file:
+        return _run_pipeline(opts, hooks)
+    file_hooks = _LogFileHooks(hooks)
+    try:
+        return _run_pipeline(opts, file_hooks)
+    except Exception as e:
+        file_hooks.lines.append(f"[error] Pipeline failed: {e}")
+        raise
+    finally:
+        try:
+            out.mkdir(parents=True, exist_ok=True)
+            file_hooks.write(out / LOG_FILE_NAME, opts)
+            hooks.log(f"Log written to {out / LOG_FILE_NAME}", "info")
+        except OSError as e:
+            hooks.log(f"Could not write the log file ({e}).", "warning")
+
+
+def _run_pipeline(opts, hooks):
+    pkg = Path(opts.pkg_dir)
+    out = Path(opts.out_dir)
 
     if opts.clean_run:
         hooks.log("Clean run requested -- wiping disk cache and leftover temp files first...", "info")
@@ -2949,11 +3158,22 @@ def run_pipeline(opts, hooks):
         # available for any placement). Roads/rail (net/str) are
         # deliberately NOT part of this -- those stay airport-wide,
         # built separately below.
-        shaped_rects = _per_object_exclusion_rects(obj_dir, _footprint_exclusion_candidates)
+        # The package's own exclusion rectangles (the areas its author
+        # cleared: a block around a terminal, a car park) are drawn into
+        # the same grid as the footprints, so overlapping and touching
+        # ones become one area instead of a pile of separate rectangles.
+        _package_rects = list(all_exclusions)
+        _footprint_stats = {}
+        shaped_rects = _per_object_exclusion_rects(
+            obj_dir, _footprint_exclusion_candidates if opts.exclusions else [],
+            extra_rects=_package_rects if opts.exclusions else (),
+            stats=_footprint_stats, **EXCLUSION_GRID)
+        if not _footprint_stats.get("footprints"):
+            shaped_rects = []  # nothing of our own: use the airport-wide fallbacks below
         _used_per_object_rects = bool(shaped_rects)
         _footprint_rect_count = len(shaped_rects)
-        kept_package_rects = 0
-        if not shaped_rects:
+        kept_package_rects = len(_package_rects) if _used_per_object_rects else 0
+        if not shaped_rects and opts.exclusions:
             if boundary_points:
                 shaped_rects.extend(_polygon_interior_exclusion_rects(boundary_points))
             if placements_bbox is not None and all_lats:
@@ -2973,7 +3193,11 @@ def run_pipeline(opts, hooks):
         # nothing shape-aware could be built at all (no apt.dat match
         # AND no placements), so at least something suppresses
         # default objects.
-        if shaped_rects or reference_bbox:
+        if not opts.exclusions:
+            hooks.log("Exclusion zones are switched off: no default X-Plane scenery is removed "
+                      "under the converted objects (not even the package's own exclusions).", "info")
+            all_exclusions = []
+        elif shaped_rects or reference_bbox:
             superseded_count = len(all_exclusions)
             if shaped_rects:
                 # net/str deliberately excluded here even when shaped_rects
@@ -2986,27 +3210,17 @@ def run_pipeline(opts, hooks):
                 _non_road_categories = tuple(k for k in dsf_compiler.EXCLUSION_PROP_KEYS.keys() if k not in ("net", "str"))
                 for r in shaped_rects:
                     r["categories"] = _non_road_categories
-                # Per-object footprints only cover what this package
-                # places; the package's own exclusion rectangles are the
-                # areas its author cleared (a block around a terminal, a
-                # car park, a landscaped strip) and are often larger, so
-                # with footprints they are kept, not superseded.
+                # The package's own rectangles are already part of the
+                # footprint grid above: kept, not superseded.
                 if _used_per_object_rects:
-                    for r in all_exclusions:
-                        w, e = sorted((r["west"], r["east"]))
-                        so, n = sorted((r["south"], r["north"]))
-                        if e > w and n > so:
-                            shaped_rects.append({"west": w, "east": e, "south": so, "north": n,
-                                                 "categories": _non_road_categories})
-                    kept_package_rects = len(shaped_rects) - _footprint_rect_count
-                    superseded_count = len(all_exclusions) - kept_package_rects
-                all_exclusions = shaped_rects
+                    superseded_count = 0
+                all_exclusions = list(shaped_rects)
             else:
                 reference_bbox["categories"] = tuple(dsf_compiler.EXCLUSION_PROP_KEYS.keys())
                 all_exclusions = [reference_bbox]
             source_parts = []
             if _used_per_object_rects:
-                source_parts.append("each converted object's own footprint edges (per-object, +0.5m each)")
+                source_parts.append("the converted objects' footprints, merged where they lie close together")
                 if kept_package_rects:
                     source_parts.append(f"the package's own {kept_package_rects} exclusion rectangle(s)")
             else:
@@ -3097,7 +3311,7 @@ def run_pipeline(opts, hooks):
             )
             hooks.log(f"Routed {len(all_exclusions)} exclusion rectangles into "
                      f"{len(tile_exclusions)} DSF tile(s).{note}", "info")
-        else:
+        elif opts.exclusions:
             hooks.log(
                 "No exclusion rectangles at all this run -- neither the package's own BGL "
                 "Exclusion sections nor the airport-boundary match (see above, if any) "

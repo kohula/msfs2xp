@@ -34,6 +34,7 @@ mkdir -p "$BUILD" "$ROOT/dist"
     --name MSFS2XP \
     --distpath "$BUILD/pyinstaller-dist" --workpath "$BUILD/pyinstaller-work" --specpath "$BUILD" \
     --add-data "$ROOT/iconfin.ico:." \
+    --add-data "$ROOT/packaging/VERSION:." \
     --add-data "$ROOT/spb2xml/decompiler.py:spb2xml" \
     --add-data "$ROOT/spb2xml/propdefs.py:spb2xml" \
     --add-data "$ROOT/spb2xml/textdecode.py:spb2xml" \

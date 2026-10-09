@@ -474,5 +474,115 @@ class TestPerObjectExclusionRectsConcave(unittest.TestCase):
             self.assertTrue(_covers(rects, 47.0 - 8.0 / m_per_deg_lat, 19.0 + 1.0 / m_per_deg_lon))
 
 
+class TestMergedExclusionRects(unittest.TestCase):
+    """Fewer exclusion zones: footprints share one grid, so objects close
+    together become one area, tiny props add nothing, and a staircase
+    along a rotated building is joined into fewer rectangles."""
+
+    M_LAT = 111320.0
+    M_LON = 111320.0 * math.cos(math.radians(47.0))
+
+    def _box(self, obj_dir, stem, w, l):
+        ir = mesh_ir.MeshIR(
+            name=stem,
+            positions=np.array([[-w / 2, 0, -l / 2], [w / 2, 0, -l / 2], [w / 2, 0, l / 2], [-w / 2, 0, l / 2]],
+                               dtype=np.float64),
+            indices=np.array([0, 1, 2, 0, 2, 3], dtype=np.int64),
+        )
+        mesh_ir.save(ir, mesh_ir.sidecar_path_for(obj_dir / f"{stem}.obj"))
+
+    def _at(self, east, north):
+        return 47.0 + north / self.M_LAT, 19.0 + east / self.M_LON
+
+    def _cand(self, stem, east, north, hdg=0.0):
+        lat, lon = self._at(east, north)
+        return ([stem], lat, lon, hdg)
+
+    def test_neighbouring_buildings_become_one_area(self):
+        with tempfile.TemporaryDirectory() as td:
+            obj_dir = Path(td)
+            self._box(obj_dir, "Hall", 20.0, 20.0)
+            cands = [self._cand("Hall", 0.0, 0.0), self._cand("Hall", 26.0, 0.0)]  # 6 m apart
+            apart = main._per_object_exclusion_rects(obj_dir, cands)
+            merged = main._per_object_exclusion_rects(obj_dir, cands, **main.EXCLUSION_GRID)
+            self.assertEqual(len(merged), 1)
+            self.assertFalse(_covers(apart, *self._at(13.0, 0.0)))
+            self.assertTrue(_covers(merged, *self._at(13.0, 0.0)))
+
+    def test_far_apart_buildings_stay_apart(self):
+        with tempfile.TemporaryDirectory() as td:
+            obj_dir = Path(td)
+            self._box(obj_dir, "Hall", 20.0, 20.0)
+            cands = [self._cand("Hall", 0.0, 0.0), self._cand("Hall", 60.0, 0.0)]  # 40 m apart
+            rects = main._per_object_exclusion_rects(obj_dir, cands, **main.EXCLUSION_GRID)
+            self.assertEqual(len(rects), 2)
+            self.assertFalse(_covers(rects, *self._at(30.0, 0.0)))
+
+    def test_tiny_props_add_no_zones_of_their_own(self):
+        with tempfile.TemporaryDirectory() as td:
+            obj_dir = Path(td)
+            self._box(obj_dir, "Hall", 20.0, 20.0)
+            self._box(obj_dir, "Bench", 1.5, 0.5)
+            cands = [self._cand("Hall", 0.0, 0.0)] + [self._cand("Bench", 100.0 + 10 * i, 50.0) for i in range(20)]
+            stats = {}
+            rects = main._per_object_exclusion_rects(obj_dir, cands, stats=stats, **main.EXCLUSION_GRID)
+            self.assertEqual(len(rects), 1)
+            self.assertEqual(stats["footprints"], 21)
+
+    def test_rotated_building_needs_few_rectangles_and_stays_close(self):
+        with tempfile.TemporaryDirectory() as td:
+            obj_dir = Path(td)
+            self._box(obj_dir, "Terminal", 120.0, 25.0)
+            cands = [self._cand("Terminal", 0.0, 0.0, 33.0)]
+            fine = main._per_object_exclusion_rects(obj_dir, cands)
+            rects = main._per_object_exclusion_rects(obj_dir, cands, **main.EXCLUSION_GRID)
+            self.assertLess(len(rects), len(fine) / 3)
+            def area(rs):
+                return sum((r["north"] - r["south"]) * self.M_LAT * (r["east"] - r["west"]) * self.M_LON for r in rs)
+            # 13 rectangles instead of ~125, and hardly more ground
+            self.assertLess(area(rects), 1.05 * area(fine))
+            # the building itself is covered end to end
+            h = math.radians(33.0)
+            for t in (-55.0, 0.0, 55.0):
+                self.assertTrue(_covers(rects, *self._at(t * math.cos(h), -t * math.sin(h))))
+
+    def test_package_rectangles_join_the_footprints(self):
+        with tempfile.TemporaryDirectory() as td:
+            obj_dir = Path(td)
+            self._box(obj_dir, "Hall", 20.0, 20.0)
+            (s, w), (n, e) = self._at(-10.0, -10.0), self._at(40.0, 10.0)
+            package = [{"west": w, "east": e, "south": s, "north": n}]
+            rects = main._per_object_exclusion_rects(obj_dir, [self._cand("Hall", 0.0, 0.0)],
+                                                     extra_rects=package, **main.EXCLUSION_GRID)
+            self.assertEqual(len(rects), 1)
+            self.assertTrue(_covers(rects, *self._at(35.0, 0.0)))
+
+    def test_an_area_across_a_block_boundary_is_one_rectangle(self):
+        with tempfile.TemporaryDirectory() as td:
+            obj_dir = Path(td)
+            self._box(obj_dir, "Shed", 30.0, 9.0)
+            block_m = main._EXCLUSION_BLOCK_CELLS * 3.0
+            # straddles the boundary between the first and second block east
+            cands = [self._cand("Shed", 0.0, 0.0), self._cand("Shed", block_m - 1.5, 0.0)]
+            rects = main._per_object_exclusion_rects(obj_dir, cands, **main.EXCLUSION_GRID)
+            self.assertEqual(len(rects), 2)
+            self.assertTrue(_covers(rects, *self._at(block_m - 14.0, 0.0)))
+            self.assertTrue(_covers(rects, *self._at(block_m + 11.0, 0.0)))
+
+
+class TestGreedyRectsFromMask(unittest.TestCase):
+    def test_runs_and_extensions(self):
+        mask = np.zeros((6, 8), dtype=bool)
+        mask[1:4, 1:5] = True
+        mask[3:6, 6:8] = True
+        mask[0, 7] = True
+        rects = main._greedy_rects_from_mask(mask)
+        cover = np.zeros_like(mask)
+        for y0, x0, y1, x1 in rects:
+            cover[y0:y1 + 1, x0:x1 + 1] = True
+        self.assertTrue((cover == mask).all())
+        self.assertEqual(len(rects), 3)
+
+
 if __name__ == "__main__":
     unittest.main()
