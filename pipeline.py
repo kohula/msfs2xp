@@ -1794,8 +1794,9 @@ def clean_previous_output(out, log):
         for name in ("apt.dat", "apt.dat.xp11"):
             if (nav / name).is_file():
                 _rm(nav / name)
-    if (out / LOG_FILE_NAME).is_file():
-        _rm(out / LOG_FILE_NAME)
+    for name in (LOG_FILE_NAME, NO_AUTODGS_NAME):
+        if (out / name).is_file():
+            _rm(out / name)
     for folder, suffixes in _GENERATED_OUTPUT.items():
         d = out / folder
         if d.is_dir():
@@ -1851,6 +1852,9 @@ class PipelineOptions:
     exclusions: bool = True
     # Also write the run's log to a .log file in the output folder.
     write_log_file: bool = False
+    # An empty no_autodgs.txt in the pack: the openSAM plugin then adds no
+    # docking guidance or marshaller of its own at the airport.
+    no_autodgs: bool = True
 
 
 class PipelineHooks:
@@ -1880,6 +1884,7 @@ class PipelineHooks:
 
 
 LOG_FILE_NAME = "msfs2xp_conversion.log"
+NO_AUTODGS_NAME = "no_autodgs.txt"
 
 
 class _LogFileHooks:
@@ -3442,6 +3447,18 @@ def _run_pipeline(opts, hooks):
         else:
             hooks.log("No decodable airport record in the package and no matching default airport -- "
                       "skipping apt.dat generation.", "warning")
+
+        if wrote_apt and opts.no_autodgs:
+            # openSAM (the jetway/docking-guidance plugin) leaves a pack's
+            # airports alone when this empty file sits in the pack: no
+            # docking display or marshaller of its own on top of the ones
+            # the MSFS scenery already draws, and no automatic docking.
+            try:
+                (out / NO_AUTODGS_NAME).write_text("", encoding="utf-8")
+                hooks.log(f"Wrote an empty {NO_AUTODGS_NAME}: openSAM adds no docking guidance of its own "
+                          f"at this airport.", "info")
+            except OSError as e:
+                hooks.log(f"(couldn't write {NO_AUTODGS_NAME}: {e})", "warning")
 
         if wrote_apt:
             # Both apt.dat and an apt.dat.xp11 copy (jetway rows stripped)

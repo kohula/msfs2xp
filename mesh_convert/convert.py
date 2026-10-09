@@ -31,6 +31,7 @@ except ImportError:
 import gpu_accel
 from .draped_ranking import draped_layer_offset, rank_draped_layer_offsets
 from . import mesh_ir as mesh_ir_module
+from . import autoplay
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +125,7 @@ class MatBuilder:
         self.normal_texture_name = None
         self.vertex_blocks = {}
         self.base_color_factor = (255, 255, 255, 255)
+        self.stated_metallic = 0.0
         self.alpha_mode = "OPAQUE"
         self.alpha_cutoff = 0.5
         self.double_sided = False
@@ -145,6 +147,7 @@ class MatBuilder:
         self.anim_pivot = None  # (px, py, pz) world-space rotation pivot, or None
         self.anim_rotate = None  # (axis_x, axis_y, axis_z) or None
         self.anim_rotate_keys = None  # [(dataref_value, angle_degrees), ...] or None
+        self.anim_loop = None  # seconds: a self-playing clip repeating on the sim clock
         self.light_level_dataref = None  # (v1, v2, dataref) or None
         self.proximity_dataref = None  # custom plugin-driven dataref name, or None
 
@@ -340,6 +343,32 @@ def _rest_open_rotation_values(values):
     v0 = np.asarray(values[0][:4], dtype=np.float64)
     v1 = np.asarray(values[-1][:4], dtype=np.float64)
     return (v0, v1) if abs(v0[3]) >= abs(v1[3]) else (v1, v0)
+
+
+def _set_autoplay_keys(builder, node_anim, frame, anim_ancestor_world, apply_global_rotation):
+    """Animation keys for a part MSFS moves by itself (autoplay.py): the
+    clip's own key table on the sim clock, looping with the clip's length.
+    frame turns the animated node's parent frame into the output frame.
+    Leaves the builder still (no keys) when a rotation doesn't keep to one
+    axis."""
+    times = np.asarray(node_anim["times"], dtype=np.float64)
+    values = np.asarray(node_anim["values"], dtype=np.float64)
+    if node_anim["path"] == "rotation":
+        rest_quat, _ = _rest_open_rotation_values(values)
+        turn = autoplay.rotation_turn(rest_quat, values[:, :4], frame)
+        if turn is None:
+            return
+        axis, angles = turn
+        builder.anim_rotate = axis
+        builder.anim_rotate_keys = autoplay.thin_turn(times, angles)
+        pivot = (anim_ancestor_world @ np.array([0.0, 0.0, 0.0, 1.0]))[:3]
+        pivot = apply_global_rotation(pivot.reshape(1, 3))[0]
+        builder.anim_pivot = (float(pivot[0]), float(pivot[1]), float(pivot[2]))
+    else:
+        offsets = (values[:, :3] - values[0, :3]) @ frame.T
+        builder.anim_translate_keys = autoplay.thin_slide(times, offsets)
+    builder.anim_dataref = autoplay.AUTOPLAY_DATAREF
+    builder.anim_loop = float(node_anim["clip_length"])
 
 
 def node_local_matrix_at_rest(node, node_idx, gltf_animations):
@@ -1288,7 +1317,8 @@ def find_normal_texture(mat):
     return None
 
 
-def make_normal_metalness(textures_dir, normal_name, comp_name, metallic_factor, roughness_factor):
+def make_normal_metalness(textures_dir, normal_name, comp_name, metallic_factor, roughness_factor,
+                          normal_scale=1.0):
     """X-Plane normal map in its NORMAL_METALNESS layout: red/green the
     tangent-space normal (as the MSFS normal map has it), blue the
     metalness, alpha the smoothness (white = smooth). glTF/MSFS keep
@@ -1297,12 +1327,20 @@ def make_normal_metalness(textures_dir, normal_name, comp_name, metallic_factor,
 
     Without this, X-Plane read the normal map's blue as the normal's Z and
     its alpha as shininess -- an RGB normal map has alpha 255, so every
-    normal-mapped surface was drawn fully glossy. Returns the new texture
-    name, or `normal_name` unchanged if it can't be read."""
+    normal-mapped surface was drawn fully glossy.
+
+    normal_scale is the material's normalTexture "scale": MSFS draws the
+    map's bumps that much weaker (or stronger). X-Plane has no such
+    factor, so it is baked into red/green; at full strength the faint
+    ripples of a glass pane meant to be all but flat showed as blotches.
+    Returns the new texture name, or `normal_name` unchanged if it can't
+    be read."""
     textures_dir = Path(textures_dir)
     comp_tag = f"_{Path(comp_name).stem}" if comp_name else ""
     m8, r8 = int(round(metallic_factor * 255)), int(round(roughness_factor * 255))
-    new_name = f"{Path(normal_name).stem}{comp_tag}_m{m8}r{r8}_nm.png"
+    normal_scale = max(0.0, min(float(normal_scale), 4.0))
+    scale_tag = "" if abs(normal_scale - 1.0) < 1e-3 else f"s{int(round(normal_scale * 100))}"
+    new_name = f"{Path(normal_name).stem}{comp_tag}_m{m8}r{r8}{scale_tag}_nm.png"
     new_path = textures_dir / new_name
     with _TEXTURE_LOCK:
         if new_path.exists() and new_path.stat().st_size > 100 and _is_valid_image(new_path):
@@ -1313,8 +1351,12 @@ def make_normal_metalness(textures_dir, normal_name, comp_name, metallic_factor,
         return normal_name
     h, w = normal.shape[:2]
     out = np.empty((h, w, 4), dtype=np.uint8)
-    out[..., 0] = normal[..., 0]
-    out[..., 1] = normal[..., 1]
+    if scale_tag:
+        xy = (normal[..., :2].astype(np.float32) - 127.5) * normal_scale + 127.5
+        out[..., :2] = np.clip(np.rint(xy), 0, 255).astype(np.uint8)
+    else:
+        out[..., 0] = normal[..., 0]
+        out[..., 1] = normal[..., 1]
     comp = None
     if comp_name:
         try:
@@ -1337,6 +1379,21 @@ def make_normal_metalness(textures_dir, normal_name, comp_name, metallic_factor,
         return new_name
     except Exception:
         return normal_name
+
+
+UNTEXTURED_METAL_DARKENING = 0.65
+
+
+def untextured_swatch_color(rgba, metallic):
+    """The flat colour an untextured material is drawn with. MSFS shades a
+    metal surface by what it reflects, so bare metal reads as a darker
+    version of its colour; X-Plane, with no normal map to carry the
+    metalness, draws the colour as plain paint -- white metal panels came
+    out glowing white. Metal is darkened accordingly (white fully metal ->
+    dark grey)."""
+    r, g, b, a = rgba
+    k = 1.0 - UNTEXTURED_METAL_DARKENING * max(0.0, min(1.0, metallic))
+    return (int(round(r * k)), int(round(g * k)), int(round(b * k)), a)
 
 
 def find_emissive_texture(mat):
@@ -1402,10 +1459,14 @@ def read_gltf_animations(gltf, buffers):
     animate one property per node in practice); "times" are in the glTF
     clip's own seconds, "values" are raw translation vec3 / rotation quat
     (xyzw) samples straight from the accessor, unnormalized/un-transformed.
+    "clip" is the animation's name (what the model XML refers to) and
+    "clip_length" its last key time over all its channels.
     """
     result = {}
     for anim in gltf.get("animations", []):
         samplers = anim.get("samplers", [])
+        clip_name = str(anim.get("name", "") or "")
+        clip_end = None
         for channel in anim.get("channels", []):
             target = channel.get("target", {})
             node_idx = target.get("node")
@@ -1423,7 +1484,12 @@ def read_gltf_animations(gltf, buffers):
                 continue
             if len(times) < 2:
                 continue
-            result[node_idx] = {"path": path, "times": times, "values": values}
+            result[node_idx] = {"path": path, "times": times, "values": values, "clip": clip_name}
+            clip_end = max(clip_end or 0.0, float(times.max()))
+        # every channel of a clip loops with the clip's full length
+        for entry in result.values():
+            if entry.get("clip") == clip_name and clip_end is not None and "clip_length" not in entry:
+                entry["clip_length"] = clip_end
     return result
 
 
@@ -1984,6 +2050,11 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
     # folder, LOD suffix stripped); anything else falls through untouched.
     xml_path = glb_path.parent / f"{re.sub(r'_LOD[0-9]+$', '', glb_path.stem)}.xml"
     time_behavior = parse_time_behavior(xml_path)
+    try:
+        autoplay_clips = autoplay.autoplay_animation_names(
+            xml_path.read_text(encoding="utf-8", errors="replace")) if xml_path.exists() else set()
+    except OSError:
+        autoplay_clips = set()
     if disable_proximity_animation and time_behavior is not None and time_behavior[0] in ("proximity", "business_hours"):
         # Both "proximity" and "business_hours" drive mesh rotation/
         # translation (a door/barrier/gate) -- never ATTR_light_level/
@@ -2237,7 +2308,12 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
 
     light_entries = []
     for node_idx, node in enumerate(gltf.get("nodes", [])):
-        macro_light = node.get("extensions", {}).get("ASOBO_macro_light")
+        _node_ext = node.get("extensions", {})
+        # ASOBO_advanced_light is MSFS 2024's light (same colour/intensity/
+        # day-night fields, its cone given as inner/outer angles).
+        macro_light = _node_ext.get("ASOBO_macro_light")
+        if macro_light is None:
+            macro_light = _node_ext.get("ASOBO_advanced_light")
         khr_light_ref = node.get("extensions", {}).get("KHR_lights_punctual", {}).get("light") if macro_light is None else None
         khr_light = khr_light_defs[khr_light_ref] if khr_light_ref is not None and 0 <= khr_light_ref < len(khr_light_defs) else None
         if macro_light is None and khr_light is None:
@@ -2246,22 +2322,24 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
         pos_world = (base_world @ np.array([0.0, 0.0, 0.0, 1.0]))[:3]
         pos_world = apply_global_rotation(pos_world.reshape(1, 3))[0]
 
-        # Aim direction: glTF's convention (which ASOBO's own node-based
-        # lights follow too, based on the tested taxi-edge-light fixture)
-        # is that a light points down its local -Z axis by default: rotate
-        # that by the node's own world rotation (scale stripped out) plus
-        # the file's global pitch/yaw/roll.
+        # Aim direction: a KHR_lights_punctual light points down its node's
+        # local -Z axis (glTF's convention), but MSFS's own lights shine
+        # along +Z -- a lamp-post spot is a node turned ~110 degrees about
+        # X so that its +Z points down at the ground; read as -Z it aimed
+        # at the sky. Rotated by the node's world rotation (scale stripped
+        # out) plus the file's global pitch/yaw/roll.
         rot3 = base_world[:3, :3]
         col_norms = np.linalg.norm(rot3, axis=0)
         col_norms[col_norms == 0] = 1.0
-        dir_world = (rot3 / col_norms) @ np.array([0.0, 0.0, -1.0])
+        local_axis = (0.0, 0.0, 1.0) if macro_light is not None else (0.0, 0.0, -1.0)
+        dir_world = (rot3 / col_norms) @ np.array(local_axis)
         dir_world = apply_global_rotation(dir_world.reshape(1, 3))[0]
         dir_norm = np.linalg.norm(dir_world)
         dir_world = dir_world / dir_norm if dir_norm > 1e-9 else np.array([0.0, 1.0, 0.0])
 
         if macro_light is not None:
             color = macro_light.get("color", [1.0, 1.0, 1.0])
-            cone_angle = macro_light.get("cone_angle", 360.0)
+            cone_angle = macro_light.get("cone_angle", macro_light.get("outer_cone_angle", 360.0))
             intensity = macro_light.get("intensity", 1.0)
             day_night_cycle = bool(macro_light.get("day_night_cycle", False))
             flash_frequency = macro_light.get("flash_frequency", 0.0) or 0.0
@@ -2386,12 +2464,18 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                 # flickers uniformly wherever it's used, so no per-node
                 # split is needed there).
                 animated_node_id = None
-                if time_behavior is not None and anim_ancestor_idx is not None:
+                node_is_autoplay = False
+                if anim_ancestor_idx is not None:
                     node_anim = gltf_animations.get(anim_ancestor_idx)
                     if node_anim is not None and len(node_anim["values"]) >= 2:
-                        kind = time_behavior[0]
+                        kind = time_behavior[0] if time_behavior is not None else None
                         if kind in ("business_hours", "proximity") and node_anim["path"] in ("translation", "rotation"):
                             animated_node_id = node_idx
+                        elif (node_anim.get("clip", "").lower() in autoplay_clips
+                              and node_anim.get("clip_length", 0.0) > 0.0):
+                            # moves by itself in MSFS (radar, fan): see autoplay.py
+                            animated_node_id = node_idx
+                            node_is_autoplay = True
 
                 # Reverted to the file-wide verdict (see the removed
                 # per-node classification's own replacement comment above)
@@ -2414,6 +2498,10 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                             int(max(0, min(1, color[2])) * 255),
                             int(max(0, min(1, color[3])) * 255) if len(color) > 3 else 255
                         )
+
+                        # Metalness the material states itself (the glTF
+                        # default of 1.0 would make every surface metal).
+                        builder.stated_metallic = float(pbr.get("metallicFactor", 0.0) or 0.0)
 
                         builder.alpha_mode = mat.get("alphaMode", "OPAQUE")
                         builder.alpha_cutoff = mat.get("alphaCutoff", 0.5)
@@ -2749,7 +2837,8 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                                     _metal = float(_pbr.get("metallicFactor", 1.0 if comp_name else 0.0))
                                     _rough = float(_pbr.get("roughnessFactor", 1.0 if comp_name else 0.5))
                                     builder.normal_texture_name = make_normal_metalness(
-                                        textures_dir, normal_name, comp_name, _metal, _rough)
+                                        textures_dir, normal_name, comp_name, _metal, _rough,
+                                        normal_scale=float(normal_tex.get("scale", 1.0) or 0.0))
                                     builder.normal_metalness = builder.normal_texture_name != normal_name
 
                         if not builder.texture_name:
@@ -2925,7 +3014,10 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                             # this is computed once here rather than
                             # duplicated per animation kind (translation vs
                             # rotation).
-                            if time_behavior[0] == "business_hours":
+                            if node_is_autoplay:
+                                _set_autoplay_keys(builder, node_anim, global_rot_matrix @ parent_rot_n,
+                                                   anim_ancestor_world, apply_global_rotation)
+                            elif time_behavior[0] == "business_hours":
                                 open_start, open_end = time_behavior[1], time_behavior[2]
                                 builder.anim_dataref = "sim/time/local_time_sec"
                                 schedule_times = [
@@ -2950,7 +3042,9 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                                 schedule_times = [0.0, 1.0]
                                 schedule_values = [0.0, 1.0]
 
-                            if node_anim["path"] == "translation":
+                            if node_is_autoplay:
+                                pass
+                            elif node_anim["path"] == "translation":
                                 delta_local = np.asarray(values[-1][:3], dtype=np.float64) - np.asarray(values[0][:3], dtype=np.float64)
                                 delta_dir = parent_rot_n @ delta_local
                                 delta_world = apply_global_rotation(delta_dir.reshape(1, 3))[0]
@@ -3515,28 +3609,23 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
             # as "not transparent". Go straight to the flat-color swatch,
             # which is built from this builder's own (already alpha-
             # adjusted, e.g. by the is_glass override) base_color_factor.
-            needs_own_alpha = builder.alpha_mode == "BLEND"
-            if image_cache and not needs_own_alpha:
-                builder.texture_name = list(image_cache.values())[0]
-            else:
-                existing_pngs = [
-                    p.name for p in textures_dir.glob("*.png")
-                    if not p.name.endswith("_default.png")
-                ] if not needs_own_alpha else []
-                if existing_pngs:
-                    builder.texture_name = existing_pngs[0]
-                else:
-                    fallback_name = f"{model_name}_{builder.name}_default.png"
-                    fallback_path = textures_dir / fallback_name
+            #
+            # The same holds for an opaque material: MSFS draws an
+            # untextured material in its own flat colour, so it gets that
+            # swatch too, rather than another material's texture (which
+            # put an unrelated image on plain painted panels).
+            fallback_name = f"{model_name}_{builder.name}_default.png"
+            fallback_path = textures_dir / fallback_name
+            swatch = untextured_swatch_color(builder.base_color_factor, builder.stated_metallic)
 
-                    with _TEXTURE_LOCK:
-                        if not (fallback_path.exists() and _is_valid_image(fallback_path)):
-                            img = Image.new("RGBA", (2, 2), builder.base_color_factor)
-                            temp_path = fallback_path.with_name(f"{fallback_path.name}.tmp_{_unique_suffix()}")
-                            img.save(str(temp_path), "PNG")
-                            _atomic_replace(temp_path, fallback_path)
+            with _TEXTURE_LOCK:
+                if not (fallback_path.exists() and _is_valid_image(fallback_path)):
+                    img = Image.new("RGBA", (2, 2), swatch)
+                    temp_path = fallback_path.with_name(f"{fallback_path.name}.tmp_{_unique_suffix()}")
+                    img.save(str(temp_path), "PNG")
+                    _atomic_replace(temp_path, fallback_path)
 
-                    builder.texture_name = fallback_name
+            builder.texture_name = fallback_name
 
         obj_path = objects_dir / f"{model_name}_{builder.name}.obj"
         num_verts = len(builder.vertices)
@@ -3707,10 +3796,14 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
             if has_anim:
                 f.write("ANIM_begin\n")
 
+            # Looping clips are keyed in seconds of sim time: finer steps.
+            key_fmt = ".2f" if builder.anim_loop is None else ".4f"
+            loop_line = f"ANIM_keyframe_loop {builder.anim_loop:.4f}\n" if builder.anim_loop else ""
             if builder.anim_translate_keys:
                 f.write(f"ANIM_trans_begin {builder.anim_dataref}\n")
                 for t, dx, dy, dz in builder.anim_translate_keys:
-                    f.write(f"ANIM_trans_key {t:.2f} {dx:.5f} {dy:.5f} {dz:.5f}\n")
+                    f.write(f"ANIM_trans_key {t:{key_fmt}} {dx:.5f} {dy:.5f} {dz:.5f}\n")
+                f.write(loop_line)
                 f.write("ANIM_trans_end\n")
 
             if builder.anim_rotate:
@@ -3725,7 +3818,8 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                 ax, ay, az = builder.anim_rotate
                 f.write(f"ANIM_rotate_begin {ax:.5f} {ay:.5f} {az:.5f} {builder.anim_dataref}\n")
                 for t, angle_deg in builder.anim_rotate_keys:
-                    f.write(f"ANIM_rotate_key {t:.2f} {angle_deg:.5f}\n")
+                    f.write(f"ANIM_rotate_key {t:{key_fmt}} {angle_deg:.5f}\n")
+                f.write(loop_line)
                 f.write("ANIM_rotate_end\n")
 
             f.write(f"TRIS 0 {num_indices}\n")

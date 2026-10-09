@@ -52,6 +52,9 @@ def build_parser():
                         "stay under the converted scenery")
     p.add_argument("--log-file", action="store_true",
                    help=f"also write the run's log to {LOG_FILE_NAME} in the output folder")
+    p.add_argument("--opensam-dgs", action="store_true",
+                   help="don't write no_autodgs.txt: let the openSAM plugin add its own docking "
+                        "guidance at the airport")
     p.add_argument("--version", action="version", version=f"MSFS2XP {app_version()}")
     return p
 
@@ -79,6 +82,7 @@ def main(argv=None):
         remove_runway_clutter=not a.keep_runway_objects,
         exclusions=not a.no_exclusions,
         write_log_file=a.log_file,
+        no_autodgs=not a.opensam_dgs,
     )
     run_pipeline(opts, PipelineHooks())
     return 0

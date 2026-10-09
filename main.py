@@ -377,6 +377,7 @@ class ModularPythonConverterApp:
         self.remove_runway_clutter_var = tk.BooleanVar(value=True)
         self.exclusions_var = tk.BooleanVar(value=True)
         self.write_log_file_var = tk.BooleanVar(value=False)
+        self.no_autodgs_var = tk.BooleanVar(value=True)
         # How opaque blended MSFS glass is drawn (MSFS glass relies on
         # reflections X-Plane doesn't draw, so its own alpha is near zero).
         self.glass_opacity_var = tk.IntVar(value=50)
@@ -556,6 +557,7 @@ class ModularPythonConverterApp:
                     self.remove_runway_clutter_var.set(data.get("remove_runway_clutter", True))
                     self.exclusions_var.set(data.get("exclusions", True))
                     self.write_log_file_var.set(data.get("write_log_file", False))
+                    self.no_autodgs_var.set(data.get("no_autodgs", True))
                     self.glass_opacity_var.set(int(data.get("glass_opacity", 50)))
                     self.max_texture_var.set(int(data.get("max_texture", 2048)))
                     geom = data.get("geometry")
@@ -585,6 +587,7 @@ class ModularPythonConverterApp:
                     "remove_runway_clutter": self.remove_runway_clutter_var.get(),
                     "exclusions": self.exclusions_var.get(),
                     "write_log_file": self.write_log_file_var.get(),
+                    "no_autodgs": self.no_autodgs_var.get(),
                     "glass_opacity": self._glass_opacity(),
                     "max_texture": self._max_texture(),
                     "geometry": self.root.geometry()
@@ -773,6 +776,8 @@ class ModularPythonConverterApp:
              self.native_painted_lines_var),
             ("apt.dat: flatten the terrain inside the airport, as MSFS does (if objects still float/sink)",
              self.flatten_airport_var),
+            ("openSAM: no docking guidance of its own at this airport (writes no_autodgs.txt)",
+             self.no_autodgs_var),
             ("Approximate name-matching for unresolved base-game objects (heuristic)",
              self.approximate_substitution_var),
             ("Convert draped pavement/markings to real .pol DSF polygons (experimental)", self.pol_polygons_var),
@@ -939,6 +944,7 @@ class ModularPythonConverterApp:
             remove_runway_clutter=self.remove_runway_clutter_var.get(),
             exclusions=self.exclusions_var.get(),
             write_log_file=self.write_log_file_var.get(),
+            no_autodgs=self.no_autodgs_var.get(),
             glass_opacity=max(1, min(100, self._glass_opacity())),
             max_texture=self._max_texture(),
         )

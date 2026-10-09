@@ -14,13 +14,15 @@ from gltf_builder import GltfBuilder, flat_quad  # noqa: E402
 import mesh_convert
 
 
-def _convert(with_comp, factors=None):
+def _convert(with_comp, factors=None, normal_scale=None):
     b = GltfBuilder()
     base = b.add_texture(b.add_image_data_uri((180, 180, 180, 255)))
     normal = b.add_texture(b.add_image_data_uri((100, 150, 255, 255)))
     mat = b.add_material("Wall", base_color_texture_index=base, alpha_mode="OPAQUE")
     m = b._materials[mat]
     m["normalTexture"] = {"index": normal}
+    if normal_scale is not None:
+        m["normalTexture"]["scale"] = normal_scale
     if with_comp:
         comp = b.add_texture(b.add_image_data_uri((255, 64, 200, 255)))  # AO, roughness 64, metal 200
         m["pbrMetallicRoughness"]["metallicRoughnessTexture"] = {"index": comp}
@@ -54,6 +56,15 @@ class TestNormalMetalness(unittest.TestCase):
         self.assertEqual(px[2], 0, "no metal unless the material says so")
         _, px = _convert(False, {"metallicFactor": 1.0, "roughnessFactor": 0.2})
         self.assertEqual(px[2:], (255, 255 - 51))
+
+
+    def test_normal_scale_weakens_the_bumps(self):
+        """normalTexture.scale 0.2 (a glass pane's faint ripple): red/green
+        move a fifth of the way from flat (127.5) to the map's values."""
+        _, px = _convert(True, normal_scale=0.2)
+        self.assertEqual(px[:2], (round(127.5 + (100 - 127.5) * 0.2), round(127.5 + (150 - 127.5) * 0.2)))
+        _, px = _convert(True, normal_scale=1.0)
+        self.assertEqual(px[:2], (100, 150))
 
 
 if __name__ == "__main__":
