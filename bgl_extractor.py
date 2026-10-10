@@ -1581,6 +1581,8 @@ def extract_spb_placements(spb_path: Path, airport_lat: float, airport_lon: floa
                 # drop the now-redundant raw container placements so
                 # they don't get re-reported as unresolved
                 "container_guid": container_guid_hex,
+                # every object of one placed container: one rigid build
+                "group": f"{container_guid_hex}@{anchor_lat:.7f},{anchor_lon:.7f}",
                 "source": f"SPB-SimPropContainer{' (Fallback)' if used_fallback else ''}"
             })
         except Exception as e:

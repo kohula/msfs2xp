@@ -309,5 +309,87 @@ class TestBuildingParts(unittest.TestCase):
             self.assertEqual(self.wing["name"], "wing_tfit_k")
 
 
+class TestRigidContainers(unittest.TestCase):
+    """Objects of one placed container keep their MSFS heights relative to
+    each other: one ground level per cluster, no fit of their own."""
+
+    def tearDown(self):
+        terrain_dem._dem_cache.clear()
+        terrain_dem._mesh_cache.clear()
+
+    def _cand(self, stem, lat, lon, agl, group="c1", draped=False):
+        entry = {"name": f"{stem}_tfit_k", "agl": agl}
+        return {"group_key": ((stem,), lat, lon, 0.0, False), "abs_lat": lat, "abs_lon": lon, "hdg": 0.0,
+                "agl": agl, "height_offset": agl, "rigid_group": group,
+                "stem_entries": {stem: (entry, True, draped, "applied_vertical_shift")}}
+
+    def test_one_level_for_the_container(self):
+        with tempfile.TemporaryDirectory() as td:
+            xp = Path(td) / "XPlane"
+            TestPropsOnHostFloors._sloped(None, xp)
+            o_lat, o_lon = 47.5, 8.5
+            cands = [self._cand("floor", o_lat, o_lon, 0.0)]
+            for i, (stem, east, agl) in enumerate((("pillar", 20.0, 0.0), ("seat", -20.0, 4.0),
+                                                   ("glass", 35.0, 1.0))):
+                lat, lon = local_offset_to_latlon(o_lat, o_lon, 0.0, east, 0.0)
+                cands.append(self._cand(stem, lat, lon, agl))
+            self.assertEqual(pipeline._level_rigid_groups(cands, xp), (1, 4))
+            tops = []
+            for c in cands:
+                (entry, *_), = c["stem_entries"].values()
+                stem, = c["stem_entries"]
+                self.assertEqual(entry["name"], stem)
+                g = terrain_dem.get_elevation(xp, c["abs_lat"], c["abs_lon"])
+                tops.append(g + entry["agl"] - c["agl"])
+                self.assertTrue(c["grouped"])
+            # every object stands on one level, whatever the slope under it
+            for t in tops[1:]:
+                self.assertAlmostEqual(t, tops[0], places=6)
+
+    def test_far_apart_objects_are_separate_builds(self):
+        with tempfile.TemporaryDirectory() as td:
+            xp = Path(td) / "XPlane"
+            TestPropsOnHostFloors._sloped(None, xp)
+            lat, lon = local_offset_to_latlon(47.5, 8.5, 0.0, pipeline.RIGID_GROUP_LINK_M * 4, 0.0)
+            cands = [self._cand("a", 47.5, 8.5, 0.0), self._cand("b", lat, lon, 0.0)]
+            self.assertEqual(pipeline._level_rigid_groups(cands, xp), (2, 2))
+            # each on its own ground: nothing moved
+            for c in cands:
+                (entry, *_), = c["stem_entries"].values()
+                self.assertAlmostEqual(entry["agl"], 0.0, places=6)
+
+    def test_a_chain_over_a_hill_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as td:
+            xp = Path(td) / "XPlane"
+            TestPropsOnHostFloors._sloped(None, xp)
+            # posts 40 m apart up the slope: linked, but the ground climbs well past the limit
+            cands = []
+            for i in range(10):
+                lat, lon = local_offset_to_latlon(47.5, 8.5, 0.0, 40.0 * i, 0.0)
+                cands.append(self._cand(f"post{i}", lat, lon, 0.0))
+            self.assertEqual(pipeline._level_rigid_groups(cands, xp), (0, 0))
+            self.assertFalse(any(c.get("grouped") for c in cands))
+
+    def test_draped_parts_and_loose_objects_untouched(self):
+        with tempfile.TemporaryDirectory() as td:
+            xp = Path(td) / "XPlane"
+            TestPropsOnHostFloors._sloped(None, xp)
+            lat, lon = local_offset_to_latlon(47.5, 8.5, 0.0, 20.0, 0.0)
+            cands = [self._cand("a", 47.5, 8.5, 0.0), self._cand("decal", lat, lon, 0.0, draped=True),
+                     self._cand("tree", lat, lon, 0.0, group=None)]
+            pipeline._level_rigid_groups(cands, xp)
+            self.assertEqual(cands[1]["stem_entries"]["decal"][0], {"name": "decal_tfit_k", "agl": 0.0})
+            self.assertEqual(cands[2]["stem_entries"]["tree"][0], {"name": "tree_tfit_k", "agl": 0.0})
+            self.assertFalse(cands[2].get("grouped"))
+
+    def test_grouped_objects_are_not_parts_of_another_building(self):
+        with tempfile.TemporaryDirectory() as td:
+            xp, obj_dir = TestBuildingParts._setup(TestBuildingParts(), td)
+            cands = TestBuildingParts._cands(self, "negligible", "applied_vertical_shift")
+            cands[1]["grouped"] = True
+            self.assertEqual(pipeline._attach_parts_to_buildings(cands, obj_dir, xp), 0)
+            self.assertEqual(self.wing["name"], "wing_tfit_k")
+
+
 if __name__ == "__main__":
     unittest.main()

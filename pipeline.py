@@ -1098,7 +1098,7 @@ def _settle_flat_airport_objects(cands, obj_dir, dsf_tiles, ground):
     drop = set()
     dropped = draped = 0
     for c in cands:
-        if c.get("hosted"):
+        if c.get("hosted") or c.get("grouped"):
             continue
         stems = [s for s, (_e, _fa, is_draped, _r) in c["stem_entries"].items() if not is_draped]
         if not stems or not ground.contains(c["abs_lat"], c["abs_lon"]):
@@ -1187,6 +1187,79 @@ def _paths_on_terrain(dsf_tiles, obj_dir, xplane_root):
     return adjusted
 
 
+RIGID_GROUP_LINK_M = 50.0  # objects of one container this close chain into one rigid build
+RIGID_GROUP_MAX_SPREAD_M = 5.0  # ...unless the ground under them differs by more than this
+
+
+def _level_rigid_groups(cands, xplane_root):
+    """All objects of one placed SimPropContainer (a terminal: its shell,
+    glass, floors, pillars, seats, people) stand in MSFS on one level
+    ground, at exactly the heights the author gave them relative to each
+    other. Placed one by one on X-Plane's terrain and terrain-fitted one by
+    one, each lands on the ground under its own anchor, so floors, pillars,
+    windows and seats end up at slightly different heights.
+
+    Each container's objects -- split into clusters of objects within
+    RIGID_GROUP_LINK_M of each other, so a container spread over a whole
+    district isn't made one slab -- are placed as one rigid build: one
+    ground level for the cluster (the median of the terrain under its
+    objects), every object at its own MSFS height above that level, none
+    of them terrain-fitted on its own. Draped parts still drape. A cluster
+    whose ground varies by more than RIGID_GROUP_MAX_SPREAD_M (a row of
+    lamp posts up a hill road) is left to the per-object placement.
+    Returns (clusters, objects)."""
+    groups = {}
+    for c in cands:
+        if c.get("rigid_group"):
+            groups.setdefault(c["rigid_group"], []).append(c)
+    clusters = objects = 0
+    for members in groups.values():
+        # single-linkage clusters by anchor distance, via a grid
+        m_lat, m_lon = geo_transform.metres_per_degree(members[0]["abs_lat"])
+        pts = [((c["abs_lat"] - members[0]["abs_lat"]) * m_lat, (c["abs_lon"] - members[0]["abs_lon"]) * m_lon)
+               for c in members]
+        cell = {}
+        for k, (y, x) in enumerate(pts):
+            cell.setdefault((int(y // RIGID_GROUP_LINK_M), int(x // RIGID_GROUP_LINK_M)), []).append(k)
+        label = [-1] * len(members)
+        for start in range(len(members)):
+            if label[start] >= 0:
+                continue
+            label[start] = start
+            stack = [start]
+            while stack:
+                k = stack.pop()
+                gy, gx = int(pts[k][0] // RIGID_GROUP_LINK_M), int(pts[k][1] // RIGID_GROUP_LINK_M)
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        for n in cell.get((gy + dy, gx + dx), ()):
+                            if label[n] < 0 and math.dist(pts[k], pts[n]) <= RIGID_GROUP_LINK_M:
+                                label[n] = start
+                                stack.append(n)
+        by_label = {}
+        for k, lab in enumerate(label):
+            by_label.setdefault(lab, []).append(members[k])
+        for cluster in by_label.values():
+            grounds = [terrain_dem.get_elevation(xplane_root, c["abs_lat"], c["abs_lon"]) for c in cluster]
+            known = [g for g in grounds if g is not None]
+            if not known or max(known) - min(known) > RIGID_GROUP_MAX_SPREAD_M:
+                continue
+            level = float(np.median(known))
+            for c, g in zip(cluster, grounds):
+                if g is None:
+                    continue
+                for s, (entry, _fit, draped, _r) in c["stem_entries"].items():
+                    if draped:
+                        continue
+                    entry["name"] = s  # the model as authored, not a terrain-fitted copy
+                    entry["agl"] = c["agl"] + level - g
+                c["grouped"] = True
+                c["group_level"] = level
+                objects += 1
+            clusters += 1
+    return clusters, objects
+
+
 PART_MIN_SIDE_M = 4.0     # a building part is at least this long...
 PART_MIN_HEIGHT_M = 2.0   # ...and this tall (smaller things are props: host_floor)
 
@@ -1226,7 +1299,9 @@ def _attach_parts_to_buildings(cands, obj_dir, xplane_root):
         if ground is None:
             continue
         t = terrain_fit.get_cached_transform(c["group_key"])
-        if "applied_rigid_warp" in reasons:
+        if c.get("grouped"):
+            mode, level = "level", c["group_level"]
+        elif "applied_rigid_warp" in reasons:
             mode, level = "warp", None
         else:
             if c.get("linked_shift") is not None:
@@ -1242,7 +1317,7 @@ def _attach_parts_to_buildings(cands, obj_dir, xplane_root):
 
     attached = 0
     for i, c, stems, group, bbox, height in infos:
-        if c.get("hosted") or max(bbox[1] - bbox[0], bbox[3] - bbox[2]) < PART_MIN_SIDE_M \
+        if c.get("hosted") or c.get("grouped") or max(bbox[1] - bbox[0], bbox[3] - bbox[2]) < PART_MIN_SIDE_M \
                 or height < PART_MIN_HEIGHT_M:
             continue
         area = (bbox[1] - bbox[0]) * (bbox[3] - bbox[2])
@@ -1357,7 +1432,7 @@ def _place_props_on_host_floors(cands, obj_dir, xplane_root):
     used, moved = set(), 0
     for i, c in enumerate(cands):
         stems = rigid_stems(c)
-        if i in host_keys or not stems:
+        if i in host_keys or not stems or c.get("grouped"):
             continue
         bbox = host_floor.footprint(irs(stems))
         area = (bbox[1] - bbox[0]) * (bbox[3] - bbox[2]) if bbox else 0.0
@@ -2888,6 +2963,7 @@ def _run_pipeline(opts, hooks):
                     "mid_y": mid_y, "model": original_stem, "title": p.get("title") or "",
                     "source": p.get("source") or "", "is_agl": p.get("is_agl"), "alt": p.get("alt"),
                     "any_applied": group_any_applied, "stem_entries": _stem_entries,
+                    "rigid_group": p.get("group"),
                 })
 
                 # A model split into many sub-object files (walls/roof/
@@ -3058,6 +3134,11 @@ def _run_pipeline(opts, hooks):
         # on the X-Plane ground under each of them (see host_floor.py).
         if xplane_root is not None and _anchor_cluster_candidates:
             try:
+                _gc, _go = _level_rigid_groups(_anchor_cluster_candidates, xplane_root)
+                if _go:
+                    hooks.log(f"{_go} object(s) of {_gc} placed container cluster(s) set as rigid builds: one "
+                              f"ground level each, every object at its MSFS height, none fitted on its own.",
+                              "info")
                 _parts = _attach_parts_to_buildings(_anchor_cluster_candidates, obj_dir, xplane_root)
                 if _parts:
                     hooks.log(f"{_parts} building part(s) placed with their building's terrain fit, so the "
@@ -3574,6 +3655,21 @@ def _run_pipeline(opts, hooks):
                 "Exclusion sections nor the airport-boundary match (see above, if any) "
                 "produced any.",
                 "info")
+
+        # Terrain-fitted copies no placement ended up using (objects of a
+        # container set as one rigid build go back to the model as authored).
+        try:
+            _used = {e.get("name") for objs in dsf_tiles.values() for e in objs}
+            _dropped = 0
+            for _tf in list(obj_dir.glob("*_tfit*.obj")):
+                if _tf.stem not in _used:
+                    for _side in obj_dir.glob(f"{glob_escape(_tf.stem)}.*"):
+                        _side.unlink(missing_ok=True)
+                    _dropped += 1
+            if _dropped:
+                hooks.log(f"Removed {_dropped} terrain-fit copy(ies) no placement uses.", "info")
+        except OSError as e:
+            hooks.log(f"(couldn't remove unused terrain-fit copies: {e})", "warning")
 
         # Union with tile_exclusions' own keys, not just dsf_tiles': an
         # exclusion rectangle can (and, for anything but a small airport

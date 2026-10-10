@@ -1,24 +1,25 @@
-Test build: heights from the terrain X-Plane actually draws, building
-parts fitted together, vehicles driving their path on the terrain.
+Test build: buildings placed from one MSFS container stay together on
+sloped terrain.
 
 ## What's new
 
-- **Terrain heights from X-Plane's own mesh**: every height the converter
-  works out (terrain fit, props on floors, paths) now comes from the
-  terrain mesh X-Plane draws, not the elevation raster it was built from.
-  Between mesh points the drawn ground can sit well off the raster, which
-  left objects floating or sunk by small amounts here and there. Falls
-  back to the raster where a tile's mesh can't be read.
-- **Building parts fit together**: parts of one building placed as
-  separate objects (wings, interiors, facades) take the building's own
-  terrain correction -- warped with it, or raised/lowered to its level --
-  instead of each being corrected on its own.
-- **Moving vehicles**: wheels follow the vehicle along its path while
-  spinning (every animated level of a looping animation is kept), and
-  the path itself is raised or lowered onto the X-Plane ground at each
-  point.
-- **Below-zero geometry**: the negative-AGL experiment from 1.1.9 is
-  removed; models stand on their MSFS zero point, unchanged.
+- **Containers placed as one build**: everything an MSFS SimPropContainer
+  (.spb) places (a terminal's shell, glass, floors, pillars, seats,
+  people) used to be put on the X-Plane ground under each object's own
+  anchor and terrain-fitted on its own. On sloped terrain that moved each
+  piece by a different amount, so windows and interiors sat above the
+  floor on one side while pillars missed it on the other. Now the
+  objects of one container (those within 50 m of each other) share one
+  ground level, the middle of the terrain under them, and every object
+  keeps the height MSFS gives it relative to the others. They are not
+  terrain-fitted one by one any more. Ground decals still drape on the
+  terrain, and the terrain itself is never flattened. Where the ground
+  under such a group varies by more than 5 m (a row of lamp posts up a
+  hill), the objects are placed one by one as before.
+- Seats and other props of such a container keep their MSFS heights
+  instead of being moved onto a floor separately.
+- Terrain-fitted copies that no placement uses are removed from the
+  output.
 
 ## Windows
 
