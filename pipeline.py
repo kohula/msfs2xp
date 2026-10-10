@@ -1088,53 +1088,30 @@ def _attach_bare_lights(dsf_tiles, obj_dir, converted_stems_map):
     return lamp_posts.attach_to_lamps(dsf_tiles, load, bare)
 
 
-def _bake_negative_heights(dsf_tiles, obj_dir):
-    """Objects meant to reach below the ground -- a drain tile whose
-    channel and base sit under the surface, anything MSFS places below its
-    ground level -- end up with a negative height above ground (their
-    placement height, plus convert()'s recentering, which lifts every
-    model so its lowest point is y=0). X-Plane does not place an object
-    below the terrain from a negative AGL height: it stood on the ground
-    instead, its below-ground part showing above the pavement. So the
-    drop is baked into a copy of the geometry (`<stem>_dn<cm>`) placed at
-    height 0. Objects without a MeshIR sidecar (animated ones) keep the
-    AGL height. Returns (baked, left) placement counts."""
-    cache = {}
-    baked = left = 0
-    for objects in dsf_tiles.values():
-        for o in objects:
-            agl = o.get("agl", 0.0)
-            name = o.get("name")
-            if not name or agl > -0.01:
+def _sink_below_zero(cands, obj_dir):
+    """An object with geometry below its zero point (a drain channel, a
+    quay wall reaching into the water) is given that depth as a negative
+    height above the ground: the AGL height of each of its sub-objects goes
+    down by the lowest vertex y of the whole placement. The geometry itself
+    is not changed. Draped parts are left alone. Returns how many
+    placements were lowered."""
+    lowered = 0
+    for c in cands:
+        parts = [e for e, _fit, draped, _r in c["stem_entries"].values() if not draped and e.get("name")]
+        low = None
+        for e in parts:
+            ir = terrain_fit._load_ir(obj_dir, e["name"])
+            if ir is None or not len(ir.positions) or ir.draped:
                 continue
-            if name not in cache:
-                ir = None
-                sidecar = mesh_ir.sidecar_path_for(obj_dir / f"{name}.obj")
-                if sidecar.exists():
-                    try:
-                        ir = mesh_ir.load(sidecar)
-                    except (OSError, EOFError, pickle.UnpicklingError):
-                        ir = None
-                cache[name] = ir
-            ir = cache[name]
-            if ir is None or ir.draped or not (len(ir.positions) or ir.lights):
-                left += 1
-                continue
-            new = f"{name}_dn{int(round(-agl * 100))}"
-            path = obj_dir / f"{new}.obj"
-            if not path.exists():
-                pos = ir.positions.copy()
-                if len(pos):
-                    pos[:, 1] += agl
-                lowered = dataclasses.replace(
-                    ir, name=new, positions=pos,
-                    lights=[dataclasses.replace(lt, pos=(lt.pos[0], lt.pos[1] + agl, lt.pos[2])) for lt in ir.lights])
-                mesh_ir.write_obj8(lowered, path)
-                mesh_ir.save(lowered, mesh_ir.sidecar_path_for(path))
-            o["name"] = new
-            o["agl"] = 0.0
-            baked += 1
-    return baked, left
+            y = float(ir.positions[:, 1].min())
+            low = y if low is None else min(low, y)
+        if low is None or low > -0.01:
+            continue
+        for e in parts:
+            e["agl"] = e.get("agl", 0.0) + low
+        c["below_zero_m"] = low
+        lowered += 1
+    return lowered
 
 
 def _settle_flat_airport_objects(cands, obj_dir, dsf_tiles, ground):
@@ -1184,9 +1161,11 @@ def _settle_flat_airport_objects(cands, obj_dir, dsf_tiles, ground):
 
 
 def _place_props_on_host_floors(cands, obj_dir, xplane_root):
-    """host_floor.py: give every small placement standing on a large
-    building's floor the building's base level instead of the terrain under
-    it, and drop its own terrain fit (it now moves with the building).
+    """host_floor.py: every small placement standing on a large building's
+    floor is set on that floor as the building is actually placed -- its
+    terrain-fitted geometry (shifted, warped or lifted onto a skirt),
+    sampled right under the prop -- instead of the terrain under it, and
+    its own terrain fit is dropped (it moves with the building).
     cands: the placement loop's _anchor_cluster_candidates. Returns
     (buildings that hold props, placements moved)."""
     def rigid_stems(c):
@@ -1195,34 +1174,31 @@ def _place_props_on_host_floors(cands, obj_dir, xplane_root):
     def irs(stems):
         return [terrain_fit._load_ir(obj_dir, s) for s in stems]
 
-    hosts = []
+    hosts, host_agl = [], {}
     for i, c in enumerate(cands):
         stems = rigid_stems(c)
-        reasons = {c["stem_entries"][s][3] for s in stems}
-        # a per-vertex-warped building already follows the ground under it
-        if not stems or "applied_rigid_warp" in reasons:
+        if not stems:
             continue
         group = irs(stems)
         bbox = host_floor.footprint(group)
         if not host_floor.is_host_size(bbox, host_floor.height_of(group)):
             continue
-        cover = host_floor.horizontal_cover(group)
+        entries = [c["stem_entries"][s][0] for s in stems]
+        placed = [terrain_fit._load_ir(obj_dir, e["name"]) if e.get("name") and e["name"] != s else ir
+                  for s, e, ir in zip(stems, entries, group)]
+        if c.get("linked_shift") is not None:
+            # moved by a sibling's shift, not by a fitted copy of its own
+            placed = [None if ir is None else dataclasses.replace(
+                ir, positions=ir.positions + np.array([0.0, c["linked_shift"], 0.0])) for ir in group]
+        cover = host_floor.horizontal_cover(group, placed)
         if cover is None:
             continue
-        t = terrain_fit.get_cached_transform(c["group_key"])
-        ground = t.get("origin_elev") if t else None
-        if ground is None:
-            ground = terrain_dem.get_elevation(xplane_root, c["abs_lat"], c["abs_lon"])
+        ground = terrain_dem.get_elevation(xplane_root, c["abs_lat"], c["abs_lon"])
         if ground is None:
             continue
-        if c.get("linked_shift") is not None:
-            shift = c["linked_shift"]
-        elif reasons & {"applied_vertical_shift", "applied_skirt"} and t and t.get("vertical_shift") is not None:
-            shift = t["vertical_shift"]
-        else:
-            shift = 0.0
         hosts.append(host_floor.Host(i, c["abs_lat"], c["abs_lon"], c["hdg"], bbox, cover,
-                                     c["agl"], ground + shift))
+                                     c["agl"], ground))
+        host_agl[i] = entries[0].get("agl", c["agl"])
     if not hosts:
         return 0, 0
 
@@ -1238,10 +1214,15 @@ def _place_props_on_host_floors(cands, obj_dir, xplane_root):
         host = index.host_for(c["abs_lat"], c["abs_lon"], c["height_offset"], area)
         if host is None:
             continue
+        floor = host.floor_under(c["abs_lat"], c["abs_lon"], c["height_offset"])
         ground = terrain_dem.get_elevation(xplane_root, c["abs_lat"], c["abs_lon"])
-        if ground is None:
+        if floor is None or ground is None:
             continue
-        agl = c["agl"] + host.base - ground
+        modelled, placed_y = floor
+        # the floor where the building actually stands, plus however far
+        # above its modelled floor the prop was placed
+        floor_world = host.base + host_agl[host.key] + placed_y
+        agl = floor_world + (c["agl"] - (host.agl + modelled)) - ground
         for s in stems:
             entry = c["stem_entries"][s][0]
             entry["name"] = s
@@ -2951,17 +2932,15 @@ def _run_pipeline(opts, hooks):
             except Exception as e:
                 hooks.log(f"(couldn't attach separate lights to lamp posts: {e})", "warning")
 
-        # Negative heights (parts meant to be below the ground) are baked
-        # into the geometry: X-Plane won't sink an object below the
-        # terrain from its AGL height.
+        # Geometry below an object's zero point: that depth becomes a
+        # negative AGL height (_sink_below_zero); the geometry is unchanged.
         try:
-            _baked, _left = _bake_negative_heights(dsf_tiles, obj_dir)
-            if _baked or _left:
-                hooks.log(f"{_baked} placement(s) reaching below the ground lowered into the terrain"
-                          + (f" ({_left} animated one(s) left on their negative AGL height)" if _left else "")
-                          + ".", "info")
+            _sunk = _sink_below_zero(_anchor_cluster_candidates, obj_dir)
+            if _sunk:
+                hooks.log(f"{_sunk} placement(s) with geometry below their zero point placed that much "
+                          f"lower (negative AGL height).", "info")
         except Exception as e:
-            hooks.log(f"(couldn't lower below-ground objects: {e})", "warning")
+            hooks.log(f"(couldn't lower below-zero objects: {e})", "warning")
 
         try:
             _airport_alt = native_airport_layout.alt_m if native_airport_layout is not None else None

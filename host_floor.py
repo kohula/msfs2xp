@@ -37,10 +37,13 @@ _INDEX_DEG = 0.002  # host lookup grid, ~200 m
 
 class Cover:
     """A building's near-horizontal triangles (floors, roofs, ceilings) in
-    its own local metres, indexed by x/z."""
+    its own local metres, indexed by x/z. `placed` (optional, same shape)
+    holds the same triangles as the building is actually placed -- after
+    terrain fitting (shift, warp, skirt lift)."""
 
-    def __init__(self, tris):
+    def __init__(self, tris, placed=None):
         self.tris = tris  # (N, 3, 3) x/y/z
+        self.placed = placed if placed is not None and placed.shape == tris.shape else tris
         self.cells = {}
         xz = tris[:, :, [0, 2]]
         lo = np.floor(xz.min(axis=1) / _CELL_M).astype(int)
@@ -50,12 +53,14 @@ class Cover:
                 for cz in range(lo[i, 1], hi[i, 1] + 1):
                     self.cells.setdefault((cx, cz), []).append(i)
 
-    def heights_at(self, x, z):
-        """Local heights of the triangles over/under (x, z)."""
+    def heights_at(self, x, z, placed=False):
+        """Local heights of the triangles over/under (x, z) -- as modelled,
+        or (placed=True) as placed, in the same order."""
         idx = self.cells.get((int(math.floor(x / _CELL_M)), int(math.floor(z / _CELL_M))))
         if not idx:
             return np.zeros(0)
         t = self.tris[idx]
+        tp = self.placed[idx]
         ax, az = t[:, 0, 0], t[:, 0, 2]
         bx, bz = t[:, 1, 0], t[:, 1, 2]
         cx, cz = t[:, 2, 0], t[:, 2, 2]
@@ -67,30 +72,55 @@ class Cover:
         w3 = 1.0 - w1 - w2
         eps = -1e-9
         inside = ok & (w1 >= eps) & (w2 >= eps) & (w3 >= eps)
-        y = w1 * t[:, 0, 1] + w2 * t[:, 1, 1] + w3 * t[:, 2, 1]
+        src = tp if placed else t
+        y = w1 * src[:, 0, 1] + w2 * src[:, 1, 1] + w3 * src[:, 2, 1]
         return y[inside]
 
     def has_floor(self, x, z, y, tol=FLOOR_TOLERANCE_M):
         h = self.heights_at(x, z)
         return bool(len(h)) and bool(np.any(np.abs(h - y) <= tol))
 
+    def floor_at(self, x, z, y, tol=FLOOR_TOLERANCE_M):
+        """(modelled height, placed height) of the floor nearest level y
+        at (x, z), or None."""
+        h = self.heights_at(x, z)
+        if not len(h):
+            return None
+        k = int(np.argmin(np.abs(h - y)))
+        if abs(h[k] - y) > tol:
+            return None
+        return float(h[k]), float(self.heights_at(x, z, placed=True)[k])
 
-def horizontal_cover(irs):
+
+def horizontal_cover(irs, placed_irs=None):
     """Cover of the near-horizontal triangles of these MeshIRs (one
-    placement's rigid sub-objects, sharing one local frame), or None."""
-    parts = []
-    for ir in irs:
+    placement's rigid sub-objects, sharing one local frame), or None.
+    placed_irs: the same sub-objects as placed (terrain-fitted copies,
+    same order); a fitted copy keeps the original's triangles first (a
+    skirt only adds triangles after them)."""
+    parts, placed_parts = [], []
+    for k, ir in enumerate(irs):
         if ir is None or not len(ir.indices) or not len(ir.positions):
             continue
-        tri = ir.positions[np.asarray(ir.indices, dtype=np.int64).reshape(-1, 3)]
+        idx = np.asarray(ir.indices, dtype=np.int64).reshape(-1, 3)
+        tri = ir.positions[idx]
         n = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
         length = np.linalg.norm(n, axis=1)
         keep = (length > 1e-9) & (np.abs(n[:, 1]) >= _MIN_UP_NORMAL * np.maximum(length, 1e-12))
-        if np.any(keep):
-            parts.append(tri[keep])
+        if not np.any(keep):
+            continue
+        parts.append(tri[keep])
+        fitted = placed_irs[k] if placed_irs is not None and k < len(placed_irs) else None
+        ptri = tri
+        if fitted is not None and len(fitted.positions) >= len(ir.positions) \
+                and len(fitted.indices) >= len(ir.indices):
+            fidx = np.asarray(fitted.indices, dtype=np.int64).reshape(-1, 3)[:len(idx)]
+            if np.array_equal(fidx, idx):
+                ptri = fitted.positions[fidx]
+        placed_parts.append(ptri[keep])
     if not parts:
         return None
-    return Cover(np.concatenate(parts))
+    return Cover(np.concatenate(parts), np.concatenate(placed_parts))
 
 
 def footprint(irs):
@@ -117,6 +147,16 @@ class Host:
         self.base = base
         self.area = (bbox[1] - bbox[0]) * (bbox[3] - bbox[2])
         self.radius = max(math.hypot(x, z) for x in bbox[:2] for z in bbox[2:])
+
+    def floor_under(self, lat, lon, height_offset):
+        """(modelled, placed) local height of this building's floor under a
+        prop at (lat, lon) standing height_offset m above the ground, or
+        None."""
+        x, z = latlon_offset_to_local(self.lat, self.lon, self.hdg, lat, lon)
+        x0, x1, z0, z1 = self.bbox
+        if not (x0 <= x <= x1 and z0 <= z <= z1):
+            return None
+        return self.cover.floor_at(x, z, height_offset - self.agl)
 
     def holds(self, lat, lon, height_offset):
         """Does this building have a floor under (lat, lon) at the level a

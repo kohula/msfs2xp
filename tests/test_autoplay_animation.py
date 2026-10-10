@@ -98,5 +98,41 @@ class TestAutoplayConversion(unittest.TestCase):
         self.assertNotIn("ANIM_", text)
 
 
+class TestPathAnimation(unittest.TestCase):
+    def test_vehicle_on_a_path_moves_and_turns(self):
+        """One node with a translation and a rotation channel (a bus driving
+        a loop): both are written -- the move, then the turn about the bus's
+        own origin -- instead of only the first channel (which slid the bus
+        along the path without turning it)."""
+        b = GltfBuilder()
+        tex = b.add_texture(b.add_image_data_uri((180, 30, 30, 255)))
+        mat = b.add_material("Bus", base_color_texture_index=tex)
+        mesh = b.add_mesh([(-1.2, 0, -5), (1.2, 0, -5), (1.2, 3, 5), (-1.2, 3, 5)], [0, 1, 2, 0, 2, 3],
+                          normals=[(0, 0, -1)] * 4, uvs=[(0, 0)] * 4, material_index=mat)
+        node = b.add_node(mesh_index=mesh, name="Bus")
+        times = [i * 1.0 for i in range(9)]
+        a = b.add_animation(target_node=node, path="translation", times=times,
+                            values=[(20 * math.cos(math.radians(45 * i)), 0.0, 20 * math.sin(math.radians(45 * i)))
+                                    for i in range(9)])
+        b._animations[a]["name"] = "Bus_Path"
+        b._animations[a]["channels"].append({"sampler": 1, "target": {"node": node, "path": "rotation"}})
+        r_in = b.add_accessor(np.asarray(times, dtype=np.float32), 5126, "SCALAR")
+        r_out = b.add_accessor(np.asarray([_y_turn(-45.0 * i) for i in range(9)], dtype=np.float32), 5126, "VEC4")
+        b._animations[a]["samplers"].append({"input": r_in, "output": r_out})
+        td = Path(tempfile.mkdtemp())
+        (td / "bus_LOD00.glb").write_bytes(b.build())
+        (td / "bus.xml").write_text('<ModelInfo><Animation name="Bus_Path" typeParam="AutoPlay"/></ModelInfo>')
+        (td / "objects").mkdir()
+        (td / "textures").mkdir()
+        res = mesh_convert.convert(td / "bus_LOD00.glb", td / "objects", td / "textures", td / "textures",
+                                   "0.0", "180.0", "0.0")
+        text = "\n".join(p.read_text() for p in res)
+        self.assertIn("ANIM_trans_begin sim/time/total_running_time_sec", text)
+        self.assertIn("ANIM_rotate_begin", text)
+        self.assertEqual(text.count("ANIM_keyframe_loop 8.0000"), 2)
+        keys = [l.split() for l in text.splitlines() if l.startswith("ANIM_rotate_key")]
+        self.assertAlmostEqual(abs(float(keys[-1][2]) - float(keys[0][2])), 360.0, places=1)
+
+
 if __name__ == "__main__":
     unittest.main()

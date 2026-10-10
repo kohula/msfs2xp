@@ -349,26 +349,28 @@ def _set_autoplay_keys(builder, node_anim, frame, anim_ancestor_world, apply_glo
     """Animation keys for a looping (AutoPlay) clip (autoplay.py): the
     clip's own key table on the sim clock, looping with the clip's length.
     frame turns the animated node's parent frame into the output frame.
-    Leaves the builder still (no keys) when a rotation doesn't keep to one
-    axis."""
-    times = np.asarray(node_anim["times"], dtype=np.float64)
-    values = np.asarray(node_anim["values"], dtype=np.float64)
-    if node_anim["path"] == "rotation":
+    A node that both moves and turns (a vehicle on a path) gets both: the
+    move, then the turn about the node's own origin. A rotation that
+    doesn't keep to one axis is left out."""
+    channels = node_anim.get("channels") or {node_anim["path"]: (node_anim["times"], node_anim["values"])}
+    if "rotation" in channels:
+        times, values = (np.asarray(v, dtype=np.float64) for v in channels["rotation"])
         rest_quat, _ = _rest_open_rotation_values(values)
         turn = autoplay.rotation_turn(rest_quat, values[:, :4], frame)
-        if turn is None:
-            return
-        axis, angles = turn
-        builder.anim_rotate = axis
-        builder.anim_rotate_keys = autoplay.thin_turn(times, angles)
-        pivot = (anim_ancestor_world @ np.array([0.0, 0.0, 0.0, 1.0]))[:3]
-        pivot = apply_global_rotation(pivot.reshape(1, 3))[0]
-        builder.anim_pivot = (float(pivot[0]), float(pivot[1]), float(pivot[2]))
-    else:
+        if turn is not None:
+            axis, angles = turn
+            builder.anim_rotate = axis
+            builder.anim_rotate_keys = autoplay.thin_turn(times, angles)
+            pivot = (anim_ancestor_world @ np.array([0.0, 0.0, 0.0, 1.0]))[:3]
+            pivot = apply_global_rotation(pivot.reshape(1, 3))[0]
+            builder.anim_pivot = (float(pivot[0]), float(pivot[1]), float(pivot[2]))
+    if "translation" in channels:
+        times, values = (np.asarray(v, dtype=np.float64) for v in channels["translation"])
         offsets = (values[:, :3] - values[0, :3]) @ frame.T
         builder.anim_translate_keys = autoplay.thin_slide(times, offsets)
-    builder.anim_dataref = autoplay.AUTOPLAY_DATAREF
-    builder.anim_loop = float(node_anim["clip_length"])
+    if builder.anim_rotate or builder.anim_translate_keys:
+        builder.anim_dataref = autoplay.AUTOPLAY_DATAREF
+        builder.anim_loop = float(node_anim["clip_length"])
 
 
 def node_local_matrix_at_rest(node, node_idx, gltf_animations):
@@ -389,16 +391,17 @@ def node_local_matrix_at_rest(node, node_idx, gltf_animations):
     s = np.eye(4)
     s[0, 0], s[1, 1], s[2, 2] = scale
 
-    if anim["path"] == "translation":
-        t = np.eye(4)
-        t[0:3, 3] = np.asarray(anim["values"][0][:3], dtype=np.float64)
-        r = quat_to_matrix(node["rotation"]) if "rotation" in node else np.eye(4)
-    else:  # "rotation"
-        t = np.eye(4)
-        if "translation" in node:
-            t[0:3, 3] = node["translation"]
-        rest_quat, _ = _rest_open_rotation_values(anim["values"])
+    channels = anim.get("channels") or {anim["path"]: (anim["times"], anim["values"])}
+    t = np.eye(4)
+    if "translation" in channels:
+        t[0:3, 3] = np.asarray(channels["translation"][1][0][:3], dtype=np.float64)
+    elif "translation" in node:
+        t[0:3, 3] = node["translation"]
+    if "rotation" in channels:
+        rest_quat, _ = _rest_open_rotation_values(channels["rotation"][1])
         r = quat_to_matrix(rest_quat)
+    else:
+        r = quat_to_matrix(node["rotation"]) if "rotation" in node else np.eye(4)
 
     return t @ r @ s
 
@@ -1528,8 +1531,10 @@ def _is_downlight_fixture(model_name):
 def read_gltf_animations(gltf, buffers):
     """Returns {node_idx: {"path": "translation"|"rotation"|..., "times": np.ndarray(N,),
     "values": np.ndarray(N,3 or 4)}} across every animation/channel in the
-    file. Only the first channel found per node is kept (MSFS SimObjects
-    animate one property per node in practice); "times" are in the glTF
+    file. "path"/"times"/"values" are the first channel found for the node;
+    "channels" holds every translation/rotation channel of it,
+    {path: (times, values)} (a vehicle on a path both moves and turns);
+    "times" are in the glTF
     clip's own seconds, "values" are raw translation vec3 / rotation quat
     (xyzw) samples straight from the accessor, unnormalized/un-transformed.
     "clip" is the animation's name (what the model XML refers to) and
@@ -1544,7 +1549,9 @@ def read_gltf_animations(gltf, buffers):
             target = channel.get("target", {})
             node_idx = target.get("node")
             path = target.get("path")
-            if node_idx is None or path not in ("translation", "rotation") or node_idx in result:
+            if node_idx is None or path not in ("translation", "rotation"):
+                continue
+            if node_idx in result and path in result[node_idx]["channels"]:
                 continue
             sampler_idx = channel.get("sampler")
             if sampler_idx is None or sampler_idx >= len(samplers):
@@ -1557,7 +1564,13 @@ def read_gltf_animations(gltf, buffers):
                 continue
             if len(times) < 2:
                 continue
-            result[node_idx] = {"path": path, "times": times, "values": values, "clip": clip_name}
+            if node_idx in result:
+                # a second property of the same node (a vehicle on a path
+                # both moves and turns): kept beside the first
+                result[node_idx]["channels"][path] = (times, values)
+            else:
+                result[node_idx] = {"path": path, "times": times, "values": values, "clip": clip_name,
+                                    "channels": {path: (times, values)}}
             clip_end = max(clip_end or 0.0, float(times.max()))
         # every channel of a clip loops with the clip's full length
         for entry in result.values():

@@ -164,6 +164,10 @@ class TestPropsOnHostFloors(unittest.TestCase):
             p_lat, p_lon = local_offset_to_latlon(t_lat, t_lon, 0.0, -20.0, 10.0)
             gk = (("terminal",), t_lat, t_lon, 0.0, False)
             ground_t = terrain_dem.get_elevation(xp, t_lat, t_lon)
+            # the terminal's terrain-fitted copy: shifted down 0.4 m
+            shifted = _l_shaped_terminal()
+            shifted.positions = shifted.positions + np.array([0.0, -0.4, 0.0])
+            mesh_ir.save(shifted, mesh_ir.sidecar_path_for(obj_dir / "terminal_tfit_x.obj"))
             terrain_fit._group_transform_cache[gk] = {"vertical_shift": -0.4, "origin_elev": ground_t}
             try:
                 person = {"name": "person", "agl": 0.0}
@@ -181,6 +185,40 @@ class TestPropsOnHostFloors(unittest.TestCase):
                 self.assertAlmostEqual(ground_p + person["agl"], ground_t - 0.4, places=6)
             finally:
                 terrain_fit._group_transform_cache.pop(gk, None)
+
+    def test_props_follow_a_warped_building_floor(self):
+        """A building warped onto the terrain: its floor under the prop is
+        where the fitted copy has it, not the level at its anchor."""
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            xp = td / "XPlane"
+            self._sloped(xp)
+            obj_dir = td / "objects"
+            obj_dir.mkdir()
+            mesh_ir.save(_l_shaped_terminal(), mesh_ir.sidecar_path_for(obj_dir / "terminal.obj"))
+            warped = _l_shaped_terminal()
+            warped.positions = warped.positions.copy()
+            warped.positions[:, 1] += 0.05 * warped.positions[:, 0]  # floor rises 5 cm per metre east
+            mesh_ir.save(warped, mesh_ir.sidecar_path_for(obj_dir / "terminal_tfit_w.obj"))
+            mesh_ir.save(_ir("seat", [_quad(-0.3, 0.3, -0.3, 0.3, 0.0)]), mesh_ir.sidecar_path_for(obj_dir / "seat.obj"))
+            t_lat, t_lon = 47.5, 8.5
+            p_lat, p_lon = local_offset_to_latlon(t_lat, t_lon, 0.0, 20.0, -20.0)
+            seat = {"name": "seat_tfit_q", "agl": 0.0}
+            cands = [
+                {"group_key": (("terminal",), t_lat, t_lon, 0.0, False), "abs_lat": t_lat, "abs_lon": t_lon,
+                 "hdg": 0.0, "agl": 0.0, "height_offset": 0.0,
+                 "stem_entries": {"terminal": ({"name": "terminal_tfit_w", "agl": 0.0}, True, False,
+                                               "applied_rigid_warp")}},
+                {"group_key": (("seat",), p_lat, p_lon, 0.0, False), "abs_lat": p_lat, "abs_lon": p_lon,
+                 "hdg": 0.0, "agl": 0.0, "height_offset": 0.0,
+                 "stem_entries": {"seat": (seat, True, False, "applied_rigid_warp")}},
+            ]
+            self.assertEqual(pipeline._place_props_on_host_floors(cands, obj_dir, xp), (1, 1))
+            ground_t = terrain_dem.get_elevation(xp, t_lat, t_lon)
+            ground_p = terrain_dem.get_elevation(xp, p_lat, p_lon)
+            # the warped floor 20 m east of the anchor is 1 m up
+            self.assertAlmostEqual(ground_p + seat["agl"], ground_t + 1.0, places=4)
+            self.assertEqual(seat["name"], "seat")
 
     def test_props_on_the_open_apron_keep_their_own_ground(self):
         with tempfile.TemporaryDirectory() as td:

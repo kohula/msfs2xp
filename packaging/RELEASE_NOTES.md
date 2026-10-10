@@ -1,37 +1,19 @@
-Test build: jetways dock in X-Plane 12, exclusion zones reduced, light
-and material fixes, new options.
+Test build: below-zero geometry as negative AGL height, props on the
+building floor as placed, vehicles on paths turn.
 
 ## What's new
 
-- **Jetways**: rigged MSFS jetway models are converted into X-Plane 12
-  jetways that keep the scenery's own model and textures. Each one is
-  written as an animated object on X-Plane's jetway datarefs and listed
-  in apt.dat (1500/1501 rows), so X-Plane's jetway command docks it.
-  Stands with more than one jetway assign the extra ones to door 2.
-  Main page tick box, or `--static-jetways` for the old static objects.
-  Requires the package's airport record and the XP12 apt.dat.
-- **Exclusion zones**: footprints are now merged into one grid with small
-  gaps closed, so far fewer rectangles are written. Can be turned off
-  (Main page, `--no-exclusions`).
-- **Lights**: ASOBO light direction corrected (local +Z); the MSFS 2024
-  light extension (ASOBO_advanced_light) is read; lights-only models
-  next to a lamp post are attached to its lamp (`--keep-bare-lights` to
-  disable); emissive lamps without a light source get a halo
-  (`--no-lamp-glow` to disable); synthesized fixture lights are placed
-  correctly.
-- **Emissive maps** that are near-constant and dim are dropped (they only
-  added a grey wash at night).
-- **AutoPlay animations** from the model XML are written as looping
-  animations.
-- **Materials**: normal map strength (glTF `scale`) is applied; untextured
-  materials use their own colour, darkened by their metallic factor.
-- **openSAM**: `no_autodgs.txt` is written next to apt.dat
-  (`--opensam-dgs` to skip).
-- **Program**: version shown in the window; options split into Main and
-  Advanced (some were hidden before); optional `.log` file
-  (`--log-file`); max texture size no longer resets to 0.
-- Embedded models now keep their XML, so their behaviours, animations
-  and jetway rigs are read.
+- **Below-zero geometry**: an object whose geometry reaches below its zero
+  point (drain channels, quay walls into the water) is placed lower by
+  that depth, as a negative AGL height. The geometry itself is no longer
+  modified (the lowered `_dn` copies are gone).
+- **Props inside buildings** (seats, desks, people) sit on the building's
+  floor as the building is actually placed -- including buildings that
+  were terrain-fitted with a warp or a skirt lift -- sampled right under
+  each prop.
+- **Path animations**: a looping animation that both moves and turns a
+  part (the airport bus) now does both; before only the move was kept,
+  so the bus slid along its path without turning.
 
 ## Windows
 

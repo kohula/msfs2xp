@@ -1,8 +1,7 @@
 """
-X-Plane doesn't sink an object below the terrain from a negative AGL
-height: a drain tile whose channel sits under the surface stood on the
-ground instead, its below-ground part showing above the pavement. The
-pipeline bakes the drop into a copy of the geometry placed at height 0.
+Geometry below an object's zero point (a drain channel, a quay wall into
+the water) is given as a negative AGL height on every part of the
+placement; the geometry itself stays as modelled.
 """
 import tempfile
 import unittest
@@ -11,68 +10,49 @@ from pathlib import Path
 import numpy as np
 
 import pipeline
+import terrain_fit
 from mesh_convert import mesh_ir
 
 
-def _tile(name):
-    # a 20 m tile, lifted by convert() so its 1.2 m deep channel bottom is y=0
-    pos = np.array([[-10, 1.2, -10], [10, 1.2, -10], [10, 1.2, 10], [-10, 1.2, 10],
-                    [-1, 0.0, -10], [1, 0.0, -10], [1, 0.0, 10], [-1, 0.0, 10]], dtype=float)
-    light = mesh_ir.LightEntry(pos=(0.0, 1.5, 0.0), dir=(0, -1, 0), color=(1, 1, 1), cone_angle=90,
-                               size=1.0, dataref=None)
+def _tile(name, bottom=-1.2):
+    # a 20 m tile: surface at y=0, a channel down to `bottom`
+    pos = np.array([[-10, 0.0, -10], [10, 0.0, -10], [10, 0.0, 10], [-10, 0.0, 10],
+                    [-1, bottom, -10], [1, bottom, -10], [1, bottom, 10], [-1, bottom, 10]], dtype=float)
     return mesh_ir.MeshIR(name=name, positions=pos, normals=np.tile([0.0, 1.0, 0.0], (8, 1)),
-                          uvs=np.zeros((8, 2)), indices=np.array([0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7]),
-                          lights=[light])
+                          uvs=np.zeros((8, 2)), indices=np.array([0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7]))
 
 
-class TestBakeNegativeHeights(unittest.TestCase):
-    def test_negative_height_is_baked_into_the_geometry(self):
+def _cand(**entries):
+    return {"stem_entries": {k: (v[0], False, v[1], "negligible") for k, v in entries.items()}}
+
+
+class TestSinkBelowZero(unittest.TestCase):
+    def tearDown(self):
+        terrain_fit._ir_cache.clear()
+
+    def test_depth_becomes_negative_agl_on_every_part(self):
         with tempfile.TemporaryDirectory() as td:
             obj_dir = Path(td)
             mesh_ir.save(_tile("drain"), mesh_ir.sidecar_path_for(obj_dir / "drain.obj"))
-            entry = {"name": "drain", "lat": 51.5, "lon": 0.05, "hdg": 0.0, "agl": -1.2}
-            tiles = {(51, 0): [entry]}
-            self.assertEqual(pipeline._bake_negative_heights(tiles, obj_dir), (1, 0))
-            self.assertEqual(entry["agl"], 0.0)
-            self.assertEqual(entry["name"], "drain_dn120")
-            lowered = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / "drain_dn120.obj"))
-            # the surface is back at ground level, the channel under it
-            self.assertAlmostEqual(float(lowered.positions[:, 1].max()), 0.0, places=6)
-            self.assertAlmostEqual(float(lowered.positions[:, 1].min()), -1.2, places=6)
-            self.assertAlmostEqual(lowered.lights[0].pos[1], 0.3, places=6)
-            self.assertTrue((obj_dir / "drain_dn120.obj").exists())
+            mesh_ir.save(_tile("grate", bottom=-0.3), mesh_ir.sidecar_path_for(obj_dir / "grate.obj"))
+            drain, grate = {"name": "drain", "agl": 0.0}, {"name": "grate", "agl": 0.5}
+            c = _cand(drain=(drain, False), grate=(grate, False))
+            self.assertEqual(pipeline._sink_below_zero([c], obj_dir), 1)
+            self.assertAlmostEqual(drain["agl"], -1.2)
+            self.assertAlmostEqual(grate["agl"], 0.5 - 1.2)
+            self.assertEqual(drain["name"], "drain")  # geometry untouched
+            self.assertAlmostEqual(float(mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / "drain.obj"))
+                                         .positions[:, 1].min()), -1.2)
 
-    def test_one_copy_per_model_and_depth(self):
+    def test_objects_at_or_above_zero_and_draped_parts_stay(self):
         with tempfile.TemporaryDirectory() as td:
             obj_dir = Path(td)
-            mesh_ir.save(_tile("drain"), mesh_ir.sidecar_path_for(obj_dir / "drain.obj"))
-            a = {"name": "drain", "agl": -1.2}
-            b = {"name": "drain", "agl": -1.2}
-            c = {"name": "drain", "agl": -0.5}
-            self.assertEqual(pipeline._bake_negative_heights({(51, 0): [a, b, c]}, obj_dir), (3, 0))
-            self.assertEqual(a["name"], b["name"])
-            self.assertEqual(c["name"], "drain_dn50")
-
-    def test_ground_level_raised_draped_and_animated_are_left_alone(self):
-        with tempfile.TemporaryDirectory() as td:
-            obj_dir = Path(td)
-            mesh_ir.save(_tile("drain"), mesh_ir.sidecar_path_for(obj_dir / "drain.obj"))
-            decal = _tile("decal")
-            decal.draped = True
-            mesh_ir.save(decal, mesh_ir.sidecar_path_for(obj_dir / "decal.obj"))
-            ground = {"name": "drain", "agl": 0.0}
-            raised = {"name": "drain", "agl": 3.0}
-            draped = {"name": "decal", "agl": -1.0}
-            animated = {"name": "door_anim", "agl": -0.8}  # no sidecar
-            library = {"name": None, "library_path": "lib/x.obj", "agl": -1.0}
-            tiles = {(51, 0): [ground, raised, draped, animated, library]}
-            self.assertEqual(pipeline._bake_negative_heights(tiles, obj_dir), (0, 2))
-            self.assertEqual([o["name"] for o in tiles[(51, 0)]], ["drain", "drain", "decal", "door_anim", None])
-            self.assertEqual(animated["agl"], -0.8)
-
-
-if __name__ == "__main__":
-    unittest.main()
+            mesh_ir.save(_tile("slab", bottom=0.0), mesh_ir.sidecar_path_for(obj_dir / "slab.obj"))
+            mesh_ir.save(_tile("decal"), mesh_ir.sidecar_path_for(obj_dir / "decal.obj"))
+            slab, decal = {"name": "slab", "agl": 0.0}, {"name": "decal", "agl": 0.0}
+            self.assertEqual(pipeline._sink_below_zero([_cand(slab=(slab, False), decal=(decal, True))],
+                                                       obj_dir), 0)
+            self.assertEqual((slab["agl"], decal["agl"]), (0.0, 0.0))
 
 
 class TestPlacementReport(unittest.TestCase):
@@ -81,7 +61,7 @@ class TestPlacementReport(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             obj_dir = Path(td)
             mesh_ir.save(_tile("drain"), mesh_ir.sidecar_path_for(obj_dir / "drain.obj"))
-            kept = {"name": "drain_dn120", "agl": 0.0}
+            kept = {"name": "drain", "agl": -1.2}
             gone = {"name": "cover", "agl": 0.0}
             cands = [{
                 "model": "DrainTile", "title": "Drain tile", "source": "SceneryObject",
@@ -100,5 +80,9 @@ class TestPlacementReport(unittest.TestCase):
             self.assertEqual(r["airport_alt_m"], "5.800")
             self.assertEqual(r["height_above_ground_m"], "-1.200")
             self.assertEqual(r["model_height_m"], "1.20")
-            self.assertIn("drain_dn120@+0.00", r["final_parts"])
+            self.assertIn("drain@-1.20", r["final_parts"])
             self.assertIn("cover=removed", r["final_parts"])
+
+
+if __name__ == "__main__":
+    unittest.main()
