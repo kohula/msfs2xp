@@ -148,6 +148,7 @@ class MatBuilder:
         self.anim_rotate = None  # (axis_x, axis_y, axis_z) or None
         self.anim_rotate_keys = None  # [(dataref_value, angle_degrees), ...] or None
         self.anim_loop = None  # seconds: a self-playing clip repeating on the sim clock
+        self.anim_chain = None  # looping stages (autoplay_stages), geometry kept at rest
         self.light_level_dataref = None  # (v1, v2, dataref) or None
         self.proximity_dataref = None  # custom plugin-driven dataref name, or None
 
@@ -345,32 +346,44 @@ def _rest_open_rotation_values(values):
     return (v0, v1) if abs(v0[3]) >= abs(v1[3]) else (v1, v0)
 
 
-def _set_autoplay_keys(builder, node_anim, frame, anim_ancestor_world, apply_global_rotation):
-    """Animation keys for a looping (AutoPlay) clip (autoplay.py): the
-    clip's own key table on the sim clock, looping with the clip's length.
-    frame turns the animated node's parent frame into the output frame.
-    A node that both moves and turns (a vehicle on a path) gets both: the
-    move, then the turn about the node's own origin. A rotation that
-    doesn't keep to one axis is left out."""
-    channels = node_anim.get("channels") or {node_anim["path"]: (node_anim["times"], node_anim["values"])}
-    if "rotation" in channels:
-        times, values = (np.asarray(v, dtype=np.float64) for v in channels["rotation"])
-        rest_quat, _ = _rest_open_rotation_values(values)
-        turn = autoplay.rotation_turn(rest_quat, values[:, :4], frame)
-        if turn is not None:
-            axis, angles = turn
-            builder.anim_rotate = axis
-            builder.anim_rotate_keys = autoplay.thin_turn(times, angles)
-            pivot = (anim_ancestor_world @ np.array([0.0, 0.0, 0.0, 1.0]))[:3]
-            pivot = apply_global_rotation(pivot.reshape(1, 3))[0]
-            builder.anim_pivot = (float(pivot[0]), float(pivot[1]), float(pivot[2]))
-    if "translation" in channels:
-        times, values = (np.asarray(v, dtype=np.float64) for v in channels["translation"])
-        offsets = (values[:, :3] - values[0, :3]) @ frame.T
-        builder.anim_translate_keys = autoplay.thin_slide(times, offsets)
-    if builder.anim_rotate or builder.anim_translate_keys:
-        builder.anim_dataref = autoplay.AUTOPLAY_DATAREF
-        builder.anim_loop = float(node_anim["clip_length"])
+def autoplay_stages(chain, gltf, gltf_animations, world_transforms, global_rot_matrix):
+    """One animation stage per looping (AutoPlay) node in chain (outermost
+    first): {"trans": [(t, dx, dy, dz)] or None, "axis", "rot": [(t, deg)]
+    or None, "pivot": (x, y, z), "loop": seconds}, all in the output frame
+    with the geometry at rest. Applied in order (outer first), each stage
+    moves the node and turns it about its own origin (autoplay.py)."""
+    stages = []
+    nodes = gltf.get("nodes", [])
+    for a in chain:
+        anim = gltf_animations[a]
+        world = world_transforms.get(a, np.eye(4))
+        local = node_local_matrix_at_rest(nodes[a], a, gltf_animations)
+        try:
+            parent_rot = (world @ np.linalg.inv(local))[:3, :3]
+        except np.linalg.LinAlgError:
+            parent_rot = world[:3, :3]
+        norms = np.linalg.norm(parent_rot, axis=0)
+        norms[norms == 0] = 1.0
+        frame = global_rot_matrix @ (parent_rot / norms)
+        pivot = global_rot_matrix @ world[:3, 3]
+        channels = anim.get("channels") or {anim["path"]: (anim["times"], anim["values"])}
+        stage = {"trans": None, "axis": None, "rot": None,
+                 "pivot": tuple(float(v) for v in pivot), "loop": float(anim["clip_length"])}
+        if "translation" in channels:
+            times, values = (np.asarray(v, dtype=np.float64) for v in channels["translation"])
+            offsets = (values[:, :3] - values[0, :3]) @ frame.T
+            if np.abs(offsets).max() > 1e-4:
+                stage["trans"] = autoplay.thin_slide(times, offsets)
+        if "rotation" in channels:
+            times, values = (np.asarray(v, dtype=np.float64) for v in channels["rotation"])
+            rest_quat, _ = _rest_open_rotation_values(values)
+            turn = autoplay.rotation_turn(rest_quat, values[:, :4], frame)
+            if turn is not None:
+                stage["axis"], angles = turn
+                stage["rot"] = autoplay.thin_turn(times, angles)
+        if stage["trans"] or stage["rot"]:
+            stages.append(stage)
+    return stages
 
 
 def node_local_matrix_at_rest(node, node_idx, gltf_animations):
@@ -2556,11 +2569,23 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                         kind = time_behavior[0] if time_behavior is not None else None
                         if kind in ("business_hours", "proximity") and node_anim["path"] in ("translation", "rotation"):
                             animated_node_id = node_idx
-                        elif (node_anim.get("clip", "").lower() in autoplay_clips
-                              and node_anim.get("clip_length", 0.0) > 0.0):
-                            # a looping AutoPlay clip: see autoplay.py
-                            animated_node_id = node_idx
-                            node_is_autoplay = True
+                        else:
+                            # looping AutoPlay clips on this node's animated
+                            # ancestors (a wheel spinning on a bus driving
+                            # its path): see autoplay.py
+                            autoplay_nodes = []
+                            _cur, _seen = anim_ancestor_idx, set()
+                            while _cur is not None and _cur not in _seen:
+                                _seen.add(_cur)
+                                _a = gltf_animations.get(_cur)
+                                if (_a is not None and _a.get("clip", "").lower() in autoplay_clips
+                                        and _a.get("clip_length", 0.0) > 0.0):
+                                    autoplay_nodes.append(_cur)
+                                _cur = node_parents.get(_cur)
+                            if autoplay_nodes:
+                                autoplay_nodes.reverse()  # outermost first
+                                animated_node_id = node_idx
+                                node_is_autoplay = True
 
                 # Reverted to the file-wide verdict (see the removed
                 # per-node classification's own replacement comment above)
@@ -3103,8 +3128,9 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                             # duplicated per animation kind (translation vs
                             # rotation).
                             if node_is_autoplay:
-                                _set_autoplay_keys(builder, node_anim, global_rot_matrix @ parent_rot_n,
-                                                   anim_ancestor_world, apply_global_rotation)
+                                builder.anim_chain = autoplay_stages(
+                                    autoplay_nodes, gltf, gltf_animations, world_transforms, global_rot_matrix)
+                                builder.anim_dataref = autoplay.AUTOPLAY_DATAREF
                             elif time_behavior[0] == "business_hours":
                                 open_start, open_end = time_behavior[1], time_behavior[2]
                                 builder.anim_dataref = "sim/time/local_time_sec"
@@ -3611,6 +3637,9 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                     builder.vertices = [
                         (x - recenter_x, y + y_lift, z - recenter_z) for (x, y, z) in builder.vertices
                     ]
+                for stage in builder.anim_chain or ():
+                    px, py, pz = stage["pivot"]
+                    stage["pivot"] = (px - recenter_x, py + y_lift, pz - recenter_z)
             for entry in light_entries:
                 lx, ly, lz = entry["pos"]
                 entry["pos"] = (lx - recenter_x, ly + y_lift, lz - recenter_z)
@@ -3883,7 +3912,7 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                 v1, v2, dataref = builder.light_level_dataref
                 f.write(f"ATTR_light_level {v1:.3f} {v2:.3f} {dataref}\n")
 
-            has_anim = bool(builder.anim_translate_keys) or bool(builder.anim_rotate)
+            has_anim = bool(builder.anim_translate_keys) or bool(builder.anim_rotate) or bool(builder.anim_chain)
             # A rotation around an off-center pivot (a hinge, a boom-barrier
             # axle) needs a NESTED ANIM_begin/end, not a sibling one: the
             # outer block's ANIM_trans shifts the local coordinate origin
@@ -3900,6 +3929,27 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
 
             if has_anim:
                 f.write("ANIM_begin\n")
+
+            for stage in builder.anim_chain or ():
+                # one looping stage: its move, then its turn about its own
+                # origin; stages compose outer to inner in this one block
+                loop = f"ANIM_keyframe_loop {stage['loop']:.4f}\n"
+                if stage["trans"]:
+                    f.write(f"ANIM_trans_begin {autoplay.AUTOPLAY_DATAREF}\n")
+                    for t, dx, dy, dz in stage["trans"]:
+                        f.write(f"ANIM_trans_key {t:.4f} {dx:.5f} {dy:.5f} {dz:.5f}\n")
+                    f.write(loop)
+                    f.write("ANIM_trans_end\n")
+                if stage["rot"]:
+                    px, py, pz = stage["pivot"]
+                    f.write(f"ANIM_trans {px:.5f} {py:.5f} {pz:.5f} {px:.5f} {py:.5f} {pz:.5f} 0 0 no_ref\n")
+                    ax, ay, az = stage["axis"]
+                    f.write(f"ANIM_rotate_begin {ax:.5f} {ay:.5f} {az:.5f} {autoplay.AUTOPLAY_DATAREF}\n")
+                    for t, angle_deg in stage["rot"]:
+                        f.write(f"ANIM_rotate_key {t:.4f} {angle_deg:.5f}\n")
+                    f.write(loop)
+                    f.write("ANIM_rotate_end\n")
+                    f.write(f"ANIM_trans {-px:.5f} {-py:.5f} {-pz:.5f} {-px:.5f} {-py:.5f} {-pz:.5f} 0 0 no_ref\n")
 
             # Looping clips are keyed in seconds of sim time: finer steps.
             key_fmt = ".2f" if builder.anim_loop is None else ".4f"
@@ -3933,6 +3983,16 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                 f.write("ANIM_end\n")
             if has_anim:
                 f.write("ANIM_end\n")
+
+        # A path the object drives (the outermost moving stage): read by
+        # the pipeline to raise/lower the path onto the X-Plane terrain.
+        _path_stage = next((st for st in builder.anim_chain or () if st["trans"]), None)
+        if _path_stage is not None:
+            try:
+                obj_path.with_suffix(".autoplay.json").write_text(json.dumps({
+                    "pivot": _path_stage["pivot"], "keys": _path_stage["trans"]}), encoding="utf-8")
+            except OSError:
+                pass
 
         obj_paths.append(obj_path)
 

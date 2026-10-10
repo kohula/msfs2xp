@@ -37,7 +37,11 @@ import struct
 import tempfile
 from pathlib import Path
 
+import numpy as np
+
 import app_paths
+import cache_utils
+import terrain_mesh
 
 try:
     import py7zr
@@ -84,6 +88,10 @@ _GLOBAL_SCENERY_CANDIDATES = [
 _NODATA_RAW = {1: -128, 2: -32768, 4: -2147483648}
 
 _dem_cache = {}  # dsf_path (str) -> {layer_name: DemLayer}
+_mesh_cache = {}  # dsf_path (str) -> terrain_mesh.Mesh or None
+# Sample the terrain mesh X-Plane draws (terrain_mesh.py), falling back to
+# the raster where a tile has no readable mesh.
+USE_MESH = True
 
 # Areas X-Plane levels at runtime (an apt.dat airport boundary with
 # "1302 flatten 1"): [(ring [(lat, lon), ...], (lat0, lat1, lon0, lon1),
@@ -136,6 +144,29 @@ class DemLayer:
         if not self.is_float and raw == _NODATA_RAW.get(self.bpp):
             return None
         return raw * self.scale + self.offset
+
+    def grid(self):
+        """The whole layer as a float array [row][col] (NODATA -> nan)."""
+        dt = {"f": "<f4", "b": "i1", "B": "u1", "h": "<i2", "H": "<u2", "i": "<i4", "I": "<u4"}[self._fmt_char()]
+        n = self.width * self.height
+        raw = np.frombuffer(self.data, dtype=dt, count=min(n, len(self.data) // self.bpp)).astype(np.float64)
+        if len(raw) < n:
+            raw = np.concatenate([raw, np.full(n - len(raw), np.nan)])
+        if not self.is_float and _NODATA_RAW.get(self.bpp) is not None:
+            raw[raw == _NODATA_RAW[self.bpp]] = np.nan
+        return (raw * self.scale + self.offset).reshape(self.height, self.width)
+
+    def bilinear_many(self, frac_rows, frac_cols, grid=None):
+        """bilinear() for arrays of points; nan where unavailable."""
+        g = self.grid() if grid is None else grid
+        row_f = np.asarray(frac_rows, dtype=np.float64) * (self.height - 1)
+        col_f = np.asarray(frac_cols, dtype=np.float64) * (self.width - 1)
+        row0 = np.clip(np.floor(row_f).astype(np.int64), 0, self.height - 2)
+        col0 = np.clip(np.floor(col_f).astype(np.int64), 0, self.width - 2)
+        ty, tx = row_f - row0, col_f - col0
+        top = g[row0, col0] + (g[row0, col0 + 1] - g[row0, col0]) * tx
+        bottom = g[row0 + 1, col0] + (g[row0 + 1, col0 + 1] - g[row0 + 1, col0]) * tx
+        return top + (bottom - top) * ty
 
     def bilinear(self, frac_row, frac_col):
         """frac_row/frac_col in [0, 1] across the whole tile. Returns None
@@ -236,22 +267,31 @@ def _decompress_if_7z(raw):
         return extracted_path.read_bytes()
 
 
+def _read_dsf(dsf_path):
+    """A DSF's decompressed bytes, or None."""
+    try:
+        raw = Path(dsf_path).read_bytes()
+        raw = _decompress_if_7z(raw)
+    except Exception:
+        return None
+    if raw is None or len(raw) < 12 or raw[:8] != _MAGIC:
+        return None
+    return raw
+
+
 def parse_dem_layers(dsf_path):
     """Returns {layer_name: DemLayer} for every raster layer in one DSF
     file, or {} on any read/decompress/parse failure -- terrain-fit is a
     best-effort visual improvement, never something that should raise and
     interrupt a conversion run."""
-    try:
-        raw = Path(dsf_path).read_bytes()
-    except OSError:
+    raw = _read_dsf(dsf_path)
+    if raw is None:
         return {}
+    return parse_dem_layers_from_bytes(raw)
 
-    try:
-        raw = _decompress_if_7z(raw)
-    except Exception:
-        return {}
-    if raw is None or len(raw) < 12 or raw[:8] != _MAGIC:
-        return {}
+
+def parse_dem_layers_from_bytes(raw):
+    """parse_dem_layers for a DSF already read and decompressed."""
 
     layer_names = []
     # (info_tuple, data_bytes) in the order encountered, across every DEMS
@@ -306,6 +346,89 @@ def _get_cached_layers(dsf_path):
     return _dem_cache[key]
 
 
+_area = []  # [(lat0, lat1, lon0, lon1)] or empty: the part of a tile worth keeping
+
+
+def set_area(bbox):
+    """Keep only the mesh around (lat0, lat1, lon0, lon1) -- the scenery
+    being converted -- instead of whole tiles of millions of triangles in
+    every worker process. None clears it."""
+    _area.clear()
+    if bbox is not None:
+        _area.append(tuple(round(float(v), 3) for v in bbox))
+    _mesh_cache.clear()
+
+
+def area():
+    return _area[0] if _area else None
+
+
+def _crop(parsed):
+    if not _area:
+        return parsed
+    lat0, lat1, lon0, lon1 = _area[0]
+    lon, lat, elev = parsed
+    keep = ((lat.max(axis=1) >= lat0) & (lat.min(axis=1) <= lat1)
+            & (lon.max(axis=1) >= lon0) & (lon.min(axis=1) <= lon1))
+    return lon[keep], lat[keep], elev[keep]
+
+
+def _mesh_for(dsf_path):
+    """The DSF's drawn terrain mesh (terrain_mesh.Mesh), or None when it
+    can't be read. Parsed once and kept on disk for other processes."""
+    key = str(dsf_path)
+    if key in _mesh_cache:
+        return _mesh_cache[key]
+    mesh = None
+    _, _, tile_lat, tile_lon = _tile_path_parts_from_name(Path(dsf_path).stem)
+    try:
+        cache_file = (cache_utils.cache_root() / "terrain_mesh" /
+                      f"{cache_utils._make_key('terrain_mesh', (cache_utils.file_identity(dsf_path), terrain_mesh.FORMAT_VERSION, str(area())))}.npz")
+    except OSError:
+        cache_file = None
+    try:
+        if cache_file is not None and cache_file.is_file():
+            mesh = terrain_mesh.Mesh(*terrain_mesh.load(cache_file), tile_lon, tile_lat)
+        else:
+            raw = _read_dsf(dsf_path)
+            if raw is not None:
+                if key not in _dem_cache:
+                    _dem_cache[key] = parse_dem_layers_from_bytes(raw)
+                layer = _dem_cache[key].get("elevation")
+                grid = layer.grid() if layer is not None else None
+
+                def from_raster(lats, lons):
+                    if layer is None:
+                        return np.full(len(lats), np.nan)
+                    return layer.bilinear_many(np.asarray(lats) - tile_lat, np.asarray(lons) - tile_lon, grid)
+
+                parsed = terrain_mesh.parse_mesh(raw, from_raster)
+                if parsed is not None:
+                    parsed = _crop(parsed)
+                if parsed is not None and len(parsed[0]):
+                    mesh = terrain_mesh.Mesh(*parsed, tile_lon, tile_lat)
+                    if cache_file is not None:
+                        try:
+                            cache_file.parent.mkdir(parents=True, exist_ok=True)
+                            terrain_mesh.save(cache_file, *parsed)
+                        except OSError:
+                            pass
+    except Exception:
+        mesh = None  # an unreadable mesh only means falling back to the raster
+    _mesh_cache[key] = mesh
+    return mesh
+
+
+def _tile_path_parts_from_name(stem):
+    """(_, _, lat, lon) from a tile file name such as "+51+000"."""
+    try:
+        lat = int(stem[:3])
+        lon = int(stem[3:])
+    except ValueError:
+        return None, None, 0, 0
+    return None, None, lat, lon
+
+
 def set_flat_zones(zones):
     """zones: [(ring [(lat, lon), ...], elevation_m), ...] -- areas X-Plane
     flattens (see _flat_zones); get_elevation reports elevation_m inside
@@ -347,8 +470,9 @@ def flat_elevation(lat, lon):
 
 
 def get_elevation(xplane_root, lat, lon, layer_name="elevation"):
-    """Real X-Plane terrain elevation (meters) at (lat, lon), bilinearly
-    sampled from the default global scenery's own elevation raster, or
+    """Real X-Plane terrain elevation (meters) at (lat, lon): on the
+    terrain mesh X-Plane draws (terrain_mesh.py) where the tile's mesh can
+    be read, otherwise bilinearly sampled from its elevation raster, or
     None if unavailable (no X-Plane install found, tile missing, py7zr not
     installed, or that post is NODATA in the source data). Inside a flat
     zone (see set_flat_zones) it is the zone's levelled elevation."""
@@ -361,6 +485,12 @@ def get_elevation(xplane_root, lat, lon, layer_name="elevation"):
     dsf_path = find_dsf_for_latlon(xplane_root, lat, lon)
     if dsf_path is None:
         return None
+    if layer_name == "elevation" and USE_MESH:
+        mesh = _mesh_for(dsf_path)
+        if mesh is not None:
+            z = mesh.elevation(lat, lon)
+            if z is not None:
+                return z
     layers = _get_cached_layers(dsf_path)
     layer = layers.get(layer_name)
     if layer is None:

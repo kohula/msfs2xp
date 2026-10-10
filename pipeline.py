@@ -1088,32 +1088,6 @@ def _attach_bare_lights(dsf_tiles, obj_dir, converted_stems_map):
     return lamp_posts.attach_to_lamps(dsf_tiles, load, bare)
 
 
-def _sink_below_zero(cands, obj_dir):
-    """An object with geometry below its zero point (a drain channel, a
-    quay wall reaching into the water) is given that depth as a negative
-    height above the ground: the AGL height of each of its sub-objects goes
-    down by the lowest vertex y of the whole placement. The geometry itself
-    is not changed. Draped parts are left alone. Returns how many
-    placements were lowered."""
-    lowered = 0
-    for c in cands:
-        parts = [e for e, _fit, draped, _r in c["stem_entries"].values() if not draped and e.get("name")]
-        low = None
-        for e in parts:
-            ir = terrain_fit._load_ir(obj_dir, e["name"])
-            if ir is None or not len(ir.positions) or ir.draped:
-                continue
-            y = float(ir.positions[:, 1].min())
-            low = y if low is None else min(low, y)
-        if low is None or low > -0.01:
-            continue
-        for e in parts:
-            e["agl"] = e.get("agl", 0.0) + low
-        c["below_zero_m"] = low
-        lowered += 1
-    return lowered
-
-
 def _settle_flat_airport_objects(cands, obj_dir, dsf_tiles, ground):
     """runway_clutter.py: for every placement standing on the airport
     ground (not on a building's floor), drop the solid parts of small flat
@@ -1158,6 +1132,182 @@ def _settle_flat_airport_objects(cands, obj_dir, dsf_tiles, ground):
         for key, objects in dsf_tiles.items():
             dsf_tiles[key] = [o for o in objects if id(o) not in drop]
     return dropped, draped
+
+
+_PATH_BLOCK = "ANIM_trans_begin sim/time/total_running_time_sec"
+
+
+def _paths_on_terrain(dsf_tiles, obj_dir, xplane_root):
+    """An object driving a looping path (a bus round the airport) was
+    animated at its anchor's ground height all the way round. Each placed
+    one gets a copy whose path keys are raised or lowered to the X-Plane
+    ground under each point of the path (convert() records the path in an
+    .autoplay.json beside the object). Returns how many were adjusted."""
+    adjusted = 0
+    for objects in dsf_tiles.values():
+        for e in objects:
+            name = e.get("name")
+            if not name:
+                continue
+            side = obj_dir / f"{name}.autoplay.json"
+            if not side.is_file():
+                continue
+            try:
+                path = json.loads(side.read_text(encoding="utf-8"))
+                lines = (obj_dir / f"{name}.obj").read_text(encoding="utf-8").splitlines(keepends=True)
+            except (OSError, ValueError):
+                continue
+            ground = terrain_dem.get_elevation(xplane_root, e["lat"], e["lon"])
+            if ground is None:
+                continue
+            px, _py, pz = path["pivot"]
+            dys = []
+            for _t, dx, _dy, dz in path["keys"]:
+                lat, lon = geo_transform.local_offset_to_latlon(e["lat"], e["lon"], e.get("hdg", 0.0), px + dx, pz + dz)
+                g = terrain_dem.get_elevation(xplane_root, lat, lon)
+                dys.append(0.0 if g is None else g - ground)
+            try:
+                start = next(i for i, l in enumerate(lines) if l.startswith(_PATH_BLOCK))
+            except StopIteration:
+                continue
+            k = 0
+            for i in range(start + 1, len(lines)):
+                if not lines[i].startswith("ANIM_trans_key"):
+                    break
+                parts = lines[i].split()
+                if k < len(dys):
+                    parts[3] = f"{float(parts[3]) + dys[k]:.5f}"
+                lines[i] = " ".join(parts) + "\n"
+                k += 1
+            key = "%.7f_%.7f_%.2f" % (e["lat"], e["lon"], e.get("hdg", 0.0))
+            new = f"{name}_rt_{hashlib.md5(key.encode()).hexdigest()[:10]}"
+            (obj_dir / f"{new}.obj").write_text("".join(lines), encoding="utf-8")
+            e["name"] = new
+            adjusted += 1
+    return adjusted
+
+
+PART_MIN_SIDE_M = 4.0     # a building part is at least this long...
+PART_MIN_HEIGHT_M = 2.0   # ...and this tall (smaller things are props: host_floor)
+
+
+def _attach_parts_to_buildings(cands, obj_dir, xplane_root):
+    """Parts of one building placed as separate objects (wings, interiors,
+    facades, roof units) were terrain-fitted each on their own: one shifted
+    by a little, its neighbour warped, another left alone as "negligible",
+    so they no longer meet. A part lying within a larger building -- under
+    or over that building's own floors, roofs or ceilings -- takes the
+    building's correction instead: warped onto the terrain when the
+    building was warped, else raised or lowered to the building's level.
+    Returns how many parts were attached."""
+    def rigid_stems(c):
+        return [s for s, (_e, _fa, draped, _r) in c["stem_entries"].items() if not draped]
+
+    infos = []
+    for i, c in enumerate(cands):
+        stems = rigid_stems(c)
+        if not stems:
+            continue
+        group = [terrain_fit._load_ir(obj_dir, s) for s in stems]
+        bbox = host_floor.footprint(group)
+        if bbox is None:
+            continue
+        infos.append((i, c, stems, group, bbox, host_floor.height_of(group)))
+
+    hosts = []
+    for i, c, stems, group, bbox, height in infos:
+        if not host_floor.is_host_size(bbox, height):
+            continue
+        cover = host_floor.horizontal_cover(group)
+        if cover is None:
+            continue
+        reasons = {c["stem_entries"][s][3] for s in stems}
+        ground = terrain_dem.get_elevation(xplane_root, c["abs_lat"], c["abs_lon"])
+        if ground is None:
+            continue
+        t = terrain_fit.get_cached_transform(c["group_key"])
+        if "applied_rigid_warp" in reasons:
+            mode, level = "warp", None
+        else:
+            if c.get("linked_shift") is not None:
+                shift = c["linked_shift"]
+            elif reasons & {"applied_vertical_shift", "applied_skirt"} and t and t.get("vertical_shift") is not None:
+                shift = t["vertical_shift"]
+            else:
+                shift = 0.0
+            mode, level = "level", ground + shift
+        area = (bbox[1] - bbox[0]) * (bbox[3] - bbox[2])
+        hosts.append((area, i, c, bbox, cover, mode, level))
+    hosts.sort(key=lambda h: -h[0])
+
+    attached = 0
+    for i, c, stems, group, bbox, height in infos:
+        if c.get("hosted") or max(bbox[1] - bbox[0], bbox[3] - bbox[2]) < PART_MIN_SIDE_M \
+                or height < PART_MIN_HEIGHT_M:
+            continue
+        area = (bbox[1] - bbox[0]) * (bbox[3] - bbox[2])
+        cx, cz = (bbox[0] + bbox[1]) / 2.0, (bbox[2] + bbox[3]) / 2.0
+        p_lat, p_lon = geo_transform.local_offset_to_latlon(c["abs_lat"], c["abs_lon"], c["hdg"], cx, cz)
+        host = None
+        for h_area, hi, hc, hbox, hcover, mode, level in hosts:
+            if hi == i or h_area <= area:
+                continue
+            x, z = geo_transform.latlon_offset_to_local(hc["abs_lat"], hc["abs_lon"], hc["hdg"], p_lat, p_lon)
+            if hbox[0] <= x <= hbox[1] and hbox[2] <= z <= hbox[3] and len(hcover.heights_at(x, z)):
+                host = (hi, hc, mode, level)
+                break
+        if host is None:
+            continue
+        hi, hc, mode, level = host
+        reasons = {c["stem_entries"][s][3] for s in stems}
+        if mode == "warp":
+            if reasons == {"applied_rigid_warp"}:
+                continue  # already follows the terrain the same way
+            origin = terrain_dem.get_elevation(xplane_root, c["abs_lat"], c["abs_lon"])
+            if origin is None:
+                continue
+            for s, ir in zip(stems, group):
+                if ir is None:
+                    continue
+                entry = c["stem_entries"][s][0]
+                entry["name"] = _warped_copy(obj_dir, s, ir, c, origin, xplane_root)
+        else:
+            ground = terrain_dem.get_elevation(xplane_root, c["abs_lat"], c["abs_lon"])
+            if ground is None:
+                continue
+            agl = c["agl"] + level - ground
+            for s in stems:
+                entry = c["stem_entries"][s][0]
+                entry["name"] = s
+                entry["agl"] = agl
+        c["part_of"] = hi
+        attached += 1
+    return attached
+
+
+def _warped_copy(obj_dir, stem, ir, c, origin_elev, xplane_root):
+    """A copy of one sub-object with every vertex (and light) moved by the
+    terrain under it relative to its anchor's ground. Returns its stem."""
+    key = "%.7f_%.7f_%.2f" % (c["abs_lat"], c["abs_lon"], c["hdg"])
+    name = f"{stem}_wp_{hashlib.md5(key.encode()).hexdigest()[:10]}"
+    path = obj_dir / f"{name}.obj"
+    if path.exists():
+        return name
+
+    def delta(x, z):
+        lat, lon = geo_transform.local_offset_to_latlon(c["abs_lat"], c["abs_lon"], c["hdg"], x, z)
+        e = terrain_dem.get_elevation(xplane_root, lat, lon)
+        return 0.0 if e is None else e - origin_elev
+
+    pos = ir.positions.copy()
+    for k in range(len(pos)):
+        pos[k, 1] += delta(float(pos[k, 0]), float(pos[k, 2]))
+    lights = [dataclasses.replace(lt, pos=(lt.pos[0], lt.pos[1] + delta(lt.pos[0], lt.pos[2]), lt.pos[2]))
+              for lt in (ir.lights or [])]
+    warped = dataclasses.replace(ir, name=name, positions=pos, lights=lights)
+    mesh_ir.write_obj8(warped, path)
+    mesh_ir.save(warped, mesh_ir.sidecar_path_for(path))
+    return name
 
 
 def _place_props_on_host_floors(cands, obj_dir, xplane_root):
@@ -1234,7 +1384,7 @@ def _place_props_on_host_floors(cands, obj_dir, xplane_root):
 
 
 def _terrain_fit_group_worker(obj_stems, base_lat, base_lon, heading_deg,
-                              skip_draped, obj_dir_str, xplane_root_str, flat_zones=None):
+                              skip_draped, obj_dir_str, xplane_root_str, flat_zones=None, area=None):
     """Worker for the parallel terrain-fit pre-warm in step 4. Runs ONE
     terrain_fit group in this subprocess. The heavy part -- pickle-loading
     each sub-object's MeshIR, sampling the DEM, building the warped copy,
@@ -1266,6 +1416,8 @@ def _terrain_fit_group_worker(obj_stems, base_lat, base_lon, heading_deg,
     # a spawned worker (Windows) starts without the parent's flat zones
     if flat_zones is not None and terrain_dem.flat_zones() != flat_zones:
         terrain_dem.set_flat_zones(flat_zones)
+    if area is not None and terrain_dem.area() != tuple(round(float(v), 3) for v in area):
+        terrain_dem.set_area(area)
     group_key = (tuple(sorted(obj_stems)), round(base_lat, 6), round(base_lon, 6),
                  round(heading_deg, 2), bool(skip_draped))
     try:
@@ -1289,7 +1441,7 @@ _OBJ_TEXTURE_LINE_RE = re.compile(r'^TEXTURE(?:_NORMAL|_LIT)?\s+\.\./textures/(.
 # what terrain_fit.py/draped_merge.py consume instead of regex-parsing the
 # .obj text; without restoring it on a cache hit, those two would see the
 # .obj but no sidecar and have nothing to correct/merge for that model.
-_CONVERT_SIDECAR_SUFFIXES = (".proximity.json", ".footprint.json", ".meshir.pkl")
+_CONVERT_SIDECAR_SUFFIXES = (".proximity.json", ".footprint.json", ".meshir.pkl", ".autoplay.json")
 
 
 def _is_valid_texture(path):
@@ -2050,6 +2202,11 @@ def _run_pipeline(opts, hooks):
         # terminal interiors, jetways, apron gear), so a terminal is level
         # all the way through, not just on its apron side.
         terrain_dem.set_flat_zones([])
+        # the drawn terrain mesh is kept only around the scenery (+~2 km)
+        _plats = [p["lat"] for p in all_placements if p.get("lat") is not None]
+        _plons = [p["lon"] for p in all_placements if p.get("lon") is not None]
+        terrain_dem.set_area((min(_plats) - 0.02, max(_plats) + 0.02, min(_plons) - 0.03, max(_plons) + 0.03)
+                             if _plats and _plons else None)
         airport_boundary_points = []
         if apt_native.is_usable(native_airport_layout):
             airport_boundary_points = apt_native.points_near_airport(native_airport_layout, [
@@ -2554,11 +2711,14 @@ def _run_pipeline(opts, hooks):
                          f"across {_tf_workers} process(es)...", "info")
                 _obj_dir_s, _xp_s, _skip_d = str(obj_dir), str(xplane_root), bool(use_pol_polygons)
                 _flat_z = terrain_dem.flat_zones()
+                _area = terrain_dem.area()
+                # parse the drawn terrain mesh once here; the workers load it
+                terrain_dem.get_elevation(xplane_root, _tf_jobs[0][1], _tf_jobs[0][2])
                 try:
                     with ProcessPoolExecutor(max_workers=_tf_workers) as _ex:
                         _futs = [
                             _ex.submit(_terrain_fit_group_worker, _st, _la, _lo, _hd,
-                                       _skip_d, _obj_dir_s, _xp_s, _flat_z)
+                                       _skip_d, _obj_dir_s, _xp_s, _flat_z, _area)
                             for (_st, _la, _lo, _hd) in _tf_jobs
                         ]
                         for _f in as_completed(_futs):
@@ -2898,6 +3058,10 @@ def _run_pipeline(opts, hooks):
         # on the X-Plane ground under each of them (see host_floor.py).
         if xplane_root is not None and _anchor_cluster_candidates:
             try:
+                _parts = _attach_parts_to_buildings(_anchor_cluster_candidates, obj_dir, xplane_root)
+                if _parts:
+                    hooks.log(f"{_parts} building part(s) placed with their building's terrain fit, so the "
+                              f"parts of one building meet.", "info")
                 _hosts, _on_floor = _place_props_on_host_floors(_anchor_cluster_candidates, obj_dir, xplane_root)
                 if _on_floor:
                     hooks.log(f"{_on_floor} placement(s) inside {_hosts} building(s) set on their building's "
@@ -2932,15 +3096,18 @@ def _run_pipeline(opts, hooks):
             except Exception as e:
                 hooks.log(f"(couldn't attach separate lights to lamp posts: {e})", "warning")
 
-        # Geometry below an object's zero point: that depth becomes a
-        # negative AGL height (_sink_below_zero); the geometry is unchanged.
-        try:
-            _sunk = _sink_below_zero(_anchor_cluster_candidates, obj_dir)
-            if _sunk:
-                hooks.log(f"{_sunk} placement(s) with geometry below their zero point placed that much "
-                          f"lower (negative AGL height).", "info")
-        except Exception as e:
-            hooks.log(f"(couldn't lower below-zero objects: {e})", "warning")
+        # Looping paths (vehicles driving round) follow the X-Plane ground.
+        if xplane_root is not None:
+            try:
+                _paths = _paths_on_terrain(dsf_tiles, obj_dir, xplane_root)
+                if _paths:
+                    hooks.log(f"{_paths} moving object(s) set to follow the terrain along their path.", "info")
+            except Exception as e:
+                hooks.log(f"(couldn't set moving objects onto the terrain: {e})", "warning")
+
+        # No height change for geometry below an object's zero point: X-Plane
+        # stands an object on its origin like MSFS does, so parts below it
+        # are already below the ground.
 
         try:
             _airport_alt = native_airport_layout.alt_m if native_airport_layout is not None else None

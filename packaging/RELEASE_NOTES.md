@@ -1,19 +1,24 @@
-Test build: below-zero geometry as negative AGL height, props on the
-building floor as placed, vehicles on paths turn.
+Test build: heights from the terrain X-Plane actually draws, building
+parts fitted together, vehicles driving their path on the terrain.
 
 ## What's new
 
-- **Below-zero geometry**: an object whose geometry reaches below its zero
-  point (drain channels, quay walls into the water) is placed lower by
-  that depth, as a negative AGL height. The geometry itself is no longer
-  modified (the lowered `_dn` copies are gone).
-- **Props inside buildings** (seats, desks, people) sit on the building's
-  floor as the building is actually placed -- including buildings that
-  were terrain-fitted with a warp or a skirt lift -- sampled right under
-  each prop.
-- **Path animations**: a looping animation that both moves and turns a
-  part (the airport bus) now does both; before only the move was kept,
-  so the bus slid along its path without turning.
+- **Terrain heights from X-Plane's own mesh**: every height the converter
+  works out (terrain fit, props on floors, paths) now comes from the
+  terrain mesh X-Plane draws, not the elevation raster it was built from.
+  Between mesh points the drawn ground can sit well off the raster, which
+  left objects floating or sunk by small amounts here and there. Falls
+  back to the raster where a tile's mesh can't be read.
+- **Building parts fit together**: parts of one building placed as
+  separate objects (wings, interiors, facades) take the building's own
+  terrain correction -- warped with it, or raised/lowered to its level --
+  instead of each being corrected on its own.
+- **Moving vehicles**: wheels follow the vehicle along its path while
+  spinning (every animated level of a looping animation is kept), and
+  the path itself is raised or lowered onto the X-Plane ground at each
+  point.
+- **Below-zero geometry**: the negative-AGL experiment from 1.1.9 is
+  removed; models stand on their MSFS zero point, unchanged.
 
 ## Windows
 

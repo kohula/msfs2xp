@@ -1,7 +1,5 @@
 """
-Geometry below an object's zero point (a drain channel, a quay wall into
-the water) is given as a negative AGL height on every part of the
-placement; the geometry itself stays as modelled.
+The per-placement height report (msfs2xp_placements.csv).
 """
 import tempfile
 import unittest
@@ -10,7 +8,6 @@ from pathlib import Path
 import numpy as np
 
 import pipeline
-import terrain_fit
 from mesh_convert import mesh_ir
 
 
@@ -24,35 +21,6 @@ def _tile(name, bottom=-1.2):
 
 def _cand(**entries):
     return {"stem_entries": {k: (v[0], False, v[1], "negligible") for k, v in entries.items()}}
-
-
-class TestSinkBelowZero(unittest.TestCase):
-    def tearDown(self):
-        terrain_fit._ir_cache.clear()
-
-    def test_depth_becomes_negative_agl_on_every_part(self):
-        with tempfile.TemporaryDirectory() as td:
-            obj_dir = Path(td)
-            mesh_ir.save(_tile("drain"), mesh_ir.sidecar_path_for(obj_dir / "drain.obj"))
-            mesh_ir.save(_tile("grate", bottom=-0.3), mesh_ir.sidecar_path_for(obj_dir / "grate.obj"))
-            drain, grate = {"name": "drain", "agl": 0.0}, {"name": "grate", "agl": 0.5}
-            c = _cand(drain=(drain, False), grate=(grate, False))
-            self.assertEqual(pipeline._sink_below_zero([c], obj_dir), 1)
-            self.assertAlmostEqual(drain["agl"], -1.2)
-            self.assertAlmostEqual(grate["agl"], 0.5 - 1.2)
-            self.assertEqual(drain["name"], "drain")  # geometry untouched
-            self.assertAlmostEqual(float(mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / "drain.obj"))
-                                         .positions[:, 1].min()), -1.2)
-
-    def test_objects_at_or_above_zero_and_draped_parts_stay(self):
-        with tempfile.TemporaryDirectory() as td:
-            obj_dir = Path(td)
-            mesh_ir.save(_tile("slab", bottom=0.0), mesh_ir.sidecar_path_for(obj_dir / "slab.obj"))
-            mesh_ir.save(_tile("decal"), mesh_ir.sidecar_path_for(obj_dir / "decal.obj"))
-            slab, decal = {"name": "slab", "agl": 0.0}, {"name": "decal", "agl": 0.0}
-            self.assertEqual(pipeline._sink_below_zero([_cand(slab=(slab, False), decal=(decal, True))],
-                                                       obj_dir), 0)
-            self.assertEqual((slab["agl"], decal["agl"]), (0.0, 0.0))
 
 
 class TestPlacementReport(unittest.TestCase):

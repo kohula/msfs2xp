@@ -244,5 +244,70 @@ class TestPropsOnHostFloors(unittest.TestCase):
             self.assertEqual(tug, {"name": "tug_tfit_y", "agl": 0.0})
 
 
+class TestBuildingParts(unittest.TestCase):
+    """Separately placed parts of one building take the building's terrain
+    fit, so they meet instead of each being fitted on its own."""
+
+    def tearDown(self):
+        terrain_fit._ir_cache.clear()
+        terrain_dem._dem_cache.clear()
+        terrain_dem._mesh_cache.clear()
+
+    def _setup(self, td):
+        td = Path(td)
+        xp = td / "XPlane"
+        TestPropsOnHostFloors._sloped(None, xp)
+        obj_dir = td / "objects"
+        obj_dir.mkdir()
+        mesh_ir.save(_l_shaped_terminal(), mesh_ir.sidecar_path_for(obj_dir / "terminal.obj"))
+        wing = _ir("wing", [_quad(-5, 5, -3, 3, 0.0), _quad(-5, 5, -3, 3, 4.0)])
+        mesh_ir.save(wing, mesh_ir.sidecar_path_for(obj_dir / "wing.obj"))
+        return xp, obj_dir
+
+    def _cands(self, reason, wing_reason="negligible"):
+        t_lat, t_lon = 47.5, 8.5
+        w_lat, w_lon = local_offset_to_latlon(t_lat, t_lon, 0.0, 15.0, -20.0)
+        self.wing = {"name": "wing_tfit_k", "agl": 0.0}
+        return [
+            {"group_key": (("terminal",), t_lat, t_lon, 0.0, False), "abs_lat": t_lat, "abs_lon": t_lon,
+             "hdg": 0.0, "agl": 0.0, "height_offset": 0.0,
+             "stem_entries": {"terminal": ({"name": "terminal", "agl": 0.0}, False, False, reason)}},
+            {"group_key": (("wing",), w_lat, w_lon, 0.0, False), "abs_lat": w_lat, "abs_lon": w_lon,
+             "hdg": 0.0, "agl": 0.0, "height_offset": 0.0,
+             "stem_entries": {"wing": (self.wing, True, False, wing_reason)}},
+        ]
+
+    def test_part_of_a_level_building_takes_its_level(self):
+        with tempfile.TemporaryDirectory() as td:
+            xp, obj_dir = self._setup(td)
+            cands = self._cands("negligible", "applied_vertical_shift")
+            self.assertEqual(pipeline._attach_parts_to_buildings(cands, obj_dir, xp), 1)
+            g_t = terrain_dem.get_elevation(xp, cands[0]["abs_lat"], cands[0]["abs_lon"])
+            g_w = terrain_dem.get_elevation(xp, cands[1]["abs_lat"], cands[1]["abs_lon"])
+            self.assertEqual(self.wing["name"], "wing")
+            self.assertAlmostEqual(g_w + self.wing["agl"], g_t, places=6)
+
+    def test_part_of_a_warped_building_is_warped_too(self):
+        with tempfile.TemporaryDirectory() as td:
+            xp, obj_dir = self._setup(td)
+            cands = self._cands("applied_rigid_warp", "applied_vertical_shift")
+            self.assertEqual(pipeline._attach_parts_to_buildings(cands, obj_dir, xp), 1)
+            self.assertTrue(self.wing["name"].startswith("wing_wp_"))
+            warped = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{self.wing['name']}.obj"))
+            # the ground rises eastward, so the warped wing's east side is higher
+            east = warped.positions[warped.positions[:, 0] > 0, 1].min()
+            west = warped.positions[warped.positions[:, 0] < 0, 1].min()
+            self.assertGreater(east, west)
+
+    def test_things_outside_the_building_stay(self):
+        with tempfile.TemporaryDirectory() as td:
+            xp, obj_dir = self._setup(td)
+            cands = self._cands("negligible", "applied_vertical_shift")
+            w_lat, w_lon = local_offset_to_latlon(47.5, 8.5, 0.0, 15.0, 15.0)  # the L's open corner
+            cands[1]["abs_lat"], cands[1]["abs_lon"] = w_lat, w_lon
+            self.assertEqual(pipeline._attach_parts_to_buildings(cands, obj_dir, xp), 0)
+            self.assertEqual(self.wing["name"], "wing_tfit_k")
+
+
 if __name__ == "__main__":
     unittest.main()
