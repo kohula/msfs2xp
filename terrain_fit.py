@@ -1,133 +1,73 @@
 """
-Rigid-object terrain-fit workaround.
+Fits placed objects onto X-Plane's terrain through the shared ground grid.
 
-A rigid MSFS building mesh is authored assuming flat ground under its
-whole footprint (X-Plane's OBJECT placement only gives it one drape
-point). Real X-Plane terrain often isn't flat under a large footprint,
-so one side of a big building can visibly float or sink once placed.
-This samples real ground elevation (terrain_dem.py) at each vertex's own
-real-world position and moves that vertex's Y by the difference from the
-object's own drape point -- at whatever resolution the DSF elevation
-raster itself supports (already bilinearly interpolated per point, so
-there's no coarser grid step to approximate away).
+Every MSFS height is a height above one level airport ground; X-Plane's
+terrain isn't level. ground_grid.py holds one terrain height per place,
+and every placed object is moved by it vertex by vertex:
 
-Draped ground-marking/pavement geometry gets the same treatment: ATTR_
-draped re-projects it onto real terrain at render time regardless of
-authored Y, so this doesn't change the main render, but it keeps
-authored Y close to the real contour -- X-Plane 12's shadow pass reads
-authored Y even though the beauty pass doesn't, so a flat Y produced a
-shadow tracking a flat plane instead of the real sloped surface.
+    placed vertex height = grid(vertex position) + MSFS height of the vertex
 
-PER-VERTEX-EXACT SAMPLING, NOT A SHARED-BBOX GRID: draped_merge.py runs
-after this module and welds adjacent draped objects by snapping near-
-coincident vertices. Two adjacent pieces come from different groups, each
-processed by a separate call here -- sampling relative to each group's
-own local bbox grid produced slightly different Y at the same real-world
-boundary point, just enough to push originally-coincident vertices
-outside the weld tolerance. Sampling each vertex's own (lat, lon)
-directly is group-independent, so coincident vertices stay coincident.
+X-Plane stands an object's origin on its own terrain (plus the
+placement's AGL), so a fitted copy carries grid(vertex) - grid(origin) in
+its geometry, and the placement's AGL gets grid(origin) - terrain(origin)
+(the "lift": a few centimetres of grid interpolation, or the level of a
+levelled steep-ground building). Two objects at the same place therefore
+always get the same height, whatever they belong to.
 
-This is a shear/warp, not a physically exact re-drape: normals are left
-unchanged and only Y moves, an accepted simplification since corrections
-are on the order of a building's own footprint-scale terrain variation.
+Faces larger than the grid's bends are subdivided first (refine), so a big
+floor follows the grid between its corners the way a chair standing on it
+does -- otherwise the floor would be flat between its far-apart corners
+while the chair follows the grid. Vertical edges are never split (top and
+bottom share their x/z), so walls and pillars aren't cut up.
 
-CORRECTED PER MODEL, NOT PER SUB-OBJECT: mesh_convert's convert() splits
-one glTF model into several .obj files (one per material/animated node,
-plus a "_lights" one). get_or_create_fitted_group() takes every sibling
-stem from one placement and computes ONE shared footprint bbox to decide
-whether the group as a whole qualifies (terrain data available, not
-AGL-mounted -- AGL placements already carry an explicit runtime
-elevation via DSF's AGL pool, so warping local Y on top would double up
-rather than correct anything).
+A building on steep ground isn't bent to the slope: the pipeline levels the
+grid under it (ground_grid.Grid.level) before fitting, so it -- and
+whatever is placed inside it -- stays level, and a skirt is added below
+its walls down to the terrain (_add_skirt).
 
-Consumes each sibling's .meshir.pkl sidecar (mesh_convert.mesh_ir) --
-real float64 numpy arrays from convert()'s own in-memory data, not a
-reparse of the .obj text. A stem with no sidecar (animated/blink
-objects) is treated as disqualified.
+Draped geometry is warped too: X-Plane drapes it at render time anyway,
+but its shadow is drawn from the authored heights.
 
-RIGID (non-draped) siblings: independently shearing every closely-packed
-vertex of architectural detail (window mullions, cornices) reads as
-visibly warped/jagged geometry, not a clean tilt, for a LARGE footprint
-under gentle/normal terrain -- so those still get ONE uniform vertical
-shift, a pure translation that preserves shape and normals exactly (see
-_robust_vertical_shift). CONFIRMED REAL REGRESSION a plain uniform shift
-has, though: it's one averaged number, so it can only ever be exactly
-right for the group's own AVERAGE terrain delta -- a large footprint that
-sits on a genuine slope (not just sampling noise) still comes out with
-one end floating and the other sunk, no matter how robust the average
-is; a rotation-only correction (an earlier version of this module) has
-the same blind spot for the anchor's own offset, see below. So a group
-gets the SAME per-vertex warp draped content gets instead of a shift
-when EITHER its own footprint is small (_RIGID_WARP_MAX_SIDE_M) -- shear
-risk is negligible at that scale, since real terrain barely varies
-across a few metres anyway, so this is strictly more accurate than an
-averaged shift with no real downside -- OR the sampled terrain across
-the footprint genuinely slopes past _RIGID_WARP_SLOPE_THRESHOLD_M, where
-a real user confirmed large buildings ending up partially underground
-under the old shift-only approach: some visible shear on a big building
-is the accepted trade-off there, since the alternative (part of the
-building buried) is worse. Only draped siblings, the "_lights" sibling's
-point positions, and now qualifying rigid ones get the per-vertex warp;
-a large, gently-sloped rigid group still gets the shift.
-
-TILTING (a single rigid rotation, X-Plane's own runtime TILTED directive
-or an earlier version of this module's own better-sampled equivalent)
-only ever corrects a genuine slope, never a uniform height-offset error
--- a rotation around the object's own origin can't move that origin
-itself, so if the anchor's own real elevation differs from what the
-object assumes, every part of it stays wrong by that same amount no
-matter how well the tilt is fit. mesh_convert.convert() no longer emits
-TILTED at all, and this module no longer rotates either -- every rigid
-group gets the shift or the warp instead, chosen by the rule above,
-regardless of footprint size.
-
-The shift itself is a ROBUST estimate, not a single point: several real
-terrain samples are taken across the group's shared footprint (the same
-grid used for the qualifying negligible-check and the warp/shift
-decision above), a median-absolute-deviation outlier rejection throws
-out any sample that disagrees sharply with the rest (a lone DSF
-triangulation seam or DEM spike under one corner), and the mean of what's
-left is the one number applied to every rigid vertex in the group.
-
-Terrain sampling failures degrade gracefully: no X-Plane install/py7zr/
-origin elevation skips the whole group (no reference, no correction);
-an individual vertex's own sample being unavailable (NODATA, tile edge)
-only leaves that vertex unwarped. This is a best-effort visual
-improvement, never something that should block a conversion run.
+Unreadable terrain only leaves an object as converted; a fit never stops a
+conversion.
 """
 
 import dataclasses
 import hashlib
+import math
 import pickle
 from pathlib import Path
 
 import numpy as np
 
+import ground_grid
 import terrain_dem
-from geo_transform import local_offset_to_latlon
 from mesh_convert import mesh_ir
 
-_NOISE_FLOOR_M = 0.10  # skip a group whose sampled corners all correct by less than this
-_SHIFT_OUTLIER_MAD_K = 3.0  # modified-z-score cutoff (see _robust_vertical_shift) for rejecting a spiky sample
-_RIGID_WARP_MAX_SIDE_M = 10.0  # footprint this small or smaller: per-vertex warp, not a shift (see module docstring)
-_RIGID_WARP_SLOPE_THRESHOLD_M = 1.0  # sampled corner spread past this: warp even a large footprint
-# A building on a steep slope is not warped either: that tilts its roof.
-# It is lifted level to the highest ground under it instead, and a skirt is
-# added below its walls down to the terrain (see _add_skirt). Steep means
-# the ground's gradient (a plane fitted to the footprint's terrain samples)
-# is over _SKIRT_MIN_GRADIENT -- not merely that the ground varies by a
-# metre somewhere under a large footprint, which is a gentle slope a big
-# building sits on fine with the ordinary fit.
+_NEGLIGIBLE_M = 0.01      # every vertex this close to its origin's grid height: no fitted copy
+_REFINE_TOL_M = 0.02      # an edge is split when the grid bends more than this under its middle
+_REFINE_MIN_EDGE_M = 0.5  # ...and it is longer than this (horizontally)
+_REFINE_MAX_ROUNDS = 12
+_REFINE_MAX_GROWTH = 8    # a mesh is never refined past this many times its triangles...
+_REFINE_MIN_BUDGET = 50_000  # ...plus this many (a big floor can be two triangles)
+_LIFT_MIN_M = 0.005       # smaller placement lifts are left out
+
+# A building on steep ground is levelled instead of bent: steep means the
+# ground's gradient (a plane fitted to samples across its footprint) is
+# over _SKIRT_MIN_GRADIENT, the ground drops more than _SKIRT_MIN_SPREAD_M
+# under it, and it is taller than _SKIRT_MIN_HEIGHT_M (a flat plate just
+# follows the ground).
 _SKIRT_MIN_HEIGHT_M = 1.0
 _SKIRT_MIN_GRADIENT = 0.03  # 3 % (~1.7 degrees): about 1 m across a 30 m building
-_SKIRT_MIN_SPREAD_M = 0.3  # ...and at least this much drop under it
+_SKIRT_MIN_SPREAD_M = 0.3
+_SKIRT_MAX_AGL_M = 0.5      # only things standing on the ground get a skirt
 _SKIRT_BAND_M = 0.25  # how far above the object's lowest point a wall edge still counts as its bottom
 _SKIRT_WALL_NY = 0.5  # a triangle whose normal's |y| is below this is a wall
 _SKIRT_MIN_DROP_M = 0.05  # no skirt piece where the wall already meets the ground
 
-_ir_cache = {}       # obj_stem -> loaded MeshIR, or None if no sidecar / TILTED / no geometry+lights
-_group_cache = {}     # (tuple(sorted(obj_stems)), lat_r, lon_r, hdg_r) -> {obj_stem: (result_stem, applied, reason)}
-_group_transform_cache = {}  # group_key -> transform dict (see get_or_create_fitted_group), or absent if never reached that far
+_ir_cache = {}      # obj_stem -> MeshIR, or None if no sidecar / no geometry or lights
+_group_cache = {}   # group key -> {obj_stem: (result_stem, applied, reason)}
+_lift_cache = {}    # group key -> metres to add to the placement's AGL
 
 
 def _load_ir(obj_dir: Path, obj_stem: str):
@@ -146,96 +86,188 @@ def _load_ir(obj_dir: Path, obj_stem: str):
     return ir
 
 
-def _point_elevation_delta(base_lat, base_lon, heading_deg, local_x, local_z, xplane_root, origin_elev, cache):
-    """Real elevation at this exact real-world point minus origin_elev, or
-    None if unavailable (NODATA, tile missing, ...). See the module
-    docstring for why this samples each point directly instead of
-    interpolating within a shared-bbox grid. cache: a dict scoped to one
-    get_or_create_fitted_group() call, keyed by (local_x, local_z) rounded
-    to the centimeter -- multiple vertices (across siblings, or shared
-    mesh edges) commonly land on the exact or near-exact same local point,
-    and a centimeter is already far below both _NOISE_FLOOR_M and
-    draped_merge's own weld tolerance, so reusing the sample is safe."""
-    key = (round(local_x, 2), round(local_z, 2))
-    if key in cache:
-        return cache[key]
-    lat, lon = local_offset_to_latlon(base_lat, base_lon, heading_deg, local_x, local_z)
-    elev = terrain_dem.get_elevation(xplane_root, lat, lon)
-    delta = None if elev is None else (elev - origin_elev)
-    cache[key] = delta
-    return delta
+def group_key(obj_stems, lat, lon, heading_deg, skip_draped_positions=False):
+    return (tuple(sorted(obj_stems)), round(lat, 6), round(lon, 6), round(heading_deg, 2),
+            bool(skip_draped_positions))
 
 
-def _robust_vertical_shift(corner_samples, mad_k=_SHIFT_OUTLIER_MAD_K):
-    """corner_samples: [(local_x, local_z, elevation_delta), ...] real
-    terrain samples across a group's shared footprint. Returns a single
-    float -- the one vertical shift to apply to every rigid vertex in the
-    group -- or None if there are no samples at all.
+def group_lift(key):
+    """Metres the placement's AGL needs on top of its MSFS height (see the
+    module docstring), or 0.0."""
+    return _lift_cache.get(key, 0.0)
 
-    Robust, not a single point: a lone DSF triangulation seam or DEM spike
-    under one sample would otherwise skew a plain average by exactly as
-    much as it's wrong. Rejects outliers via a modified z-score against
-    the median (median absolute deviation, scaled by the standard 1.4826
-    constant so MAD is comparable to a normal distribution's std-dev),
-    then returns the mean of whatever samples survive. Falls back to
-    using every sample if the rejection would leave nothing (e.g. exactly
-    two samples that disagree with each other -- no way to tell which one
-    is the outlier, so trust both rather than neither) or if there's no
-    spread to reject against at all (every sample agrees)."""
-    if not corner_samples:
+
+# --- footprints ------------------------------------------------------------
+
+def model_extent(obj_dir, obj_stems):
+    """Extent of one placed model's sub-objects in its own frame:
+    {"x0", "x1", "z0", "z1"} over all geometry and lights, plus "rigid":
+    (y_min, y_max) of its non-draped geometry, or None without any.
+    None when nothing has a readable sidecar."""
+    obj_dir = Path(obj_dir)
+    xs, zs, ys = [], [], []
+    for stem in obj_stems:
+        ir = _load_ir(obj_dir, stem)
+        if ir is None:
+            continue
+        if len(ir.positions):
+            xs += [float(ir.positions[:, 0].min()), float(ir.positions[:, 0].max())]
+            zs += [float(ir.positions[:, 2].min()), float(ir.positions[:, 2].max())]
+            if not ir.draped:
+                ys += [float(ir.positions[:, 1].min()), float(ir.positions[:, 1].max())]
+        for light in ir.lights:
+            xs.append(float(light.pos[0]))
+            zs.append(float(light.pos[2]))
+    if not xs:
         return None
-    deltas = np.array([d for _, _, d in corner_samples], dtype=np.float64)
-    if len(deltas) < 3:
-        return float(np.mean(deltas))
-    med = float(np.median(deltas))
-    mad = float(np.median(np.abs(deltas - med)))
-    if mad < 1e-9:
-        return med
-    modified_z = np.abs(deltas - med) / (1.4826 * mad)
-    clean = deltas[modified_z <= mad_k]
-    if len(clean) == 0:
-        clean = deltas
-    return float(np.mean(clean))
+    return {"x0": min(xs), "x1": max(xs), "z0": min(zs), "z1": max(zs),
+            "rigid": (min(ys), max(ys)) if ys else None}
 
 
-def _robust_max(corner_samples, mad_k=_SHIFT_OUTLIER_MAD_K):
-    """The highest terrain delta among corner_samples once the same MAD
-    outlier rejection as _robust_vertical_shift has thrown out spikes, or
-    None if there are no samples."""
-    if not corner_samples:
-        return None
-    deltas = np.array([d for _, _, d in corner_samples], dtype=np.float64)
-    if len(deltas) >= 3:
-        med = float(np.median(deltas))
-        mad = float(np.median(np.abs(deltas - med)))
-        if mad > 1e-9:
-            clean = deltas[np.abs(deltas - med) / (1.4826 * mad) <= mad_k]
-            if len(clean):
-                deltas = clean
-    return float(deltas.max())
+def footprint_corners(lat, lon, heading_deg, ext, margin=0.0):
+    """The extent's rectangle as four (lat, lon) corners, grown by margin."""
+    xs = [ext["x0"] - margin, ext["x1"] + margin, ext["x1"] + margin, ext["x0"] - margin]
+    zs = [ext["z0"] - margin, ext["z0"] - margin, ext["z1"] + margin, ext["z1"] + margin]
+    lats, lons = ground_grid.local_to_latlon_many(lat, lon, heading_deg, xs, zs)
+    return list(zip(lats.tolist(), lons.tolist()))
 
 
-def _ground_gradient(corner_samples):
-    """Steepness (rise over run) of the plane best fitting corner_samples
-    [(local_x, local_z, delta), ...]; 0 with fewer than 3 usable samples."""
-    if len(corner_samples) < 3:
+def _ground_gradient(samples):
+    """Steepness (rise over run) of the plane best fitting samples
+    [(local_x, local_z, height), ...]; 0 with fewer than 3 usable samples."""
+    if len(samples) < 3:
         return 0.0
-    a = np.array([[x, z, 1.0] for x, z, _ in corner_samples], dtype=np.float64)
-    d = np.array([v for _, _, v in corner_samples], dtype=np.float64)
+    a = np.array([[x, z, 1.0] for x, z, _ in samples], dtype=np.float64)
+    d = np.array([v for _, _, v in samples], dtype=np.float64)
     if np.linalg.matrix_rank(a) < 3:
         return 0.0
     (gx, gz, _), *_ = np.linalg.lstsq(a, d, rcond=None)
     return float(np.hypot(gx, gz))
 
 
+def _robust_max(values, mad_k=3.0):
+    """The highest value once spikes (modified z-score past mad_k against
+    the median) are thrown out."""
+    v = np.asarray(values, dtype=np.float64)
+    if len(v) >= 3:
+        med = float(np.median(v))
+        mad = float(np.median(np.abs(v - med)))
+        if mad > 1e-9:
+            clean = v[np.abs(v - med) / (1.4826 * mad) <= mad_k]
+            if len(clean):
+                v = clean
+    return float(v.max())
+
+
+def steep_level(grid, lat, lon, heading_deg, ext, agl=0.0):
+    """The level a building at this placement is set to when it stands on
+    steep ground (see the module docstring), or None when it just follows
+    the grid."""
+    if ext is None or ext.get("rigid") is None or abs(agl) > _SKIRT_MAX_AGL_M:
+        return None
+    y0, y1 = ext["rigid"]
+    if y1 - y0 <= _SKIRT_MIN_HEIGHT_M:
+        return None
+    pts = [(x, z) for x in (ext["x0"], (ext["x0"] + ext["x1"]) / 2, ext["x1"])
+           for z in (ext["z0"], (ext["z0"] + ext["z1"]) / 2, ext["z1"])]
+    lats, lons = ground_grid.local_to_latlon_many(lat, lon, heading_deg, [p[0] for p in pts], [p[1] for p in pts])
+    hs = grid.heights(lats, lons)
+    samples = [(x, z, float(h)) for (x, z), h in zip(pts, hs) if not math.isnan(h)]
+    if len(samples) < 3:
+        return None
+    vals = [h for _, _, h in samples]
+    if max(vals) - min(vals) <= _SKIRT_MIN_SPREAD_M or _ground_gradient(samples) <= _SKIRT_MIN_GRADIENT:
+        return None
+    return _robust_max(vals)
+
+
+# --- geometry --------------------------------------------------------------
+
+def refine(positions, normals, uvs, indices, delta, tol=_REFINE_TOL_M, min_edge=_REFINE_MIN_EDGE_M):
+    """Splits every edge under whose middle the height field delta(xs, zs)
+    bends more than tol away from the straight line between its ends
+    (horizontal length over min_edge), until none is left. The decision
+    depends only on an edge's two end positions, so the triangles on both
+    sides of an edge -- also across a UV seam, where they don't share
+    vertex indices -- split it alike and no cracks open. Returns new
+    (positions, normals, uvs, indices)."""
+    pos = np.asarray(positions, dtype=np.float64)
+    tris = np.asarray(indices, dtype=np.int64).reshape(-1, 3)
+    if not len(tris):
+        return pos, normals, uvs, indices
+    has_n = len(normals) == len(pos)
+    has_uv = len(uvs) == len(pos)
+    nrm = np.asarray(normals, dtype=np.float64) if has_n else None
+    uv = np.asarray(uvs, dtype=np.float64) if has_uv else None
+    limit = len(tris) * _REFINE_MAX_GROWTH + _REFINE_MIN_BUDGET
+    dv = delta(pos[:, 0], pos[:, 2])
+    for _ in range(_REFINE_MAX_ROUNDS):
+        edges = tris[:, [0, 1, 1, 2, 2, 0]].reshape(-1, 2)
+        lo, hi = edges.min(axis=1), edges.max(axis=1)
+        n = len(pos) + 1
+        keys, inv = np.unique(lo * n + hi, return_inverse=True)
+        ua, ub = keys // n, keys % n
+        pa, pb = pos[ua], pos[ub]
+        length = np.hypot(pa[:, 0] - pb[:, 0], pa[:, 2] - pb[:, 2])
+        mid = (pa + pb) / 2.0
+        dev = np.abs(delta(mid[:, 0], mid[:, 2]) - (dv[ua] + dv[ub]) / 2.0)
+        split = (length > min_edge) & (dev > tol)
+        count = int(split.sum())
+        if not count or len(tris) + 3 * count > limit:
+            break
+        new_id = np.full(len(keys), -1, dtype=np.int64)
+        new_id[split] = np.arange(len(pos), len(pos) + count)
+        pos = np.vstack([pos, mid[split]])
+        dv = np.concatenate([dv, delta(mid[split][:, 0], mid[split][:, 2])])
+        if has_n:
+            nm = (nrm[ua[split]] + nrm[ub[split]]) / 2.0
+            ln = np.linalg.norm(nm, axis=1, keepdims=True)
+            nm = np.where(ln > 1e-12, nm / np.where(ln > 1e-12, ln, 1.0), nrm[ua[split]])
+            nrm = np.vstack([nrm, nm])
+        if has_uv:
+            uv = np.vstack([uv, (uv[ua[split]] + uv[ub[split]]) / 2.0])
+        mids = new_id[inv].reshape(-1, 3)  # midpoint of edge ab, bc, ca (-1: not split)
+        tris = _split_triangles(tris, mids)
+    return (pos, nrm if has_n else normals, uv if has_uv else uvs, tris.reshape(-1))
+
+
+def _split_triangles(tris, mids):
+    """tris (T, 3), mids (T, 3) edge-midpoint ids or -1 -> new (T', 3),
+    keeping every triangle's winding."""
+    s = mids >= 0
+    nsplit = s.sum(axis=1)
+    out = [tris[nsplit == 0]]
+
+    def rolled(sel, r):
+        cols = (np.arange(3)[None, :] + r[:, None]) % 3
+        return tris[sel][np.arange(len(r))[:, None], cols], mids[sel][np.arange(len(r))[:, None], cols]
+
+    one = np.nonzero(nsplit == 1)[0]
+    if len(one):
+        v, m = rolled(one, np.argmax(s[one], axis=1))  # the split edge first
+        out += [np.stack([v[:, 0], m[:, 0], v[:, 2]], axis=1), np.stack([m[:, 0], v[:, 1], v[:, 2]], axis=1)]
+    two = np.nonzero(nsplit == 2)[0]
+    if len(two):
+        unsplit = np.argmin(s[two], axis=1)
+        v, m = rolled(two, (unsplit + 1) % 3)  # the unsplit edge last (c-a)
+        out += [np.stack([m[:, 0], v[:, 1], m[:, 1]], axis=1),
+                np.stack([v[:, 0], m[:, 0], m[:, 1]], axis=1),
+                np.stack([v[:, 0], m[:, 1], v[:, 2]], axis=1)]
+    three = np.nonzero(nsplit == 3)[0]
+    if len(three):
+        v, m = tris[three], mids[three]
+        out += [np.stack([v[:, 0], m[:, 0], m[:, 2]], axis=1), np.stack([m[:, 0], v[:, 1], m[:, 1]], axis=1),
+                np.stack([m[:, 2], m[:, 1], v[:, 2]], axis=1), np.stack([m[:, 0], m[:, 1], m[:, 2]], axis=1)]
+    return np.vstack(out)
+
+
 def _add_skirt(ir, top, y_min, delta_at):
-    """The object lifted level by `top` (the highest ground under it),
-    plus a skirt: for every bottom edge of a wall (a near-vertical
-    triangle's edge within _SKIRT_BAND_M of the object's lowest point), a
-    new quad from that edge down to the terrain under it (delta_at(x, z),
-    never above `top`). The original geometry is only translated, so
-    roof and floors stay level and nothing depends on the model's
-    normals. Returns (positions, normals, uvs, indices)."""
+    """The object lifted level by `top`, plus a skirt: for every bottom
+    edge of a wall (a near-vertical triangle's edge within _SKIRT_BAND_M of
+    the object's lowest point), a new quad from that edge down to the
+    terrain under it (delta_at(x, z), never above `top`). The original
+    geometry is only translated, so roof and floors stay level. Returns
+    (positions, normals, uvs, indices)."""
     pos = ir.positions.copy()
     pos[:, 1] += top
     normals = np.asarray(ir.normals, dtype=np.float64) if len(ir.normals) == len(pos) else np.tile([0.0, 1.0, 0.0], (len(pos), 1))
@@ -286,314 +318,121 @@ def _add_skirt(ir, top, y_min, delta_at):
     return pos, normals, uvs, indices
 
 
-def _apply_vertical_shift(ir, vertical_shift):
-    """Pure translation: every vertex's Y moves by the same amount,
-    normals untouched (a translation doesn't rotate anything). Returns
-    shifted_positions; does not touch normals/uvs/indices."""
-    shifted = ir.positions.copy()
-    shifted[:, 1] += vertical_shift
-    return shifted
+# --- fitting ---------------------------------------------------------------
 
-
-def get_cached_transform(group_key):
-    """Returns the {'vertical_shift','base_lat','base_lon','heading_deg',
-    'origin_elev','footprint_area_m2','uses_rigid_warp'} dict
-    get_or_create_fitted_group computed for group_key (vertical_shift is
-    None if that group had no usable samples), or None if that group_key
-    was never processed far enough to have one (disqualified/terrain_
-    unavailable/no_xplane_root -- nothing usable either way). Lets a
-    caller (main.py's anchor-clustering pass) find a shift computed for
-    ONE placement and apply it to a DIFFERENT placement anchored at the
-    same real-world point -- see apply_shared_shift_to_group. Note that
-    apply_shared_shift_to_group only ever borrows vertical_shift, never
-    warps -- a group whose OWN uses_rigid_warp is True computed its warp
-    from its own real per-vertex samples already, so main.py must not
-    override that result with a borrowed sibling's shift (see its own
-    anchor-clustering comment)."""
-    return _group_transform_cache.get(group_key)
-
-
-def apply_shared_shift_to_group(obj_dir, obj_stems, transform, xplane_root):
-    """Retroactively applies an already-computed vertical shift (from a
-    different group_key's terrain-fit result at the same real-world
-    anchor -- see main.py's anchor-clustering pass) to stems that came
-    back disqualified/rigid_skip/negligible on their own.
-
-    Fixes one real-world building split across multiple placements from
-    different source files, which never reach the same group_key since
-    they don't share a model stem (e.g. LHBP's ATC tower: an SPB-attached
-    shell and a plain-BGL-placed interior at the same anchor). Unlike the
-    rotation this replaced, no anchor-delta bookkeeping is needed here:
-    the shift is a property of the shared real-world anchor point (how
-    much real terrain differs from assumed, AT THAT LAT/LON), not of
-    either object's own local coordinate convention, so the identical
-    number applies correctly regardless of the two objects' respective
-    local origins, recenter offsets, or (non-AGL) height conventions.
-
-    Skips draped geometry (never shifted this way) and anything with no
-    real position data (lights are corrected independently, regardless
-    of rigid-shift eligibility)."""
-    obj_dir = Path(obj_dir)
-    vertical_shift = transform.get("vertical_shift") if transform else None
-    if vertical_shift is None:
-        return {stem: (stem, False, "not_applicable") for stem in obj_stems}
-
-    result = {}
-    for stem in obj_stems:
-        ir = _load_ir(obj_dir, stem)
-        if ir is None or not len(ir.positions) or ir.draped:
-            result[stem] = (stem, False, "not_applicable")
-            continue
-
-        shifted = _apply_vertical_shift(ir, vertical_shift)
-
-        digest = hashlib.md5(f"{vertical_shift}_{stem}".encode("utf-8")).hexdigest()[:10]
-        # dataclasses.replace keeps every other field (night/normal
-        # textures, glass, draped layer group) instead of re-listing them.
-        corrected = dataclasses.replace(ir, name=f"{stem}_tfitlink_{digest}", tilted=False, positions=shifted)
-        fitted_path = obj_dir / f"{corrected.name}.obj"
-        if not fitted_path.exists():
-            mesh_ir.write_obj8(corrected, fitted_path)
-            mesh_ir.save(corrected, mesh_ir.sidecar_path_for(fitted_path))
-        result[stem] = (corrected.name, True, "applied_shared_shift")
-
-    return result
+def local_grid(xplane_root, lat, lon, heading_deg, ext, agl=0.0):
+    """A grid for one placement on its own (no shared pipeline grid):
+    posts around its footprint, levelled when it stands on steep ground.
+    Returns (grid, level or None)."""
+    grid = ground_grid.Grid.around(lat, lon)
+    corners = footprint_corners(lat, lon, heading_deg, ext, margin=ground_grid.SPACING_M)
+    lats = [a for a, _ in corners]
+    lons = [o for _, o in corners]
+    grid.cover(min(lats), max(lats), min(lons), max(lons),
+               lambda a, o: terrain_dem.get_elevation(xplane_root, a, o))
+    level = steep_level(grid, lat, lon, heading_deg, ext, agl)
+    if level is not None:
+        grid.level(footprint_corners(lat, lon, heading_deg, ext, margin=ground_grid.SPACING_M), level)
+    return grid, level
 
 
 def get_or_create_fitted_group(obj_dir, obj_stems, base_lat, base_lon, heading_deg, xplane_root,
-                                skip_draped_positions=False):
-    """obj_stems: every sibling .obj stem generated from ONE original
-    model for ONE placement (main.py's own converted_stems_map[original_stem]
-    list). Returns {obj_stem: (result_stem, applied, reason)}, one entry
-    per input stem -- result_stem is obj_stem itself wherever no
-    correction was applied to that particular file.
+                               skip_draped_positions=False, grid=None, skirt_level=None, agl=0.0):
+    """obj_stems: every sub-object .obj stem one model produced, for ONE
+    placement. They are fitted together (one origin, one grid). grid: the
+    pipeline's shared ground_grid.Grid, already levelled where needed --
+    skirt_level is then the level the pipeline set under this placement
+    (None when it didn't). Without a grid, one is built for this placement
+    alone (local_grid). Returns {obj_stem: (result_stem, applied, reason)};
+    group_lift() then gives the AGL to add to the placement's non-draped
+    parts.
 
-    skip_draped_positions: when True, draped siblings' per-vertex position
-    warp is skipped entirely (rigid siblings and lights are still
-    corrected normally) -- for the .pol/DSF-polygon conversion path,
-    where a real DRAPED_POLYGON has no elevation field of its own (X-Plane
-    projects it onto sampled terrain natively) and draped_merge.
-    _triangles_to_polygons never reads Y when serializing, so this warp's
-    output would be silently discarded anyway; skipping it avoids paying
-    for per-vertex sampling that can't affect that render path."""
+    skip_draped_positions: leave draped geometry as it is (the .pol path
+    writes it as DSF polygons, which have no heights)."""
     obj_dir = Path(obj_dir)
+    key = group_key(obj_stems, base_lat, base_lon, heading_deg, skip_draped_positions)
+    if key in _group_cache:
+        return _group_cache[key]
+
+    def done(result, lift=0.0):
+        _group_cache[key] = result
+        _lift_cache[key] = lift
+        return result
 
     if xplane_root is None:
-        return {stem: (stem, False, "no_xplane_root") for stem in obj_stems}
-
-    lat_r, lon_r, hdg_r = round(base_lat, 6), round(base_lon, 6), round(heading_deg, 2)
-    group_key = (tuple(sorted(obj_stems)), lat_r, lon_r, hdg_r, bool(skip_draped_positions))
-    if group_key in _group_cache:
-        return _group_cache[group_key]
-
+        return done({stem: (stem, False, "no_xplane_root") for stem in obj_stems})
     loaded = {stem: _load_ir(obj_dir, stem) for stem in obj_stems}
-    geo_stems = [s for s, ir in loaded.items() if ir is not None and len(ir.positions)]
-    if not geo_stems:
-        result = {stem: (stem, False, "disqualified") for stem in obj_stems}
-        _group_cache[group_key] = result
-        return result
+    ext = model_extent(obj_dir, obj_stems)
+    if ext is None:
+        return done({stem: (stem, False, "disqualified") for stem in obj_stems})
+    if grid is None:
+        grid, skirt_level = local_grid(xplane_root, base_lat, base_lon, heading_deg, ext, agl)
 
-    x_min = min(float(loaded[s].positions[:, 0].min()) for s in geo_stems)
-    x_max = max(float(loaded[s].positions[:, 0].max()) for s in geo_stems)
-    z_min = min(float(loaded[s].positions[:, 2].min()) for s in geo_stems)
-    z_max = max(float(loaded[s].positions[:, 2].max()) for s in geo_stems)
-    max_side = max(x_max - x_min, z_max - z_min)
+    origin_grid = grid.height(base_lat, base_lon)
+    origin_terrain = terrain_dem.get_elevation(xplane_root, base_lat, base_lon)
+    if origin_grid is None or origin_terrain is None:
+        return done({stem: (stem, False, "terrain_unavailable") for stem in obj_stems})
+    lift = origin_grid - origin_terrain
+    lift = lift if abs(lift) >= _LIFT_MIN_M else 0.0
 
-    origin_elev = terrain_dem.get_elevation(xplane_root, base_lat, base_lon)
-    if origin_elev is None:
-        result = {stem: (stem, False, "terrain_unavailable") for stem in obj_stems}
-        _group_cache[group_key] = result
-        return result
+    def delta(xs, zs):
+        lats, lons = ground_grid.local_to_latlon_many(base_lat, base_lon, heading_deg, xs, zs)
+        d = grid.heights(lats, lons) - origin_grid
+        return np.where(np.isnan(d), 0.0, d)
 
-    point_cache = {}
+    def terrain_delta(x, z):
+        lat, lon = ground_grid.local_to_latlon_many(base_lat, base_lon, heading_deg, [x], [z])
+        t = terrain_dem.get_elevation(xplane_root, float(lat[0]), float(lon[0]))
+        return None if t is None else t - origin_grid
 
-    # A denser grid than 4 bare corners (corners, edge midpoints, center)
-    # feeds _robust_vertical_shift's outlier rejection more samples to
-    # work with -- important now that ANY one of them being a spike could
-    # otherwise pull the single shift value applied to the whole group.
-    x_mid = (x_min + x_max) / 2.0
-    z_mid = (z_min + z_max) / 2.0
-    grid_points = [(gx, gz) for gx in (x_min, x_mid, x_max) for gz in (z_min, z_mid, z_max)]
-    corner_samples = [
-        (gx, gz, d) for gx, gz, d in (
-            (gx, gz, _point_elevation_delta(base_lat, base_lon, heading_deg, gx, gz, xplane_root, origin_elev, point_cache))
-            for gx, gz in grid_points
-        ) if d is not None
-    ]
-    if corner_samples and max(abs(d) for _, _, d in corner_samples) < _NOISE_FLOOR_M:
-        result = {stem: (stem, False, "negligible") for stem in obj_stems}
-        _group_cache[group_key] = result
-        return result
+    # negligible when no vertex (or light) of the whole model moves
+    spread = 0.0
+    for ir in loaded.values():
+        if ir is None:
+            continue
+        if len(ir.positions) and not (ir.draped and skip_draped_positions):
+            spread = max(spread, float(np.abs(delta(ir.positions[:, 0], ir.positions[:, 2])).max()))
+        if ir.lights:
+            pts = np.array([l.pos for l in ir.lights], dtype=np.float64)
+            spread = max(spread, float(np.abs(delta(pts[:, 0], pts[:, 2])).max()))
+    if spread < _NEGLIGIBLE_M and skirt_level is None:
+        return done({stem: (stem, False, "negligible") for stem in obj_stems}, lift)
 
-    vertical_shift = _robust_vertical_shift(corner_samples)
-
-    # See the module docstring: warp per-vertex instead of one averaged
-    # shift when the footprint is small enough that shear risk is
-    # negligible, or when the sampled terrain genuinely slopes more than
-    # a shift could represent with one number.
-    slope_spread = (max(d for _, _, d in corner_samples) - min(d for _, _, d in corner_samples)
-                     ) if len(corner_samples) >= 2 else 0.0
-    group_uses_rigid_warp = max_side <= _RIGID_WARP_MAX_SIDE_M or slope_spread > _RIGID_WARP_SLOPE_THRESHOLD_M
-
-    # Steep ground under something tall: level + skirt instead of a warp
-    # that would tilt its roof.
-    rigid_geo = [loaded[s] for s in geo_stems if not loaded[s].draped]
-    rigid_y_min = min(float(ir.positions[:, 1].min()) for ir in rigid_geo) if rigid_geo else 0.0
-    rigid_y_max = max(float(ir.positions[:, 1].max()) for ir in rigid_geo) if rigid_geo else 0.0
-    skirt_top = None
-    if (rigid_geo and slope_spread > _SKIRT_MIN_SPREAD_M
-            and rigid_y_max - rigid_y_min > _SKIRT_MIN_HEIGHT_M
-            and _ground_gradient(corner_samples) > _SKIRT_MIN_GRADIENT):
-        skirt_top = _robust_max(corner_samples)
-        vertical_shift = skirt_top
-        group_uses_rigid_warp = False
-
-    # Cached regardless of whether vertical_shift ended up None (an
-    # explicit "this group has no correction to offer" is as useful to a
-    # cross-group lookup as a real one) -- see get_cached_transform /
-    # apply_shared_shift_to_group. footprint_area_m2 lets main.py's
-    # anchor-clustering pass pick the most reliable member of a same-
-    # anchor bucket (see its own comment) -- a wider footprint spreads
-    # the sampling grid over more real ground, so its robust mean is
-    # less exposed to a single DEM/DSF-triangulation noise spike than a
-    # small one's.
-    _group_transform_cache[group_key] = {
-        "vertical_shift": vertical_shift,
-        "base_lat": base_lat, "base_lon": base_lon, "heading_deg": heading_deg,
-        "origin_elev": origin_elev,
-        "footprint_area_m2": (x_max - x_min) * (z_max - z_min),
-        "uses_rigid_warp": group_uses_rigid_warp,
-    }
-
-    digest = hashlib.md5(f"{lat_r}_{lon_r}_{hdg_r}".encode("utf-8")).hexdigest()[:10]
-
+    rigid_y_min = ext["rigid"][0] if ext.get("rigid") else 0.0
+    digest = hashlib.md5(f"{key[1]}_{key[2]}_{key[3]}_{skirt_level}".encode("utf-8")).hexdigest()[:10]
     result = {}
     for stem in obj_stems:
         ir = loaded[stem]
         if ir is None:
             result[stem] = (stem, False, "not_applicable")
             continue
-
-        # CONFIRMED REAL REGRESSION: this was hardcoded to False, on the
-        # reasoning that a per-vertex warp of draped geometry is invisible
-        # in-sim (X-Plane re-projects every ATTR_draped surface onto the
-        # compiled terrain mesh at render time regardless of the OBJ's own
-        # Y) -- true for the main beauty-pass render, but X-Plane 12's
-        # shadow pass reads authored Y even though the beauty pass
-        # doesn't, so a flat/un-warped Y produced a shadow tracking a
-        # flat plane instead of the real (often gently sloped) surface
-        # underneath it. Confirmed against an older working snapshot
-        # (predates this regression) whose own comment on this exact line
-        # names the real-world symptom directly: making draped siblings
-        # reach this warp -- and therefore the corrected-copy + sidecar
-        # write below, which is what makes them visible to draped_merge.
-        # py's own welding/dedup pass -- is what fixed "duplicated/
-        # unwelded pavement". `skip_draped_positions` (.pol mode) still
-        # skips it: a real DRAPED_POLYGON has no elevation field of its
-        # own at all, and draped_merge._triangles_to_polygons never reads
-        # Y when serializing, so the warp's output would be silently
-        # discarded downstream anyway in that mode.
-        # RIGID geometry gets the SAME per-vertex warp as draped content
-        # when the group's own footprint qualifies (group_uses_rigid_warp,
-        # see the module docstring), otherwise ONE uniform vertical shift
-        # -- a rotation-only correction can't fix a uniform height-offset
-        # error, and per-vertex warping shears rigid architectural detail
-        # for a large footprint under normal terrain, which is why the
-        # shift stays the default there. Light positions are corrected
-        # regardless of the sibling's draped flag -- each LIGHT_SPILL_
-        # CUSTOM is an independent point, not mesh topology, so moving it
-        # carries none of the shear/re-drape concerns above.
-        warp_positions = bool(len(ir.positions)) and ir.draped and not skip_draped_positions
-        rigid_skirt = bool(len(ir.positions)) and not ir.draped and skirt_top is not None
-        rigid_warp = bool(len(ir.positions)) and not ir.draped and group_uses_rigid_warp
-        rigid_shift = (bool(len(ir.positions)) and not ir.draped and not group_uses_rigid_warp
-                       and vertical_shift is not None and not rigid_skirt)
-        warp_lights = bool(ir.lights)
-        if not warp_positions and not rigid_warp and not rigid_shift and not rigid_skirt and not warp_lights:
-            if ir.draped and skip_draped_positions and len(ir.positions):
-                result[stem] = (stem, False, "skipped_for_polygon_mode")
-            else:
-                result[stem] = (stem, False, "rigid_skip" if len(ir.positions) else "disqualified")
+        has_geo = bool(len(ir.positions))
+        if has_geo and ir.draped and skip_draped_positions and not ir.lights:
+            result[stem] = (stem, False, "skipped_for_polygon_mode")
             continue
-
-        corrected = dataclasses.replace(
-            # tilted=False whenever this sibling's geometry is corrected
-            # (warp or shift), replacing TILTED's own rotation rather
-            # than stacking with it. A sibling reaching here only for its
-            # lights keeps its original tilted flag untouched. Geometry
-            # and lights start empty and are filled in below, exactly as
-            # before; every other field (night/normal textures, glass,
-            # draped layer group) carries over.
-            ir, name=f"{stem}_tfit_{digest}",
-            tilted=False if (warp_positions or rigid_warp or rigid_shift or rigid_skirt) else ir.tilted,
-            positions=np.zeros((0, 3)), normals=np.zeros((0, 3)), uvs=np.zeros((0, 2)),
-            indices=np.zeros((0,), dtype=np.int64), lights=[],
-        )
-        if rigid_skirt:
-            corrected.positions, corrected.normals, corrected.uvs, corrected.indices = _add_skirt(
-                ir, skirt_top, rigid_y_min,
-                lambda x, z: _point_elevation_delta(base_lat, base_lon, heading_deg, x, z,
-                                                    xplane_root, origin_elev, point_cache))
-        elif warp_positions or rigid_warp:
-            warped = ir.positions.copy()
-            for i in range(len(warped)):
-                d = _point_elevation_delta(
-                    base_lat, base_lon, heading_deg,
-                    float(ir.positions[i, 0]), float(ir.positions[i, 2]),
-                    xplane_root, origin_elev, point_cache)
-                if d is not None:
-                    warped[i, 1] += d
-            corrected.positions = warped
-            corrected.normals = ir.normals
-            corrected.uvs = ir.uvs
-            corrected.indices = ir.indices
-        elif rigid_shift:
-            # A pure translation -- every vertex moves by the identical
-            # amount, shape and normals both entirely unchanged. Shared
-            # with apply_shared_shift_to_group's cross-group case -- see
-            # _apply_vertical_shift.
-            corrected.positions = _apply_vertical_shift(ir, vertical_shift)
-            corrected.normals = ir.normals
-            corrected.uvs = ir.uvs
-            corrected.indices = ir.indices
-        elif len(ir.positions):
-            corrected.positions = ir.positions
-            corrected.normals = ir.normals
-            corrected.uvs = ir.uvs
-            corrected.indices = ir.indices
-
-        if warp_lights:
-            new_lights = []
-            for light in ir.lights:
-                px, py, pz = light.pos
-                if skirt_top is not None:
-                    d = skirt_top  # lights move with the lifted body
-                else:
-                    d = _point_elevation_delta(base_lat, base_lon, heading_deg, px, pz, xplane_root, origin_elev, point_cache)
-                new_lights.append(mesh_ir.LightEntry(
-                    pos=(px, py + (d or 0.0), pz), dir=light.dir, color=light.color,
-                    cone_angle=light.cone_angle, size=light.size, dataref=light.dataref,
-                    named_light=light.named_light,
-                ))
-            corrected.lights = new_lights
-
-        fitted_path = obj_dir / f"{corrected.name}.obj"
-        if not fitted_path.exists():
-            mesh_ir.write_obj8(corrected, fitted_path)
-            # Also write a MeshIR sidecar, same as convert() does --
-            # draped_merge.py's _load_candidate only reads .meshir.pkl,
-            # never the .obj text, so a corrected draped stem without one
-            # silently falls back to passthrough (never welded/deduped).
-            mesh_ir.save(corrected, mesh_ir.sidecar_path_for(fitted_path))
-        if rigid_skirt:
-            _reason = "applied_skirt"
-        elif rigid_shift:
-            _reason = "applied_vertical_shift"
-        elif rigid_warp and not warp_positions:
-            _reason = "applied_rigid_warp"
-        else:
-            _reason = "applied"
-        result[stem] = (corrected.name, True, _reason)
-
-    _group_cache[group_key] = result
-    return result
+        fitted = dataclasses.replace(ir, name=f"{stem}_tfit_{digest}", tilted=False if has_geo else ir.tilted)
+        reason = "applied"
+        if has_geo and not (ir.draped and skip_draped_positions):
+            if skirt_level is not None and not ir.draped:
+                fitted.positions, fitted.normals, fitted.uvs, fitted.indices = _add_skirt(
+                    ir, 0.0, rigid_y_min, terrain_delta)
+                reason = "applied_skirt"
+            else:
+                pos, nrm, uv, idx = (ir.positions, ir.normals, ir.uvs, ir.indices) if ir.draped else refine(
+                    ir.positions, ir.normals, ir.uvs, ir.indices, delta)
+                pos = np.array(pos, dtype=np.float64)
+                pos[:, 1] += delta(pos[:, 0], pos[:, 2])
+                fitted.positions, fitted.normals, fitted.uvs = pos, nrm, uv
+                fitted.indices = np.asarray(idx, dtype=np.int64)
+        if ir.lights:
+            pts = np.array([l.pos for l in ir.lights], dtype=np.float64)
+            ds = delta(pts[:, 0], pts[:, 2]) if skirt_level is None else np.zeros(len(pts))
+            fitted.lights = [dataclasses.replace(l, pos=(l.pos[0], l.pos[1] + float(d), l.pos[2]))
+                             for l, d in zip(ir.lights, ds)]
+        path = obj_dir / f"{fitted.name}.obj"
+        if not path.exists():
+            mesh_ir.write_obj8(fitted, path)
+            # draped_merge and later passes read the sidecar, not the .obj
+            mesh_ir.save(fitted, mesh_ir.sidecar_path_for(path))
+        result[stem] = (fitted.name, True, reason)
+    return done(result, lift)

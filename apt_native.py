@@ -221,7 +221,7 @@ def _metadata(layout, stock_block, ident, flatten):
     # flatten 1 levels the terrain inside the airport boundary (row 130),
     # which is what MSFS does under its airports. Off unless asked for: a
     # stock block's own flatten is dropped too, so X-Plane's terrain is
-    # kept (props follow their buildings' floors instead, host_floor.py).
+    # kept (models are fitted onto it instead, ground_grid.py).
     meta.pop("flatten", None)
     if flatten:
         meta["flatten"] = "1"

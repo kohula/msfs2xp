@@ -59,7 +59,7 @@ class TestPathsOnTerrain(unittest.TestCase):
                 {"pivot": [0.0, 0.0, 0.0], "keys": [[0.0, 0.0, 0.0, 0.0], [10.0, 500.0, 0.0, 0.0]]}))
             entry = {"name": "bus_Body", "lat": 47.5, "lon": 8.5, "hdg": 0.0, "agl": 0.0}
             tiles = {(47, 8): [entry]}
-            self.assertEqual(pipeline._paths_on_terrain(tiles, obj_dir, xp), 1)
+            self.assertEqual(pipeline._paths_on_terrain(tiles, obj_dir, pipeline._ground_at(None, xp)), 1)
             self.assertTrue(entry["name"].startswith("bus_Body_rt_"))
             text = (obj_dir / f"{entry['name']}.obj").read_text()
             keys = [l.split() for l in text.splitlines() if l.startswith("ANIM_trans_key")]

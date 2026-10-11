@@ -72,12 +72,13 @@ class TestRunwayClutter(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             obj_dir = Path(td)
             for ir in (_box("cover", 2, 0.15, 1), _box("sign", 3, 1.2, 0.3), _box("decal", 2, 0.0, 2),
-                       _box("sheet", 300, 0.2, 200)):
+                       _box("sheet", 300, 0.2, 200), _box("hall", 40, 8.0, 30)):
                 mesh_ir.save(ir, mesh_ir.sidecar_path_for(obj_dir / f"{ir.name}.obj"))
             terrain_fit._ir_cache.clear()
             ground = runway_clutter.AirportGround([], self.strips)
             on = self._at(100, 5)
             off = self._at(100, 80)
+            indoors = self._at(300, 5)
             cover_on, cover_off, cover_on_floor = {"name": "cover"}, {"name": "cover"}, {"name": "cover"}
             sign_on, decal_on = {"name": "sign"}, {"name": "decal"}
             sheet = {"name": "sheet", "agl": 0.0}
@@ -86,7 +87,9 @@ class TestRunwayClutter(unittest.TestCase):
                     "cover": (cover_on, False, False, "negligible"), "decal": (decal_on, False, True, "applied")}},
                 {"abs_lat": off[0], "abs_lon": off[1], "agl": 0.0,
                  "stem_entries": {"cover": (cover_off, False, False, "x")}},
-                {"abs_lat": on[0], "abs_lon": on[1], "agl": 0.0, "hosted": True,
+                {"abs_lat": indoors[0], "abs_lon": indoors[1], "agl": 0.0, "hdg": 0.0,
+                 "stem_entries": {"hall": ({"name": "hall"}, False, False, "x")}},
+                {"abs_lat": indoors[0], "abs_lon": indoors[1], "agl": 0.0,
                  "stem_entries": {"cover": (cover_on_floor, False, False, "x")}},
                 {"abs_lat": on[0], "abs_lon": on[1], "agl": 0.0,
                  "stem_entries": {"sign": (sign_on, False, False, "x")}},

@@ -1,11 +1,11 @@
 """
-terrain_fit.py rewritten to consume MeshIR sidecars (mesh_convert.mesh_ir)
-instead of regex-parsing OBJ8 text, and geo_transform.py instead of its
-own duplicated rotation math. Pins the "corrected per model, not per
-sub-object" grouping policy: a too-small-to-qualify-alone sibling and the
-"_lights" companion must get the IDENTICAL correction as their large
-sibling at the same real-world point.
+Objects are fitted onto X-Plane's terrain through one shared ground grid
+(ground_grid.py, terrain_fit.py): two objects at the same place get the
+same height whatever they belong to, so a seat stays on its floor and a
+deck on its pillars on uneven ground.
 """
+import math
+import struct
 import sys
 import tempfile
 import unittest
@@ -13,688 +13,283 @@ from pathlib import Path
 
 import numpy as np
 
+import ground_grid
 import terrain_dem
 import terrain_fit
-
-sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
-from dsf_fixture import build_elevation_dsf  # noqa: E402
-from gltf_builder import GltfBuilder, flat_quad  # noqa: E402
-
-import mesh_convert
+from geo_transform import local_offset_to_latlon
 from mesh_convert import mesh_ir
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
+from dsf_fixture import build_elevation_dsf, build_mesh_dsf  # noqa: E402
 
-class TestTerrainFit(unittest.TestCase):
-    def _write_sloped_terrain(self, root: Path, tile_lat: int, tile_lon: int, slope_per_post: float):
-        width = height = 5
-        grid = [[col * slope_per_post for col in range(width)] for _ in range(height)]
-        folder = f"{(tile_lat // 10) * 10:+03d}{(tile_lon // 10) * 10:+04d}"
-        dsf_dir = root / "Global Scenery" / "X-Plane 12 Global Scenery" / "Earth nav data" / folder
-        dsf_dir.mkdir(parents=True, exist_ok=True)
-        (dsf_dir / f"{tile_lat:+03d}{tile_lon:+04d}.dsf").write_bytes(build_elevation_dsf(grid))
+LAT, LON = 47.5, 8.5
 
-    def _write_bumpy_terrain(self, root: Path, tile_lat: int, tile_lon: int, bump_scale: float):
-        """A real quadratic bump (not a pure linear ramp) -- unlike
-        _write_sloped_terrain, a symmetric footprint's own grid samples
-        do NOT cancel out to zero when averaged: a linear slope sampled
-        symmetrically around its own center averages to exactly the
-        center's own value (a pure tilt, which _robust_vertical_shift
-        correctly leaves alone -- that's what rotation is for), while a
-        real bump/dip genuinely shifts the whole footprint's average
-        elevation relative to the anchor, which is what a uniform shift
-        SHOULD correct for."""
-        N = 5  # same grid size as _write_sloped_terrain, whose spacing is proven to reach a real object's footprint
-        mid = N // 2
-        grid = [[int(((r - mid) ** 2 + (c - mid) ** 2) * bump_scale) for c in range(N)] for r in range(N)]
-        folder = f"{(tile_lat // 10) * 10:+03d}{(tile_lon // 10) * 10:+04d}"
-        dsf_dir = root / "Global Scenery" / "X-Plane 12 Global Scenery" / "Earth nav data" / folder
-        dsf_dir.mkdir(parents=True, exist_ok=True)
-        (dsf_dir / f"{tile_lat:+03d}{tile_lon:+04d}.dsf").write_bytes(build_elevation_dsf(grid))
 
-    def _build_glb(self, path: Path, name: str, texture_name: str, x0, x1, z0, z1, y=0.0):
-        b = GltfBuilder()
-        tex = b.add_image_data_uri((150, 150, 150, 255), name=texture_name)
-        texi = b.add_texture(tex)
-        mat = b.add_material(f"{name}Mat", base_color_texture_index=texi)
-        positions = [(x0, y, z0), (x1, y, z0), (x1, y, z1), (x0, y, z1)]
-        normals = [(0.0, 1.0, 0.0)] * 4
-        uvs = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
-        indices = [0, 1, 2, 0, 2, 3]
-        mesh = b.add_mesh(positions, indices, normals=normals, uvs=uvs, material_index=mat)
-        b.add_node(mesh_index=mesh, name=name)
-        path.write_bytes(b.build())
+def _ridge_dsf(height=1.0, half_width_deg=0.0005):
+    """X-Plane terrain at 100 m with a ridge `height` m high along latitude
+    LAT, falling to 100 m within half_width_deg north and south of it."""
+    rows = [(47.0, 100.0), (LAT - half_width_deg, 100.0), (LAT, 100.0 + height),
+            (LAT + half_width_deg, 100.0), (48.0, 100.0)]
+    pts = [(lon, lat, z) for lat, z in rows for lon in (8.0, 9.0)]
+    tris = []
+    for r in range(len(rows) - 1):
+        a, b, c, d = 2 * r, 2 * r + 1, 2 * r + 3, 2 * r + 2
+        tris += [a, b, c, a, c, d]
+    cmds = bytes([18, 1]) + struct.pack("<ff", 0.0, -1.0)
+    cmds += bytes([23, len(tris)]) + struct.pack(f"<{len(tris)}H", *tris)
+    return build_mesh_dsf(pts, cmds, elev_range=(90.0, 40.0))
 
-    def _build_box_glb(self, path: Path, name: str, texture_name: str, half_size: float, height: float = 6.0):
-        """Walls + roof -- genuinely non-flat, so mesh_convert classifies
-        the whole file TILTED (same shape as
-        test_flatness_tilted_exclusivity.test_genuine_3d_building_stays_rigid).
-        half_size controls footprint: large enough clears terrain_fit's own
-        size gate, small enough stays under it."""
-        b = GltfBuilder()
-        tex = b.add_image_data_uri((150, 150, 150, 255), name=texture_name)
-        texi = b.add_texture(tex)
-        mat = b.add_material(f"{name}Mat", base_color_texture_index=texi)
-        hs = half_size
-        bx = [(-hs, 0, -hs), (hs, 0, -hs), (hs, 0, hs), (-hs, 0, hs),
-              (-hs, height, -hs), (hs, height, -hs), (hs, height, hs), (-hs, height, hs)]
-        wall_tris = []
-        for a, c, d, e in [(0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)]:
-            wall_tris += [(a, c, d), (a, d, e)]
-        roof_tris = [(4, 5, 6), (4, 6, 7)]
-        indices = [i for tri in (wall_tris + roof_tris) for i in tri]
-        mesh = b.add_mesh(
-            bx, indices, normals=[(0.0, 1.0, 0.0)] * len(bx), uvs=[(0.0, 0.0)] * len(bx), material_index=mat)
-        b.add_node(mesh_index=mesh, name=name)
-        path.write_bytes(b.build())
 
-    def test_draped_siblings_and_lights_companion_all_get_the_identical_correction(self):
-        """Both "Walls" and "Trim" are flat quads here, so convert() emits
-        both as ATTR_draped ground-level geometry -- draped content is
-        eligible for the real per-vertex terrain warp now (same as rigid
-        buildings; ATTR_draped still re-projects it at render time
-        regardless, so this doesn't change the main render, only what's
-        available to whatever else reads authored Y -- see terrain_fit's
-        own module docstring). Trim's own footprint is compact relative to
-        ITS OWN bbox (not just the group's shared bbox dominated by Walls),
-        so it must NOT be mistaken for sparse/GPU-instanced-looking content
-        and skipped -- all three siblings, including the synthetic "_lights"
-        companion, must land on the exact same Y correction at their shared
-        real-world point, pinning the "one consistent decision for the
-        whole group" grouping contract this module has always guaranteed."""
-        with tempfile.TemporaryDirectory() as td:
-            td = Path(td)
-            xplane_root = td / "XPlaneRoot"
-            self._write_sloped_terrain(xplane_root, 47, 8, slope_per_post=3000.0)
+def _install(root, dsf_bytes):
+    d = root / "Global Scenery" / "X-Plane 12 Global Scenery" / "Earth nav data" / "+40+000"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "+47+008.dsf").write_bytes(dsf_bytes)
+    return root
 
-            obj_dir = td / "objects"
-            tex_dir = td / "textures"
-            obj_dir.mkdir()
-            tex_dir.mkdir()
 
-            base_lat, base_lon, heading = 47.5, 8.5, 0.0
+def _quad_ir(name, half_x, half_z, y=0.0, draped=False, walls=0.0):
+    """A floor (two triangles) half_x by half_z around the origin, with
+    optional walls `walls` m high along its south and north edges."""
+    pos = [(-half_x, y, -half_z), (half_x, y, -half_z), (half_x, y, half_z), (-half_x, y, half_z)]
+    idx = [0, 2, 1, 0, 3, 2]
+    if walls:
+        for z in (-half_z, half_z):
+            k = len(pos)
+            pos += [(-half_x, y, z), (half_x, y, z), (half_x, y + walls, z), (-half_x, y + walls, z)]
+            idx += [k, k + 1, k + 2, k, k + 2, k + 3]
+    pos = np.array(pos, dtype=np.float64)
+    return mesh_ir.MeshIR(name=name, positions=pos, normals=np.tile([0.0, 1.0, 0.0], (len(pos), 1)),
+                          uvs=np.zeros((len(pos), 2)), indices=np.array(idx, dtype=np.int64), draped=draped)
 
-            # Walls + Trim as two materials/nodes in ONE glb (like a real
-            # MSFS model split by material into several sibling .obj files
-            # by one convert() call), not two separate glb files -- convert()
-            # now re-centers a whole model around its own shared XZ
-            # footprint (see convert.py's re-centering pass), so two
-            # genuinely separate files no longer share a coordinate frame
-            # the way real convert()-time siblings automatically do.
-            b = GltfBuilder()
-            walls_tex = b.add_texture(b.add_image_data_uri((150, 150, 150, 255), name="WallsTex"))
-            walls_mat = b.add_material("WallsMat", base_color_texture_index=walls_tex)
-            trim_tex = b.add_texture(b.add_image_data_uri((150, 150, 150, 255), name="TrimTex"))
-            trim_mat = b.add_material("TrimMat", base_color_texture_index=trim_tex)
 
-            wp, wn, wuv, wi = flat_quad(-15, 15, -10, 10)
-            walls_mesh = b.add_mesh(wp, wi, normals=wn, uvs=wuv, material_index=walls_mat)
-            b.add_node(mesh_index=walls_mesh, name="Walls")
+def _save(obj_dir, ir):
+    mesh_ir.save(ir, mesh_ir.sidecar_path_for(obj_dir / f"{ir.name}.obj"))
+    (obj_dir / f"{ir.name}.obj").write_text("I\n800\nOBJ\n")
 
-            tp, tn, tuv, ti = flat_quad(14, 15, 9, 10)
-            trim_mesh = b.add_mesh(tp, ti, normals=tn, uvs=tuv, material_index=trim_mat)
-            b.add_node(mesh_index=trim_mesh, name="Trim")
 
-            model_glb = td / "building.glb"
-            model_glb.write_bytes(b.build())
-            result = mesh_convert.convert(model_glb, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
-            walls_stem = next(p.stem for p in result if "Walls" in p.stem)
-            trim_stem = next(p.stem for p in result if "Trim" in p.stem)
+def _surface_y(ir, x, z):
+    """Height of the upward-facing surface of ir under (x, z)."""
+    best = None
+    for a, b, c in ir.indices.reshape(-1, 3):
+        pa, pb, pc = ir.positions[a], ir.positions[b], ir.positions[c]
+        m = np.array([[pb[0] - pa[0], pc[0] - pa[0]], [pb[2] - pa[2], pc[2] - pa[2]]])
+        if abs(np.linalg.det(m)) < 1e-9:
+            continue
+        u, v = np.linalg.solve(m, [x - pa[0], z - pa[2]])
+        if u >= -1e-9 and v >= -1e-9 and u + v <= 1 + 1e-9:
+            y = pa[1] + u * (pb[1] - pa[1]) + v * (pc[1] - pa[1])
+            best = y if best is None else min(best, y)
+    return best
 
-            # A synthetic "_lights" sidecar sharing the same group, matching
-            # what convert() itself would produce for the building's own
-            # point lights (built directly since gltf_builder doesn't cover
-            # ASOBO_macro_light end-to-end placement here).
-            lights_stem = "building_lights"
-            lights_ir = mesh_ir.MeshIR(
-                name=lights_stem,
-                lights=[mesh_ir.LightEntry(pos=(15.0, 8.5, 10.0), dir=(0.0, -1.0, 0.0),
-                                            color=(1.0, 1.0, 1.0), cone_angle=360.0, size=1.5, dataref="NULL")],
-            )
-            mesh_ir.save(lights_ir, mesh_ir.sidecar_path_for(obj_dir / f"{lights_stem}.obj"))
 
-            stems = [walls_stem, trim_stem, lights_stem]
-            results = terrain_fit.get_or_create_fitted_group(obj_dir, stems, base_lat, base_lon, heading, xplane_root)
+class _Base(unittest.TestCase):
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.td = Path(self._td.name)
+        self.obj_dir = self.td / "objects"
+        self.obj_dir.mkdir()
 
-            self.assertTrue(results[walls_stem][1], "large sibling should qualify")
-            self.assertTrue(results[trim_stem][1], "too-small-alone sibling should still be corrected as part of the group")
-            self.assertTrue(results[lights_stem][1], "lights companion should also be corrected")
-
-            def y_at(obj_stem, target_x, target_z):
-                text = (obj_dir / f"{results[obj_stem][0]}.obj").read_text(encoding="utf-8")
-                for line in text.splitlines():
-                    if line.startswith("VT "):
-                        p = line.split()
-                        if abs(float(p[1]) - target_x) < 1e-6 and abs(float(p[3]) - target_z) < 1e-6:
-                            return float(p[2])
-                return None
-
-            walls_y = y_at(walls_stem, 15.0, 10.0)
-            trim_y = y_at(trim_stem, 15.0, 10.0)
-            self.assertIsNotNone(walls_y)
-            self.assertIsNotNone(trim_y)
-            self.assertNotAlmostEqual(walls_y, 0.0, places=3, msg="draped geometry must now receive the real terrain warp")
-            self.assertAlmostEqual(walls_y, trim_y, places=5,
-                                    msg="Trim must get the identical correction as Walls at their shared point, "
-                                        "not be skipped as sparse/instanced-looking just because it's small")
-
-            light_text = (obj_dir / f"{results[lights_stem][0]}.obj").read_text(encoding="utf-8")
-            # LIGHT_PARAM <name> px py pz ...  -> py is token index 3
-            light_line = next(l for l in light_text.splitlines() if l.startswith("LIGHT_PARAM "))
-            light_py = float(light_line.split()[3])
-            self.assertAlmostEqual(light_py - 8.5, walls_y, places=5,
-                                    msg="the lights companion must get the same correction as the draped siblings too")
-
-    def test_skip_draped_positions_leaves_draped_siblings_unwarped_but_still_corrects_lights(self):
-        """Per the user's own explicit instruction for the .pol/DSF-polygon
-        conversion path: "the terrain fit should be applied to every object
-        placed on the ground, except the polygons, as they are going to be
-        DRAPED". skip_draped_positions=True must leave every DRAPED
-        sibling's own geometry completely untouched (result_stem == the
-        original stem, applied=False, reason="skipped_for_polygon_mode") --
-        a real DRAPED_POLYGON has no elevation field of its own at all, so
-        warping it here would be silently discarded downstream anyway (see
-        this module's own docstring for get_or_create_fitted_group). The
-        lights companion is a separate, independent point (not connected
-        mesh topology) and must still be corrected exactly as before --
-        this flag only ever gates the draped position warp, nothing else."""
-        with tempfile.TemporaryDirectory() as td:
-            td = Path(td)
-            xplane_root = td / "XPlaneRoot"
-            self._write_sloped_terrain(xplane_root, 47, 8, slope_per_post=3000.0)
-
-            obj_dir = td / "objects"
-            tex_dir = td / "textures"
-            obj_dir.mkdir()
-            tex_dir.mkdir()
-
-            base_lat, base_lon, heading = 47.5, 8.5, 0.0
-
-            b = GltfBuilder()
-            walls_tex = b.add_texture(b.add_image_data_uri((150, 150, 150, 255), name="WallsTex"))
-            walls_mat = b.add_material("WallsMat", base_color_texture_index=walls_tex)
-            wp, wn, wuv, wi = flat_quad(-15, 15, -10, 10)
-            walls_mesh = b.add_mesh(wp, wi, normals=wn, uvs=wuv, material_index=walls_mat)
-            b.add_node(mesh_index=walls_mesh, name="Walls")
-            model_glb = td / "building.glb"
-            model_glb.write_bytes(b.build())
-            result = mesh_convert.convert(model_glb, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
-            walls_stem = next(p.stem for p in result if "Walls" in p.stem)
-
-            lights_stem = "building_lights"
-            lights_ir = mesh_ir.MeshIR(
-                name=lights_stem,
-                lights=[mesh_ir.LightEntry(pos=(15.0, 8.5, 10.0), dir=(0.0, -1.0, 0.0),
-                                            color=(1.0, 1.0, 1.0), cone_angle=360.0, size=1.5, dataref="NULL")],
-            )
-            mesh_ir.save(lights_ir, mesh_ir.sidecar_path_for(obj_dir / f"{lights_stem}.obj"))
-
-            stems = [walls_stem, lights_stem]
-            results = terrain_fit.get_or_create_fitted_group(
-                obj_dir, stems, base_lat, base_lon, heading, xplane_root, skip_draped_positions=True)
-
-            self.assertEqual(results[walls_stem], (walls_stem, False, "skipped_for_polygon_mode"))
-            self.assertTrue(results[lights_stem][1], "lights companion is still corrected")
-
-    def _build_split_box_glb(self, path: Path, name: str, half_size: float, height: float):
-        """A building as real models are built: every face its own
-        vertices -- four walls, a roof, and a ground-floor slab at y=0."""
-        b = GltfBuilder()
-        tex = b.add_image_data_uri((150, 150, 150, 255), name=f"{name}Tex")
-        mat = b.add_material(f"{name}Mat", base_color_texture_index=b.add_texture(tex))
-        hs = half_size
-        faces = [
-            ([(-hs, 0, -hs), (hs, 0, -hs), (hs, height, -hs), (-hs, height, -hs)], (0, 0, -1)),
-            ([(hs, 0, -hs), (hs, 0, hs), (hs, height, hs), (hs, height, -hs)], (1, 0, 0)),
-            ([(hs, 0, hs), (-hs, 0, hs), (-hs, height, hs), (hs, height, hs)], (0, 0, 1)),
-            ([(-hs, 0, hs), (-hs, 0, -hs), (-hs, height, -hs), (-hs, height, hs)], (-1, 0, 0)),
-            ([(-hs, height, -hs), (hs, height, -hs), (hs, height, hs), (-hs, height, hs)], (0, 1, 0)),
-            ([(-hs, 0, -hs), (hs, 0, -hs), (hs, 0, hs), (-hs, 0, hs)], (0, 1, 0)),
-        ]
-        positions, normals, indices = [], [], []
-        for quad, n in faces:
-            k = len(positions)
-            positions += quad
-            normals += [n] * 4
-            indices += [k, k + 1, k + 2, k, k + 2, k + 3]
-        mesh = b.add_mesh(positions, indices, normals=normals, uvs=[(0.0, 0.0)] * len(positions),
-                          material_index=mat)
-        b.add_node(mesh_index=mesh, name=name)
-        path.write_bytes(b.build())
-
-    def _fit_split_box(self, td, terrain, half_size, height):
-        terrain_fit._group_cache.clear()
+    def tearDown(self):
         terrain_fit._ir_cache.clear()
-        terrain_fit._group_transform_cache.clear()
-        xplane_root = td / "XPlaneRoot"
-        terrain(xplane_root)
-        obj_dir = td / "objects"
-        tex_dir = td / "textures"
-        obj_dir.mkdir()
-        tex_dir.mkdir()
-        glb = td / "building.glb"
-        self._build_split_box_glb(glb, "Building", half_size, height)
-        result = mesh_convert.convert(glb, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
-        stem = result[0].stem
-        self.assertNotIn("ATTR_draped", result[0].read_text(encoding="utf-8"), "test setup: expected rigid")
-        original = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{stem}.obj"))
-        result_stem, applied, reason = terrain_fit.get_or_create_fitted_group(
-            obj_dir, [stem], 47.5, 8.5, 0.0, xplane_root)[stem]
-        corrected = (mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{result_stem}.obj"))
-                     if result_stem != stem else original)
-        transform = terrain_fit.get_cached_transform(((stem,), 47.5, 8.5, 0.0, False))
-        return original, corrected, applied, reason, transform
+        terrain_fit._group_cache.clear()
+        terrain_fit._lift_cache.clear()
+        terrain_dem._dem_cache.clear()
+        terrain_dem._mesh_cache.clear()
+        self._td.cleanup()
 
-    def _assert_level_with_skirt(self, original, corrected, transform):
-        top = transform["vertical_shift"]
-        n = len(original.positions)
-        # every original vertex -- roof, floor, walls -- moves by the same
-        # amount: the building stays level
-        np.testing.assert_allclose(corrected.positions[:n, 1] - original.positions[:, 1], top, atol=1e-6)
-        np.testing.assert_allclose(corrected.positions[:n, [0, 2]], original.positions[:, [0, 2]], atol=1e-9)
-        # skirt pieces were added below the walls, reaching down toward the
-        # lower ground and never above the lifted base
-        skirt = corrected.positions[n:]
-        self.assertGreater(len(skirt), 0)
-        base = float(original.positions[:, 1].min()) + top
-        self.assertTrue(np.all(skirt[:, 1] <= base + 1e-6))
-        self.assertGreater(base - float(skirt[:, 1].min()), 1.0, "the low side's skirt must reach down")
-        self.assertEqual(len(corrected.indices) % 3, 0)
-        self.assertEqual(int(np.max(corrected.indices)) + 1, len(corrected.positions))
+    def _grid(self, xp, half=120.0):
+        a0, o0 = local_offset_to_latlon(LAT, LON, 0.0, -half, half)
+        a1, o1 = local_offset_to_latlon(LAT, LON, 0.0, half, -half)
+        grid = ground_grid.Grid.around(LAT, LON)
+        grid.cover(a0, a1, o0, o1, lambda a, o: terrain_dem.get_elevation(xp, a, o))
+        return grid
 
-    def test_tall_building_on_very_steep_ground_is_level_with_a_skirt(self):
-        """CONFIRMED REAL BUG: on steep ground the per-vertex warp bent a
-        whole building to the slope, roof included. A building there is
-        lifted level to the highest ground under it, and skirt pieces are
-        added below its walls down to the terrain."""
+    def _placed(self, xp, stem, lat, lon, grid=None, hdg=0.0):
+        """(fitted MeshIR, height of its origin in X-Plane, result tuple)."""
+        res = terrain_fit.get_or_create_fitted_group(self.obj_dir, [stem], lat, lon, hdg, xp, grid=grid)[stem]
+        lift = terrain_fit.group_lift(terrain_fit.group_key([stem], lat, lon, hdg))
+        ir = mesh_ir.load(mesh_ir.sidecar_path_for(self.obj_dir / f"{res[0]}.obj"))
+        return ir, terrain_dem.get_elevation(xp, lat, lon) + lift, res
+
+
+class TestGrid(unittest.TestCase):
+    def _plane_grid(self):
+        grid = ground_grid.Grid.around(LAT, LON)
+        grid.cover(LAT - 0.001, LAT + 0.001, LON - 0.001, LON + 0.001, lambda a, o: 1000 * (a - LAT) + 50.0)
+        return grid
+
+    def test_bilinear_reproduces_a_plane(self):
+        grid = self._plane_grid()
+        for da in (-0.0007, 0.0, 0.00031):
+            self.assertAlmostEqual(grid.height(LAT + da, LON + 0.0002), 1000 * da + 50.0, places=6)
+        self.assertIsNone(grid.height(LAT + 1.0, LON))
+
+    def test_a_post_without_terrain_drops_out(self):
+        grid = ground_grid.Grid.around(LAT, LON)
+        grid.cover(LAT - 0.001, LAT + 0.001, LON - 0.001, LON + 0.001, lambda a, o: None if a > LAT else 20.0)
+        self.assertAlmostEqual(grid.height(LAT, LON), 20.0, places=6)
+
+    def test_level_sets_the_posts_inside_once(self):
+        grid = self._plane_grid()
+        big = [local_offset_to_latlon(LAT, LON, 0.0, x, z) for x, z in ((-30, -30), (30, -30), (30, 30), (-30, 30))]
+        small = [local_offset_to_latlon(LAT, LON, 0.0, x, z) for x, z in ((-5, -5), (5, -5), (5, 5), (-5, 5))]
+        self.assertGreater(grid.level(big, 77.0), 0)
+        self.assertEqual(grid.level(small, 12.0), 0)  # the larger building came first
+        self.assertAlmostEqual(grid.height(LAT, LON), 77.0, places=6)
+        far_lat, far_lon = local_offset_to_latlon(LAT, LON, 0.0, 0.0, 60.0)
+        self.assertAlmostEqual(grid.height(far_lat, far_lon), 1000 * (far_lat - LAT) + 50.0, places=6)
+
+    def test_save_and_load(self):
+        grid = self._plane_grid()
         with tempfile.TemporaryDirectory() as td:
-            original, corrected, applied, reason, transform = self._fit_split_box(
-                Path(td), lambda r: self._write_sloped_terrain(r, 47, 8, slope_per_post=3000.0), 15.0, 6.0)
-            self.assertTrue(applied, reason)
-            self.assertEqual(reason, "applied_skirt")
-            self._assert_level_with_skirt(original, corrected, transform)
-
-    def test_oversized_footprint_on_real_slope_is_level_and_not_buried(self):
-        with tempfile.TemporaryDirectory() as td:
-            original, corrected, applied, reason, transform = self._fit_split_box(
-                Path(td), lambda r: self._write_sloped_terrain(r, 47, 8, slope_per_post=3000.0), 300.0, 6.0)
-            self.assertEqual(reason, "applied_skirt")
-            self._assert_level_with_skirt(original, corrected, transform)
-
-    def test_flat_piece_on_steep_ground_still_follows_it(self):
-        """Low flat pieces (pavement, plates) have no roof to tilt: they
-        keep the per-vertex warp even on steep ground."""
-        with tempfile.TemporaryDirectory() as td:
-            original, corrected, applied, reason, transform = self._fit_split_box(
-                Path(td), lambda r: self._write_sloped_terrain(r, 47, 8, slope_per_post=3000.0), 15.0, 0.4)
-            if original.draped:
-                self.skipTest("converter drapes this slab")
-            self.assertTrue(applied, reason)
-            self.assertEqual(reason, "applied_rigid_warp")
-
-    def test_large_building_on_a_gentle_slope_is_not_skirted(self):
-        """The ground drops several metres under a 600 m building, but at
-        a 1 % gradient: that is not steep, so it keeps the ordinary fit."""
-        with tempfile.TemporaryDirectory() as td:
-            original, corrected, applied, reason, transform = self._fit_split_box(
-                Path(td), lambda r: self._write_sloped_terrain(r, 47, 8, slope_per_post=190.0), 300.0, 6.0)
-            self.assertTrue(applied, reason)
-            self.assertNotEqual(reason, "applied_skirt")
-            self.assertEqual(len(corrected.positions), len(original.positions))
-
-    def test_gradient_of_the_ground_under_a_footprint(self):
-        flat = [(x, z, 0.0) for x in (-10, 0, 10) for z in (-10, 0, 10)]
-        self.assertAlmostEqual(terrain_fit._ground_gradient(flat), 0.0)
-        ramp = [(x, z, 0.05 * x) for x in (-10, 0, 10) for z in (-10, 0, 10)]
-        self.assertAlmostEqual(terrain_fit._ground_gradient(ramp), 0.05)
-        self.assertEqual(terrain_fit._ground_gradient([(0, 0, 1.0), (1, 0, 2.0)]), 0.0)
-
-    def test_building_on_gentle_ground_keeps_the_ordinary_fit(self):
-        """No skirt unless the ground is very steep: a big building on
-        gently uneven ground keeps the ordinary vertical shift."""
-        with tempfile.TemporaryDirectory() as td:
-            original, corrected, applied, reason, transform = self._fit_split_box(
-                Path(td), lambda r: self._write_bumpy_terrain(r, 47, 8, bump_scale=60.0), 15.0, 6.0)
-            self.assertNotEqual(reason, "applied_skirt")
-            self.assertEqual(len(corrected.positions), len(original.positions))
-
-    def test_small_object_gets_the_precise_warp_no_size_disqualification(self):
-        """CONFIRMED REAL BUG this pins: terrain_fit's own correction used
-        to be gated to objects with a footprint >=300m2/10m-per-side, with
-        X-Plane's own TILTED rotation left as the ONLY correction for
-        anything smaller -- but TILTED can only ever fix a genuine local
-        SLOPE, never a flat-out wrong anchor elevation (a rotation can't
-        move its own origin). That left small/medium objects silently
-        uncorrected for exactly the more common real problem. There is no
-        disqualification gate any more: this 8m-wide box (small enough to
-        have failed the old 10m-per-side gate) on genuinely uneven terrain
-        must now be corrected too -- and, being this small, with the
-        precise per-vertex warp rather than an averaged shift (see
-        _RIGID_WARP_MAX_SIDE_M in the module docstring: real terrain
-        barely varies at all across a footprint this size, so the warp
-        carries no meaningful shear risk and is strictly more accurate).
-        Bumpy, not linearly-sloped, terrain: a symmetric footprint on a
-        pure linear slope averages to zero by construction (that's a
-        tilt, not an offset -- see _write_bumpy_terrain's own docstring)."""
-        with tempfile.TemporaryDirectory() as td:
-            td = Path(td)
-            xplane_root = td / "XPlaneRoot"
-            self._write_bumpy_terrain(xplane_root, 47, 8, bump_scale=1500.0)
-            obj_dir = td / "objects"
-            tex_dir = td / "textures"
-            obj_dir.mkdir()
-            tex_dir.mkdir()
-
-            small_glb = td / "small_box.glb"
-            self._build_box_glb(small_glb, "SmallBox", "SmallBoxTex", half_size=4.0, height=3.0)
-            result = mesh_convert.convert(small_glb, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
-            stem = result[0].stem
-            self.assertNotIn("ATTR_draped", result[0].read_text(encoding="utf-8"),
-                              "test setup issue: expected this small box fixture to convert as rigid")
-            original_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{stem}.obj"))
-
-            results = terrain_fit.get_or_create_fitted_group(obj_dir, [stem], 47.5, 8.5, 0.0, xplane_root)
-            result_stem, applied, reason = results[stem]
-            self.assertTrue(applied, f"a small object on meaningfully sloped terrain must now be corrected too (reason={reason})")
-            self.assertEqual(reason, "applied_rigid_warp")
-            self.assertNotEqual(result_stem, stem, "a corrected copy should have been written")
-
-            corrected_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{result_stem}.obj"))
-            self.assertFalse(np.allclose(original_ir.positions, corrected_ir.positions, atol=1e-6),
-                              "expected the warp to actually move the geometry, not be a no-op")
-
-    def test_shared_shift_links_a_disqualified_sibling_at_the_same_anchor(self):
-        """Universal fix for: one real-world building instance split into
-        two placements from different source paths (confirmed real case:
-        LHBP's ATC tower -- an SPB-attached exterior shell + a plain-BGL-
-        placed interior, at the same real-world anchor, that never share a
-        model stem so never reach the same terrain_fit group_key). Both
-        the shell and the (now, with no size gate) small interior qualify
-        independently, but each samples its OWN (differently-sized)
-        footprint, so on genuinely uneven (not just linearly sloped --
-        see _write_bumpy_terrain) terrain their independently-computed
-        shifts can legitimately differ. apply_shared_shift_to_group, fed
-        the shell's cached transform via get_cached_transform, must
-        override the interior with the shell's EXACT shift value instead
-        -- no anchor-delta bookkeeping needed (unlike the rotation this
-        replaced): the shift is a property of the shared real-world
-        anchor, not of either object's own local-frame convention or its
-        own footprint, so it applies directly regardless of the
-        interior's own (different) recenter offset or AGL height."""
-        with tempfile.TemporaryDirectory() as td:
-            td = Path(td)
-            xplane_root = td / "XPlaneRoot"
-            self._write_bumpy_terrain(xplane_root, 47, 8, bump_scale=1500.0)
-            obj_dir = td / "objects"
-            tex_dir = td / "textures"
-            obj_dir.mkdir()
-            tex_dir.mkdir()
-
-            shell_glb = td / "shell.glb"
-            self._build_box_glb(shell_glb, "Shell", "ShellTex", half_size=15.0)
-            shell_result = mesh_convert.convert(shell_glb, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
-            shell_stem = shell_result[0].stem
-
-            interior_glb = td / "interior.glb"
-            self._build_box_glb(interior_glb, "Interior", "InteriorTex", half_size=4.0, height=3.0)
-            interior_result = mesh_convert.convert(interior_glb, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
-            interior_stem = interior_result[0].stem
-            original_interior_positions = mesh_ir.load(
-                mesh_ir.sidecar_path_for(obj_dir / f"{interior_stem}.obj")).positions.copy()
-
-            # Same anchor for both -- the whole point of the scenario.
-            anchor_lat, anchor_lon, anchor_hdg = 47.5, 8.5, 0.0
-
-            shell_group_key = (tuple(sorted([shell_stem])), round(anchor_lat, 6), round(anchor_lon, 6),
-                                round(anchor_hdg, 2), False)
-            shell_results = terrain_fit.get_or_create_fitted_group(
-                obj_dir, [shell_stem], anchor_lat, anchor_lon, anchor_hdg, xplane_root)
-            _, shell_applied, shell_reason = shell_results[shell_stem]
-            self.assertTrue(shell_applied, f"test setup issue: expected the shell to qualify (reason={shell_reason})")
-
-            # The interior, evaluated on its own, ALSO qualifies now (no
-            # size gate) -- but its own independently-sampled footprint
-            # gives it a genuinely different shift value than the shell's,
-            # setting up the real point of this test: explicit linking
-            # below must override that with the shell's exact value.
-            interior_results_alone = terrain_fit.get_or_create_fitted_group(
-                obj_dir, [interior_stem], anchor_lat, anchor_lon, anchor_hdg, xplane_root)
-            self.assertTrue(interior_results_alone[interior_stem][1], "test setup issue: expected the interior to also qualify alone")
-
-            transform = terrain_fit.get_cached_transform(shell_group_key)
-            self.assertIsNotNone(transform)
-            self.assertIsNotNone(transform["vertical_shift"])
-
-            linked_results = terrain_fit.apply_shared_shift_to_group(obj_dir, [interior_stem], transform, xplane_root)
-            linked_stem, linked_applied, linked_reason = linked_results[interior_stem]
-            self.assertTrue(linked_applied, "the interior must be corrected once linked to the shell's shift")
-            self.assertEqual(linked_reason, "applied_shared_shift")
-            self.assertNotEqual(linked_stem, interior_stem)
-
-            linked_ir = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{linked_stem}.obj"))
-            # X/Z entirely unchanged, every vertex's Y moved by the exact
-            # shift value the shell got -- proves it was linked to the
-            # shell's own value, overriding whatever the interior's own
-            # independent computation (checked above) would have used.
-            np.testing.assert_allclose(linked_ir.positions[:, [0, 2]], original_interior_positions[:, [0, 2]], atol=1e-9)
-            dy = linked_ir.positions[:, 1] - original_interior_positions[:, 1]
-            np.testing.assert_allclose(dy, transform["vertical_shift"], atol=1e-6,
-                                        err_msg="every vertex must move by exactly the shell's own shift amount")
-
-    def test_shared_shift_is_a_noop_when_the_source_group_had_no_shift_to_offer(self):
-        """get_cached_transform on a group whose cached transform has
-        vertical_shift=None (no usable terrain samples at all) must make
-        apply_shared_shift_to_group a no-op, not synthesize a spurious
-        shift -- propagating "no shift to share" is exactly as valid a
-        shared decision as propagating a real one. Constructed directly
-        (rather than engineering a real all-samples-failed scenario)
-        since the transform dict's own shape is all this checks."""
-        with tempfile.TemporaryDirectory() as td:
-            obj_dir = Path(td)
-            transform = {"vertical_shift": None, "base_lat": 47.5, "base_lon": 8.5,
-                         "heading_deg": 0.0, "origin_elev": 10.0}
-            other_stem = "some_other_stem_at_the_same_anchor"
-            results = terrain_fit.apply_shared_shift_to_group(obj_dir, [other_stem], transform, None)
-            self.assertEqual(results[other_stem], (other_stem, False, "not_applicable"))
-
-    def test_get_cached_transform_returns_none_for_an_unprocessed_group(self):
-        self.assertIsNone(terrain_fit.get_cached_transform((("nonexistent_stem",), 1.0, 2.0, 3.0, False)))
-
-    def test_qualifying_group_on_gentle_real_slope_gets_the_ordinary_shift(self):
-        """A plain integration check that a large, qualifying group on
-        genuinely bumpy but GENTLE real terrain (its sampled corner
-        spread stays under _RIGID_WARP_SLOPE_THRESHOLD_M) gets
-        applied_vertical_shift with a real, non-zero, consistent
-        correction -- confirming the ordinary shift path is still very
-        much alive for the large-and-relatively-flat case, not replaced
-        outright by the warp. Outlier-rejection math itself is unit-
-        tested directly against synthetic samples in
-        TestRobustVerticalShift below, where exact DSF-grid/real-world
-        post alignment doesn't need to be reasoned about. (A pure linear
-        SLOPE, symmetric around the object's own anchor, averages to
-        exactly zero by construction -- that's a tilt, which a uniform
-        shift correctly leaves alone; a real bump/dip is what a uniform
-        shift is actually for, see _write_bumpy_terrain.)"""
-        with tempfile.TemporaryDirectory() as td:
-            td = Path(td)
-            xplane_root = td / "XPlaneRoot"
-            self._write_bumpy_terrain(xplane_root, 47, 8, bump_scale=20.0)
-            obj_dir = td / "objects"
-            obj_dir.mkdir()
-
-            hs = 60.0
-            positions = np.array(
-                [(-hs, 0.0, -hs), (hs, 0.0, -hs), (hs, 0.0, hs), (-hs, 0.0, hs)], dtype=np.float64)
-            ir = mesh_ir.MeshIR(
-                name="slope_box", positions=positions,
-                normals=np.tile([0.0, 1.0, 0.0], (4, 1)).astype(np.float64),
-                uvs=np.zeros((4, 2), dtype=np.float64),
-                indices=np.array([0, 1, 2, 0, 2, 3], dtype=np.int64),
-                texture="t.png", draped=False, footprint_area_m2=None,
-            )
-            mesh_ir.save(ir, mesh_ir.sidecar_path_for(obj_dir / "slope_box.obj"))
-
-            res = terrain_fit.get_or_create_fitted_group(obj_dir, ["slope_box"], 47.5, 8.5, 0.0, xplane_root)
-            rstem, applied, reason = res["slope_box"]
-            self.assertTrue(applied, f"reason={reason!r}")
-            self.assertEqual(reason, "applied_vertical_shift")
-            corrected = mesh_ir.load(mesh_ir.sidecar_path_for(obj_dir / f"{rstem}.obj"))
-            dy = corrected.positions[:, 1] - positions[:, 1]
-            self.assertAlmostEqual(float(dy.max() - dy.min()), 0.0, places=6, msg="a uniform shift, all 4 corners identical")
-            self.assertNotAlmostEqual(float(dy[0]), 0.0, places=3, msg="expected a real, non-zero correction on sloped terrain")
-
-    def test_huge_draped_quad_gets_warped_like_a_building_now(self):
-        """Draped/pavement geometry is eligible for the real per-vertex
-        terrain warp again, same as rigid buildings -- ATTR_draped still
-        re-projects it onto X-Plane's own terrain at render time regardless
-        of authored Y, so this doesn't change the main render, but keeps
-        authored Y realistically close to the real ground contour instead
-        of a flat plane (closes the residual "shadow floating slightly
-        above the surface" gap the flat-Y-only fix left behind). This is
-        the real 5518m x 3003m "TileSeams" footprint from a converted
-        package -- with per-vertex-exact sampling (no shared-bbox grid to
-        get misled by a huge footprint) there's no size-based reason to
-        disqualify or special-case it at all."""
-        with tempfile.TemporaryDirectory() as td:
-            td = Path(td)
-            xplane_root = td / "XPlaneRoot"
-            self._write_sloped_terrain(xplane_root, 47, 8, slope_per_post=3000.0)
-            obj_dir = td / "objects"
-            tex_dir = td / "textures"
-            obj_dir.mkdir()
-            tex_dir.mkdir()
-
-            huge_glb = td / "huge_decal.glb"
-            self._build_glb(huge_glb, "HugeDecal", "HugeDecalTex", -2759, 2759, -1502, 1502)
-            result = mesh_convert.convert(huge_glb, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
-            stem = result[0].stem
-            self.assertIn("ATTR_draped", result[0].read_text(encoding="utf-8").splitlines(),
-                          "test setup issue: expected this flat decal fixture to convert as draped")
-
-            results = terrain_fit.get_or_create_fitted_group(obj_dir, [stem], 47.5, 8.5, 0.0, xplane_root)
-            result_stem, applied, reason = results[stem]
-            self.assertTrue(applied, f"a huge but genuinely continuous draped footprint must not be disqualified (reason={reason!r})")
-
-            corrected_text = (obj_dir / f"{result_stem}.obj").read_text(encoding="utf-8")
-            self.assertIn("ATTR_draped", corrected_text.splitlines(),
-                          "must still be draped -- the main render is unaffected either way")
-            y_values = {round(float(line.split()[2]), 5) for line in corrected_text.splitlines() if line.startswith("VT ")}
-            self.assertNotEqual(y_values, {0.0},
-                                 "a real continuous draped surface should now receive the real terrain warp, not stay flat")
-
-    def test_scattered_points_each_get_their_own_exact_elevation(self):
-        """The old grid-interpolation approach's confirmed failure mode: a
-        "footprint" bbox spanning many scattered small clusters (like
-        GPU-instanced content -- one small motif repeated far apart across
-        a wide area) produced a warp with no relationship to any
-        individual cluster's real position, because a shared-bbox grid
-        blends distant sample points together. Per-vertex-exact sampling
-        has no such blending -- each of these two far-apart clusters must
-        come out matching a DIRECT, independent elevation computation at
-        its own real-world position, not some value interpolated from the
-        other cluster or from anywhere in between."""
-        with tempfile.TemporaryDirectory() as td:
-            td = Path(td)
-            xplane_root = td / "XPlaneRoot"
-            self._write_sloped_terrain(xplane_root, 47, 8, slope_per_post=3000.0)
-            obj_dir = td / "objects"
-            obj_dir.mkdir()
-
-            stem = "scattered_instanced_like"
-            positions = np.array([
-                [-2759.0, 0.0, -1502.0], [-2758.0, 0.0, -1502.0], [-2759.0, 0.0, -1501.0],
-                [2759.0, 0.0, 1502.0], [2758.0, 0.0, 1502.0], [2759.0, 0.0, 1501.0],
-            ], dtype=np.float64)
-            normals = np.array([[0.0, 1.0, 0.0]] * 6, dtype=np.float64)
-            uvs = np.array([[0.0, 0.0]] * 6, dtype=np.float64)
-            indices = np.array([0, 1, 2, 3, 4, 5], dtype=np.int64)
-            ir = mesh_ir.MeshIR(
-                name=stem, positions=positions, normals=normals, uvs=uvs, indices=indices,
-                texture="scattered.png", draped=True, footprint_area_m2=2.0,
-            )
-            mesh_ir.save(ir, mesh_ir.sidecar_path_for(obj_dir / f"{stem}.obj"))
-
-            base_lat, base_lon, heading = 47.5, 8.5, 0.0
-            results = terrain_fit.get_or_create_fitted_group(obj_dir, [stem], base_lat, base_lon, heading, xplane_root)
-            result_stem, applied, reason = results[stem]
-            self.assertTrue(applied, f"reason={reason!r}")
-
-            origin_elev = terrain_dem.get_elevation(xplane_root, base_lat, base_lon)
-
-            def expected_delta(local_x, local_z):
-                import geo_transform
-                lat, lon = geo_transform.local_offset_to_latlon(base_lat, base_lon, heading, local_x, local_z)
-                return terrain_dem.get_elevation(xplane_root, lat, lon) - origin_elev
-
-            corrected_text = (obj_dir / f"{result_stem}.obj").read_text(encoding="utf-8")
-            vt_by_xz = {}
-            for line in corrected_text.splitlines():
-                if line.startswith("VT "):
-                    p = line.split()
-                    vt_by_xz[(round(float(p[1]), 3), round(float(p[3]), 3))] = float(p[2])
-
-            near_corner_y = vt_by_xz[(-2759.0, -1502.0)]
-            far_corner_y = vt_by_xz[(2759.0, 1502.0)]
-            self.assertAlmostEqual(near_corner_y, expected_delta(-2759.0, -1502.0), places=3)
-            self.assertAlmostEqual(far_corner_y, expected_delta(2759.0, 1502.0), places=3)
-            self.assertNotAlmostEqual(near_corner_y, far_corner_y, places=1,
-                                       msg="two far-apart clusters on genuinely different real terrain must not "
-                                           "come out with the same (grid-blended) correction")
-
-    def test_no_xplane_root_skips_gracefully(self):
-        with tempfile.TemporaryDirectory() as td:
-            td = Path(td)
-            obj_dir = td / "objects"
-            tex_dir = td / "textures"
-            obj_dir.mkdir()
-            tex_dir.mkdir()
-            glb = td / "big.glb"
-            self._build_glb(glb, "Big", "BigTex", -20, 20, -20, 20)
-            result = mesh_convert.convert(glb, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")
-            stem = result[0].stem
-            results = terrain_fit.get_or_create_fitted_group(obj_dir, [stem], 47.5, 8.5, 0.0, None)
-            self.assertEqual(results[stem], (stem, False, "no_xplane_root"))
+            path = Path(td) / "g.npz"
+            grid.save(path)
+            back = ground_grid.Grid.load(path)
+        self.assertEqual(sorted(back.blocks), sorted(grid.blocks))
+        self.assertAlmostEqual(back.height(LAT + 0.0004, LON), grid.height(LAT + 0.0004, LON), places=9)
 
 
-class TestRobustVerticalShift(unittest.TestCase):
-    """_robust_vertical_shift's own math, isolated from any file I/O or
-    terrain sampling -- the single number this returns gets applied to
-    every vertex of every rigid object in a group, so a bad value here
-    (e.g. one spiky sample dragging the average) is as costly as the old
-    rotation module's own wrong-signed-rotation risk was."""
+class TestRefine(unittest.TestCase):
+    @staticmethod
+    def bowl(x, z):
+        return 0.0004 * (np.asarray(x) ** 2 + np.asarray(z) ** 2)
 
-    def test_plain_average_when_all_samples_agree(self):
-        samples = [(-10.0, -10.0, 2.0), (10.0, -10.0, 2.1), (-10.0, 10.0, 1.9), (10.0, 10.0, 2.0)]
-        shift = terrain_fit._robust_vertical_shift(samples)
-        self.assertAlmostEqual(shift, 2.0, places=1)
+    def test_floor_follows_a_bending_field(self):
+        ir = _quad_ir("floor", 50, 50, walls=5.0)
+        pos, nrm, uv, idx = terrain_fit.refine(ir.positions, ir.normals, ir.uvs, ir.indices, self.bowl)
+        self.assertGreater(len(idx), len(ir.indices))
+        fitted = mesh_ir.MeshIR(name="f", positions=pos.copy(), indices=np.asarray(idx))
+        fitted.positions[:, 1] += self.bowl(pos[:, 0], pos[:, 2])
+        rng = np.random.default_rng(1)
+        for x, z in rng.uniform(-48, 48, (40, 2)):
+            self.assertAlmostEqual(_surface_y(fitted, x, z), float(self.bowl(x, z)), delta=0.025)
+        # floor triangles keep facing up
+        for a, b, c in np.asarray(idx).reshape(-1, 3):
+            pa, pb, pc = pos[a], pos[b], pos[c]
+            if max(abs(pa[1]), abs(pb[1]), abs(pc[1])) < 1e-9:
+                self.assertGreater(np.cross(pb - pa, pc - pa)[1], 0.0)
+        # wall tops sit over the same split points as their bottoms
+        tops = {(round(p[0], 6), round(p[2], 6)) for p in pos if abs(p[1] - 5.0) < 1e-9}
+        bottoms = {(round(p[0], 6), round(p[2], 6)) for p in pos if abs(p[1]) < 1e-9 and abs(abs(p[2]) - 50) < 1e-9}
+        self.assertEqual(tops, bottoms)
 
-    def test_one_spiky_outlier_is_rejected_not_averaged_in(self):
-        """8 samples agreeing closely on ~2.0m, 1 wild outlier at 500m --
-        a naive mean would land near 57m (500/9 dominates); the robust
-        estimate must stay close to what the consistent majority says."""
-        samples = [
-            (-10.0, -10.0, 2.0), (0.0, -10.0, 2.1), (10.0, -10.0, 1.9),
-            (-10.0, 0.0, 2.0), (10.0, 0.0, 2.2),
-            (-10.0, 10.0, 1.8), (0.0, 10.0, 2.0), (10.0, 10.0, 2.1),
-            (0.0, 0.0, 500.0),  # the spike -- e.g. a DSF triangulation seam or DEM read error
-        ]
-        shift = terrain_fit._robust_vertical_shift(samples)
-        self.assertLess(abs(shift - 2.0), 1.0, "must track the consistent majority, not the spike")
+    def test_both_sides_of_a_uv_seam_split_alike(self):
+        # two triangles sharing an edge geometrically but not by index
+        pos = np.array([[0, 0, 0], [60, 0, 0], [0, 0, 60], [60, 0, 0], [0, 0, 60], [60, 0, 60]], dtype=np.float64)
+        idx = np.array([0, 2, 1, 3, 4, 5])
+        out, _, _, _ = terrain_fit.refine(pos, np.zeros((0, 3)), np.zeros((0, 2)), idx, self.bowl)
+        on_seam = {(round(p[0], 6), round(p[2], 6)) for p in out if abs(p[0] + p[2] - 60) < 1e-6}
+        # every seam point appears twice (once per side) or is an original corner
+        counts = {}
+        for p in out:
+            if abs(p[0] + p[2] - 60) < 1e-6:
+                counts[(round(p[0], 6), round(p[2], 6))] = counts.get((round(p[0], 6), round(p[2], 6)), 0) + 1
+        self.assertGreater(len(on_seam), 2)
+        self.assertTrue(all(n == 2 for n in counts.values()))
 
-    def test_two_disagreeing_samples_trusts_both_rather_than_guessing(self):
-        """With only 2 samples there's no way to tell which one (if
-        either) is the "real" outlier -- must fall back to using both
-        (the plain mean) rather than arbitrarily rejecting one."""
-        shift = terrain_fit._robust_vertical_shift([(-10.0, 0.0, 1.0), (10.0, 0.0, 3.0)])
-        self.assertAlmostEqual(shift, 2.0, places=6)
+    def test_a_flat_field_changes_nothing(self):
+        ir = _quad_ir("floor", 50, 50)
+        pos, _, _, idx = terrain_fit.refine(ir.positions, ir.normals, ir.uvs, ir.indices,
+                                            lambda x, z: 0.01 * np.asarray(x))
+        self.assertEqual(len(pos), len(ir.positions))
+        self.assertEqual(len(idx), len(ir.indices))
 
-    def test_no_samples_returns_none(self):
-        self.assertIsNone(terrain_fit._robust_vertical_shift([]))
 
-    def test_every_sample_identical_returns_that_value(self):
-        """No spread at all to reject against (MAD=0) -- must return the
-        common value directly, not divide by zero or otherwise choke."""
-        samples = [(-10.0, -10.0, 4.0), (10.0, -10.0, 4.0), (-10.0, 10.0, 4.0), (10.0, 10.0, 4.0)]
-        self.assertAlmostEqual(terrain_fit._robust_vertical_shift(samples), 4.0, places=6)
+class TestFit(_Base):
+    def test_seat_stays_on_the_floor_over_a_ridge(self):
+        xp = _install(self.td / "XP", _ridge_dsf(height=1.0))
+        _save(self.obj_dir, _quad_ir("floor", 50, 50, walls=4.0))
+        _save(self.obj_dir, _quad_ir("seat", 0.3, 0.3, y=0.45))
+        seat_lat, seat_lon = local_offset_to_latlon(LAT, LON, 0.0, 10.0, -20.0)
+        for grid in (self._grid(xp), None):
+            terrain_fit._group_cache.clear()
+            floor, floor_base, res = self._placed(xp, "floor", LAT, LON, grid)
+            self.assertEqual(res[2], "applied")
+            seat, seat_base, _ = self._placed(xp, "seat", seat_lat, seat_lon, grid)
+            floor_under = floor_base + _surface_y(floor, 10.0, -20.0)
+            seat_bottom = seat_base + float(seat.positions[:, 1].min())
+            self.assertAlmostEqual(seat_bottom - floor_under, 0.45, delta=0.03)
+
+    def test_pillar_meets_the_deck_and_the_ground(self):
+        xp = _install(self.td / "XP", _ridge_dsf(height=1.0))
+        _save(self.obj_dir, _quad_ir("deck", 40, 40, y=6.0))
+        pillar = mesh_ir.MeshIR(name="pillar", positions=np.array(
+            [[-0.3, 0, 0], [0.3, 0, 0], [0.3, 6, 0], [-0.3, 6, 0]], dtype=np.float64),
+            indices=np.array([0, 1, 2, 0, 2, 3]))
+        _save(self.obj_dir, pillar)
+        p_lat, p_lon = local_offset_to_latlon(LAT, LON, 0.0, -15.0, 25.0)
+        grid = self._grid(xp)
+        deck, deck_base, _ = self._placed(xp, "deck", LAT, LON, grid)
+        col, col_base, _ = self._placed(xp, "pillar", p_lat, p_lon, grid)
+        self.assertAlmostEqual(col_base + 6.0, deck_base + _surface_y(deck, -15.0, 25.0), delta=0.03)
+        self.assertAlmostEqual(col_base, terrain_dem.get_elevation(xp, p_lat, p_lon), delta=0.03)
+
+    def test_level_ground_needs_no_copy(self):
+        xp = _install(self.td / "XP", build_elevation_dsf([[40, 40], [40, 40]]))
+        _save(self.obj_dir, _quad_ir("floor", 50, 50, walls=4.0))
+        res = terrain_fit.get_or_create_fitted_group(self.obj_dir, ["floor"], LAT, LON, 0.0, xp)
+        self.assertEqual(res["floor"], ("floor", False, "negligible"))
+        self.assertEqual(terrain_fit.group_lift(terrain_fit.group_key(["floor"], LAT, LON, 0.0)), 0.0)
+
+    def test_building_on_steep_ground_is_level_with_a_skirt(self):
+        xp = _install(self.td / "XP", _ridge_dsf(height=20.0))
+        lat, lon = local_offset_to_latlon(LAT, LON, 0.0, 0.0, -20.0)  # on the ridge's north flank
+        _save(self.obj_dir, _quad_ir("hall", 15, 15, walls=6.0))
+        hall, base, res = self._placed(xp, "hall", lat, lon)
+        self.assertEqual(res[2], "applied_skirt")
+        original = mesh_ir.load(mesh_ir.sidecar_path_for(self.obj_dir / "hall.obj"))
+        # the building itself is only translated: its roof line is level
+        np.testing.assert_allclose(hall.positions[:len(original.positions)], original.positions, atol=1e-9)
+        # ...standing on the highest ground under it, with a skirt down the slope
+        corners = [local_offset_to_latlon(lat, lon, 0.0, x, z) for x in (-15, 15) for z in (-15, 15)]
+        ground = [terrain_dem.get_elevation(xp, a, o) for a, o in corners]
+        self.assertAlmostEqual(base, max(ground), delta=0.3)
+        self.assertGreater(len(hall.positions), len(original.positions))
+        self.assertLess(base + float(hall.positions[:, 1].min()), min(ground) + 0.3)
+
+    def test_gentle_slope_follows_the_ground(self):
+        xp = _install(self.td / "XP", _ridge_dsf(height=1.0))
+        _save(self.obj_dir, _quad_ir("hall", 40, 40, walls=6.0))
+        hall, base, res = self._placed(xp, "hall", LAT, LON)
+        self.assertEqual(res[2], "applied")
+        for x, z in ((-30, -30), (20, 35), (0, 0)):
+            a, o = local_offset_to_latlon(LAT, LON, 0.0, x, z)
+            self.assertAlmostEqual(base + _surface_y(hall, x, z), terrain_dem.get_elevation(xp, a, o), delta=0.03)
+
+    def test_draped_lights_and_polygon_mode(self):
+        xp = _install(self.td / "XP", _ridge_dsf(height=1.0))
+        _save(self.obj_dir, _quad_ir("decal", 30, 30, draped=True))
+        lights = mesh_ir.MeshIR(name="lamps", lights=[
+            mesh_ir.LightEntry(pos=(0.0, 5.0, z), dir=(0, -1, 0), color=(1, 1, 1), cone_angle=0.0, size=1.0,
+                               dataref="none") for z in (-30.0, 0.0)])
+        _save(self.obj_dir, lights)
+        res = terrain_fit.get_or_create_fitted_group(self.obj_dir, ["decal", "lamps"], LAT, LON, 0.0, xp)
+        self.assertTrue(res["decal"][1] and res["lamps"][1])
+        fitted = mesh_ir.load(mesh_ir.sidecar_path_for(self.obj_dir / f"{res['lamps'][0]}.obj"))
+        drop = fitted.lights[0].pos[1] - fitted.lights[1].pos[1]
+        a, o = local_offset_to_latlon(LAT, LON, 0.0, 0.0, -30.0)
+        # (the grid's 4 m posts round the ridge's sharp crest by a few cm)
+        self.assertAlmostEqual(drop, terrain_dem.get_elevation(xp, a, o) - terrain_dem.get_elevation(xp, LAT, LON),
+                               delta=0.05)
+        terrain_fit._group_cache.clear()
+        res = terrain_fit.get_or_create_fitted_group(self.obj_dir, ["decal"], LAT, LON, 0.0, xp,
+                                                     skip_draped_positions=True)
+        self.assertEqual(res["decal"][:2], ("decal", False))
+
+    def test_no_install(self):
+        _save(self.obj_dir, _quad_ir("floor", 5, 5))
+        res = terrain_fit.get_or_create_fitted_group(self.obj_dir, ["floor"], LAT, LON, 0.0, None)
+        self.assertEqual(res["floor"], ("floor", False, "no_xplane_root"))
+
+    def test_turned_placement(self):
+        xp = _install(self.td / "XP", _ridge_dsf(height=1.0))
+        _save(self.obj_dir, _quad_ir("floor", 50, 10, walls=3.0))
+        hall, base, _ = self._placed(xp, "floor", LAT, LON, hdg=90.0)
+        # local +x points south after a 90 degree turn: 40 m south of the ridge
+        a, o = local_offset_to_latlon(LAT, LON, 90.0, 40.0, 0.0)
+        self.assertLess(a, LAT)
+        self.assertAlmostEqual(base + _surface_y(hall, 40.0, 0.0), terrain_dem.get_elevation(xp, a, o), delta=0.03)
+        self.assertTrue(math.isfinite(base))
 
 
 if __name__ == "__main__":

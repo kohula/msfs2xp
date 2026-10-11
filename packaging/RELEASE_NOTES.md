@@ -1,25 +1,29 @@
-Test build: buildings placed from one MSFS container stay together on
-sloped terrain.
+Test build: one shared ground grid for every object's height.
 
 ## What's new
 
-- **Containers placed as one build**: everything an MSFS SimPropContainer
-  (.spb) places (a terminal's shell, glass, floors, pillars, seats,
-  people) used to be put on the X-Plane ground under each object's own
-  anchor and terrain-fitted on its own. On sloped terrain that moved each
-  piece by a different amount, so windows and interiors sat above the
-  floor on one side while pillars missed it on the other. Now the
-  objects of one container (those within 50 m of each other) share one
-  ground level, the middle of the terrain under them, and every object
-  keeps the height MSFS gives it relative to the others. They are not
-  terrain-fitted one by one any more. Ground decals still drape on the
-  terrain, and the terrain itself is never flattened. Where the ground
-  under such a group varies by more than 5 m (a row of lamp posts up a
-  hill), the objects are placed one by one as before.
-- Seats and other props of such a container keep their MSFS heights
-  instead of being moved onto a floor separately.
-- Terrain-fitted copies that no placement uses are removed from the
-  output.
+- **One ground grid for all heights**: every placed object is now fitted
+  onto X-Plane's terrain through one shared grid of terrain heights (posts
+  every 4 m around the converted scenery). Each vertex moves by the
+  grid's height at its own position, whichever object it belongs to, so
+  things that touch in MSFS still touch: a seat stays on its floor, a
+  deck on its pillars, glass in its frame, people on their seats.
+  Objects standing on the ground stand on X-Plane's ground, and nothing
+  of the terrain is flattened.
+- Large faces (floors, decks, roofs) are subdivided where the ground
+  bends under them, so they follow the grid between their corners just
+  like the small objects standing on them. Walls and pillars are never
+  cut up.
+- A building on steep ground (more than 3 % slope) is kept level, with
+  a skirt down to the terrain, as before; the grid is levelled under it,
+  so whatever is placed inside it stays level with it too.
+- This replaces the earlier per-object fixes (an averaged shift per
+  object, shift sharing between parts, container levelling from 1.2.1,
+  props moved onto floors), which picked a different correction for
+  each object and so pulled touching parts apart.
+- Small flat ground clutter is no longer removed inside buildings.
+- The placement report (msfs2xp_placements.csv) shows each placement's
+  grid lift instead of the old floor column.
 
 ## Windows
 

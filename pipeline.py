@@ -39,7 +39,7 @@ import cache_utils
 import gpu_accel
 import terrain_dem
 import terrain_fit
-import host_floor
+import ground_grid
 import jetway_rig
 import lamp_posts
 import runway_clutter
@@ -1030,7 +1030,7 @@ def _write_placement_report(path, cands, obj_dir, dsf_tiles, airport_alt):
         w = csv.writer(f)
         w.writerow(["model", "title", "source", "lat", "lon", "heading", "msfs_alt_m", "msfs_alt_is_agl",
                     "airport_alt_m", "height_above_ground_m", "recenter_lift_m", "agl_before_fixes_m",
-                    "model_height_m", "solid_parts", "draped_parts", "terrain_fit", "on_building_floor",
+                    "model_height_m", "solid_parts", "draped_parts", "terrain_fit", "ground_lift_m",
                     "final_parts"])
         for c in cands:
             entries = c["stem_entries"]
@@ -1056,7 +1056,7 @@ def _write_placement_report(path, cands, obj_dir, dsf_tiles, airport_alt):
                 "" if airport_alt is None else f"{airport_alt:.3f}",
                 f"{c.get('height_offset', 0.0):+.3f}", f"{-c.get('mid_y', 0.0):+.3f}",
                 f"{c.get('agl', 0.0):+.3f}", f"{max(ys) - min(ys):.2f}" if ys else "",
-                len(solid), len(draped), " ".join(reasons), "yes" if c.get("hosted") else "",
+                len(solid), len(draped), " ".join(reasons), f"{c.get('ground_lift', 0.0):+.3f}",
                 " ".join(final),
             ])
 
@@ -1088,17 +1088,53 @@ def _attach_bare_lights(dsf_tiles, obj_dir, converted_stems_map):
     return lamp_posts.attach_to_lamps(dsf_tiles, load, bare)
 
 
+BUILDING_MIN_SIDE_M = 10.0    # a placed model this long...
+BUILDING_MIN_HEIGHT_M = 3.0   # ...and this tall counts as a building others can stand in
+
+
+def _buildings(cands, obj_dir):
+    """inside(lat, lon, own) -> True when the point is within the footprint
+    of a placed building other than the candidate `own`."""
+    cell = 100.0
+    index = {}
+    for c in cands:
+        ext = terrain_fit.model_extent(obj_dir, [s for s, v in c["stem_entries"].items() if not v[2]])
+        if ext is None or ext.get("rigid") is None:
+            continue
+        if (max(ext["x1"] - ext["x0"], ext["z1"] - ext["z0"]) < BUILDING_MIN_SIDE_M
+                or ext["rigid"][1] - ext["rigid"][0] < BUILDING_MIN_HEIGHT_M):
+            continue
+        m_lat, m_lon = geo_transform.metres_per_degree(c["abs_lat"])
+        r = math.hypot(max(abs(ext["x0"]), abs(ext["x1"])), max(abs(ext["z0"]), abs(ext["z1"])))
+        n, e = c["abs_lat"] * m_lat, c["abs_lon"] * m_lon
+        for i in range(int((n - r) // cell), int((n + r) // cell) + 1):
+            for j in range(int((e - r) // cell), int((e + r) // cell) + 1):
+                index.setdefault((i, j), []).append((c, ext))
+
+    def inside(lat, lon, own):
+        m_lat, m_lon = geo_transform.metres_per_degree(lat)
+        for c, ext in index.get((int(lat * m_lat // cell), int(lon * m_lon // cell)), ()):
+            if c is own:
+                continue
+            x, z = geo_transform.latlon_offset_to_local(c["abs_lat"], c["abs_lon"], c["hdg"], lat, lon)
+            if ext["x0"] <= x <= ext["x1"] and ext["z0"] <= z <= ext["z1"]:
+                return True
+        return False
+    return inside
+
+
 def _settle_flat_airport_objects(cands, obj_dir, dsf_tiles, ground):
     """runway_clutter.py: for every placement standing on the airport
-    ground (not on a building's floor), drop the solid parts of small flat
+    ground (not inside a building), drop the solid parts of small flat
     clutter and drape large flat sheets onto the terrain. Returns
     (dropped, draped) placement counts."""
     if not ground:
         return 0, 0
     drop = set()
     dropped = draped = 0
+    in_building = _buildings(cands, obj_dir)
     for c in cands:
-        if c.get("hosted") or c.get("grouped"):
+        if in_building(c["abs_lat"], c["abs_lon"], c):
             continue
         stems = [s for s, (_e, _fa, is_draped, _r) in c["stem_entries"].items() if not is_draped]
         if not stems or not ground.contains(c["abs_lat"], c["abs_lon"]):
@@ -1137,12 +1173,14 @@ def _settle_flat_airport_objects(cands, obj_dir, dsf_tiles, ground):
 _PATH_BLOCK = "ANIM_trans_begin sim/time/total_running_time_sec"
 
 
-def _paths_on_terrain(dsf_tiles, obj_dir, xplane_root):
+def _paths_on_terrain(dsf_tiles, obj_dir, ground_at):
     """An object driving a looping path (a bus round the airport) was
     animated at its anchor's ground height all the way round. Each placed
-    one gets a copy whose path keys are raised or lowered to the X-Plane
-    ground under each point of the path (convert() records the path in an
-    .autoplay.json beside the object). Returns how many were adjusted."""
+    one gets a copy whose path keys are raised or lowered to the ground
+    under each point of the path (convert() records the path in an
+    .autoplay.json beside the object). ground_at(lat, lon): the height
+    every other object is fitted to there (see _ground_at). Returns how
+    many were adjusted."""
     adjusted = 0
     for objects in dsf_tiles.values():
         for e in objects:
@@ -1157,14 +1195,14 @@ def _paths_on_terrain(dsf_tiles, obj_dir, xplane_root):
                 lines = (obj_dir / f"{name}.obj").read_text(encoding="utf-8").splitlines(keepends=True)
             except (OSError, ValueError):
                 continue
-            ground = terrain_dem.get_elevation(xplane_root, e["lat"], e["lon"])
+            ground = ground_at(e["lat"], e["lon"])
             if ground is None:
                 continue
             px, _py, pz = path["pivot"]
             dys = []
             for _t, dx, _dy, dz in path["keys"]:
                 lat, lon = geo_transform.local_offset_to_latlon(e["lat"], e["lon"], e.get("hdg", 0.0), px + dx, pz + dz)
-                g = terrain_dem.get_elevation(xplane_root, lat, lon)
+                g = ground_at(lat, lon)
                 dys.append(0.0 if g is None else g - ground)
             try:
                 start = next(i for i, l in enumerate(lines) if l.startswith(_PATH_BLOCK))
@@ -1187,322 +1225,60 @@ def _paths_on_terrain(dsf_tiles, obj_dir, xplane_root):
     return adjusted
 
 
-RIGID_GROUP_LINK_M = 50.0  # objects of one container this close chain into one rigid build
-RIGID_GROUP_MAX_SPREAD_M = 5.0  # ...unless the ground under them differs by more than this
+def _ground_at(grid, xplane_root):
+    """lat, lon -> the height objects are fitted to there: the shared
+    ground grid's, or X-Plane's terrain outside it."""
+    def at(lat, lon):
+        h = grid.height(lat, lon) if grid is not None else None
+        return h if h is not None else terrain_dem.get_elevation(xplane_root, lat, lon)
+    return at
 
 
-def _level_rigid_groups(cands, xplane_root):
-    """All objects of one placed SimPropContainer (a terminal: its shell,
-    glass, floors, pillars, seats, people) stand in MSFS on one level
-    ground, at exactly the heights the author gave them relative to each
-    other. Placed one by one on X-Plane's terrain and terrain-fitted one by
-    one, each lands on the ground under its own anchor, so floors, pillars,
-    windows and seats end up at slightly different heights.
-
-    Each container's objects -- split into clusters of objects within
-    RIGID_GROUP_LINK_M of each other, so a container spread over a whole
-    district isn't made one slab -- are placed as one rigid build: one
-    ground level for the cluster (the median of the terrain under its
-    objects), every object at its own MSFS height above that level, none
-    of them terrain-fitted on its own. Draped parts still drape. A cluster
-    whose ground varies by more than RIGID_GROUP_MAX_SPREAD_M (a row of
-    lamp posts up a hill road) is left to the per-object placement.
-    Returns (clusters, objects)."""
-    groups = {}
-    for c in cands:
-        if c.get("rigid_group"):
-            groups.setdefault(c["rigid_group"], []).append(c)
-    clusters = objects = 0
-    for members in groups.values():
-        # single-linkage clusters by anchor distance, via a grid
-        m_lat, m_lon = geo_transform.metres_per_degree(members[0]["abs_lat"])
-        pts = [((c["abs_lat"] - members[0]["abs_lat"]) * m_lat, (c["abs_lon"] - members[0]["abs_lon"]) * m_lon)
-               for c in members]
-        cell = {}
-        for k, (y, x) in enumerate(pts):
-            cell.setdefault((int(y // RIGID_GROUP_LINK_M), int(x // RIGID_GROUP_LINK_M)), []).append(k)
-        label = [-1] * len(members)
-        for start in range(len(members)):
-            if label[start] >= 0:
-                continue
-            label[start] = start
-            stack = [start]
-            while stack:
-                k = stack.pop()
-                gy, gx = int(pts[k][0] // RIGID_GROUP_LINK_M), int(pts[k][1] // RIGID_GROUP_LINK_M)
-                for dy in (-1, 0, 1):
-                    for dx in (-1, 0, 1):
-                        for n in cell.get((gy + dy, gx + dx), ()):
-                            if label[n] < 0 and math.dist(pts[k], pts[n]) <= RIGID_GROUP_LINK_M:
-                                label[n] = start
-                                stack.append(n)
-        by_label = {}
-        for k, lab in enumerate(label):
-            by_label.setdefault(lab, []).append(members[k])
-        for cluster in by_label.values():
-            grounds = [terrain_dem.get_elevation(xplane_root, c["abs_lat"], c["abs_lon"]) for c in cluster]
-            known = [g for g in grounds if g is not None]
-            if not known or max(known) - min(known) > RIGID_GROUP_MAX_SPREAD_M:
-                continue
-            level = float(np.median(known))
-            for c, g in zip(cluster, grounds):
-                if g is None:
-                    continue
-                for s, (entry, _fit, draped, _r) in c["stem_entries"].items():
-                    if draped:
-                        continue
-                    entry["name"] = s  # the model as authored, not a terrain-fitted copy
-                    entry["agl"] = c["agl"] + level - g
-                c["grouped"] = True
-                c["group_level"] = level
-                objects += 1
-            clusters += 1
-    return clusters, objects
-
-
-PART_MIN_SIDE_M = 4.0     # a building part is at least this long...
-PART_MIN_HEIGHT_M = 2.0   # ...and this tall (smaller things are props: host_floor)
-
-
-def _attach_parts_to_buildings(cands, obj_dir, xplane_root):
-    """Parts of one building placed as separate objects (wings, interiors,
-    facades, roof units) were terrain-fitted each on their own: one shifted
-    by a little, its neighbour warped, another left alone as "negligible",
-    so they no longer meet. A part lying within a larger building -- under
-    or over that building's own floors, roofs or ceilings -- takes the
-    building's correction instead: warped onto the terrain when the
-    building was warped, else raised or lowered to the building's level.
-    Returns how many parts were attached."""
-    def rigid_stems(c):
-        return [s for s, (_e, _fa, draped, _r) in c["stem_entries"].items() if not draped]
-
-    infos = []
-    for i, c in enumerate(cands):
-        stems = rigid_stems(c)
-        if not stems:
-            continue
-        group = [terrain_fit._load_ir(obj_dir, s) for s in stems]
-        bbox = host_floor.footprint(group)
-        if bbox is None:
-            continue
-        infos.append((i, c, stems, group, bbox, host_floor.height_of(group)))
-
-    hosts = []
-    for i, c, stems, group, bbox, height in infos:
-        if not host_floor.is_host_size(bbox, height):
-            continue
-        cover = host_floor.horizontal_cover(group)
-        if cover is None:
-            continue
-        reasons = {c["stem_entries"][s][3] for s in stems}
-        ground = terrain_dem.get_elevation(xplane_root, c["abs_lat"], c["abs_lon"])
-        if ground is None:
-            continue
-        t = terrain_fit.get_cached_transform(c["group_key"])
-        if c.get("grouped"):
-            mode, level = "level", c["group_level"]
-        elif "applied_rigid_warp" in reasons:
-            mode, level = "warp", None
-        else:
-            if c.get("linked_shift") is not None:
-                shift = c["linked_shift"]
-            elif reasons & {"applied_vertical_shift", "applied_skirt"} and t and t.get("vertical_shift") is not None:
-                shift = t["vertical_shift"]
-            else:
-                shift = 0.0
-            mode, level = "level", ground + shift
-        area = (bbox[1] - bbox[0]) * (bbox[3] - bbox[2])
-        hosts.append((area, i, c, bbox, cover, mode, level))
-    hosts.sort(key=lambda h: -h[0])
-
-    attached = 0
-    for i, c, stems, group, bbox, height in infos:
-        if c.get("hosted") or c.get("grouped") or max(bbox[1] - bbox[0], bbox[3] - bbox[2]) < PART_MIN_SIDE_M \
-                or height < PART_MIN_HEIGHT_M:
-            continue
-        area = (bbox[1] - bbox[0]) * (bbox[3] - bbox[2])
-        cx, cz = (bbox[0] + bbox[1]) / 2.0, (bbox[2] + bbox[3]) / 2.0
-        p_lat, p_lon = geo_transform.local_offset_to_latlon(c["abs_lat"], c["abs_lon"], c["hdg"], cx, cz)
-        host = None
-        for h_area, hi, hc, hbox, hcover, mode, level in hosts:
-            if hi == i or h_area <= area:
-                continue
-            x, z = geo_transform.latlon_offset_to_local(hc["abs_lat"], hc["abs_lon"], hc["hdg"], p_lat, p_lon)
-            if hbox[0] <= x <= hbox[1] and hbox[2] <= z <= hbox[3] and len(hcover.heights_at(x, z)):
-                host = (hi, hc, mode, level)
-                break
-        if host is None:
-            continue
-        hi, hc, mode, level = host
-        reasons = {c["stem_entries"][s][3] for s in stems}
-        if mode == "warp":
-            if reasons == {"applied_rigid_warp"}:
-                continue  # already follows the terrain the same way
-            origin = terrain_dem.get_elevation(xplane_root, c["abs_lat"], c["abs_lon"])
-            if origin is None:
-                continue
-            for s, ir in zip(stems, group):
-                if ir is None:
-                    continue
-                entry = c["stem_entries"][s][0]
-                entry["name"] = _warped_copy(obj_dir, s, ir, c, origin, xplane_root)
-        else:
-            ground = terrain_dem.get_elevation(xplane_root, c["abs_lat"], c["abs_lon"])
-            if ground is None:
-                continue
-            agl = c["agl"] + level - ground
-            for s in stems:
-                entry = c["stem_entries"][s][0]
-                entry["name"] = s
-                entry["agl"] = agl
-        c["part_of"] = hi
-        attached += 1
-    return attached
-
-
-def _warped_copy(obj_dir, stem, ir, c, origin_elev, xplane_root):
-    """A copy of one sub-object with every vertex (and light) moved by the
-    terrain under it relative to its anchor's ground. Returns its stem."""
-    key = "%.7f_%.7f_%.2f" % (c["abs_lat"], c["abs_lon"], c["hdg"])
-    name = f"{stem}_wp_{hashlib.md5(key.encode()).hexdigest()[:10]}"
-    path = obj_dir / f"{name}.obj"
-    if path.exists():
-        return name
-
-    def delta(x, z):
-        lat, lon = geo_transform.local_offset_to_latlon(c["abs_lat"], c["abs_lon"], c["hdg"], x, z)
-        e = terrain_dem.get_elevation(xplane_root, lat, lon)
-        return 0.0 if e is None else e - origin_elev
-
-    pos = ir.positions.copy()
-    for k in range(len(pos)):
-        pos[k, 1] += delta(float(pos[k, 0]), float(pos[k, 2]))
-    lights = [dataclasses.replace(lt, pos=(lt.pos[0], lt.pos[1] + delta(lt.pos[0], lt.pos[2]), lt.pos[2]))
-              for lt in (ir.lights or [])]
-    warped = dataclasses.replace(ir, name=name, positions=pos, lights=lights)
-    mesh_ir.write_obj8(warped, path)
-    mesh_ir.save(warped, mesh_ir.sidecar_path_for(path))
-    return name
-
-
-def _place_props_on_host_floors(cands, obj_dir, xplane_root):
-    """host_floor.py: every small placement standing on a large building's
-    floor is set on that floor as the building is actually placed -- its
-    terrain-fitted geometry (shifted, warped or lifted onto a skirt),
-    sampled right under the prop -- instead of the terrain under it, and
-    its own terrain fit is dropped (it moves with the building).
-    cands: the placement loop's _anchor_cluster_candidates. Returns
-    (buildings that hold props, placements moved)."""
-    def rigid_stems(c):
-        return [s for s, (_e, _fa, draped, _r) in c["stem_entries"].items() if not draped]
-
-    def irs(stems):
-        return [terrain_fit._load_ir(obj_dir, s) for s in stems]
-
-    hosts, host_agl = [], {}
-    for i, c in enumerate(cands):
-        stems = rigid_stems(c)
-        if not stems:
-            continue
-        group = irs(stems)
-        bbox = host_floor.footprint(group)
-        if not host_floor.is_host_size(bbox, host_floor.height_of(group)):
-            continue
-        entries = [c["stem_entries"][s][0] for s in stems]
-        placed = [terrain_fit._load_ir(obj_dir, e["name"]) if e.get("name") and e["name"] != s else ir
-                  for s, e, ir in zip(stems, entries, group)]
-        if c.get("linked_shift") is not None:
-            # moved by a sibling's shift, not by a fitted copy of its own
-            placed = [None if ir is None else dataclasses.replace(
-                ir, positions=ir.positions + np.array([0.0, c["linked_shift"], 0.0])) for ir in group]
-        cover = host_floor.horizontal_cover(group, placed)
-        if cover is None:
-            continue
-        ground = terrain_dem.get_elevation(xplane_root, c["abs_lat"], c["abs_lon"])
-        if ground is None:
-            continue
-        hosts.append(host_floor.Host(i, c["abs_lat"], c["abs_lon"], c["hdg"], bbox, cover,
-                                     c["agl"], ground))
-        host_agl[i] = entries[0].get("agl", c["agl"])
-    if not hosts:
-        return 0, 0
-
-    index = host_floor.HostIndex(hosts)
-    host_keys = {h.key for h in hosts}
-    used, moved = set(), 0
-    for i, c in enumerate(cands):
-        stems = rigid_stems(c)
-        if i in host_keys or not stems or c.get("grouped"):
-            continue
-        bbox = host_floor.footprint(irs(stems))
-        area = (bbox[1] - bbox[0]) * (bbox[3] - bbox[2]) if bbox else 0.0
-        host = index.host_for(c["abs_lat"], c["abs_lon"], c["height_offset"], area)
-        if host is None:
-            continue
-        floor = host.floor_under(c["abs_lat"], c["abs_lon"], c["height_offset"])
-        ground = terrain_dem.get_elevation(xplane_root, c["abs_lat"], c["abs_lon"])
-        if floor is None or ground is None:
-            continue
-        modelled, placed_y = floor
-        # the floor where the building actually stands, plus however far
-        # above its modelled floor the prop was placed
-        floor_world = host.base + host_agl[host.key] + placed_y
-        agl = floor_world + (c["agl"] - (host.agl + modelled)) - ground
-        for s in stems:
-            entry = c["stem_entries"][s][0]
-            entry["name"] = s
-            entry["agl"] = agl
-        c["hosted"] = True
-        used.add(host.key)
-        moved += 1
-    return len(used), moved
-
-
-def _terrain_fit_group_worker(obj_stems, base_lat, base_lon, heading_deg,
-                              skip_draped, obj_dir_str, xplane_root_str, flat_zones=None, area=None):
-    """Worker for the parallel terrain-fit pre-warm in step 4. Runs ONE
-    terrain_fit group in this subprocess. The heavy part -- pickle-loading
-    each sub-object's MeshIR, sampling the DEM, building the warped copy,
-    writing the `*_tfit_*.obj` + `.meshir.pkl` -- is CPU- and GIL-bound, so
-    this has to be a process, not a thread, to actually parallelize (a
-    thread pool measured ~1 core of throughput). The `*_tfit_*` files land
-    on the shared obj_dir; the small (all-str/bool) result dict returned
-    here lets the parent's placement loop consume the fit without
-    recomputing it. Returns (group_key, {stem: (result_stem, applied,
-    reason)}, transform), or (group_key, None, None) if the fit raised.
-
-    CONFIRMED REAL BUG: this used to return only the per-stem result dict.
-    terrain_fit._group_transform_cache -- what the parent's own anchor-
-    clustering pass (main.py, right after this pre-warm) reads via
-    get_cached_transform() to find a vertical shift one placement's
-    terrain-fit computed, and retroactively apply it to a DIFFERENT placement sharing
-    the same real-world anchor (e.g. a building's own shell vs. its
-    separately-placed glass/interior) -- lives in the terrain_fit MODULE
-    in THIS subprocess. A ProcessPoolExecutor worker's module state is
-    never shared back to the parent, so the parent's own cache stayed
-    permanently empty for every group pre-warmed here (i.e. essentially
-    all of them), silently no-opping the anchor-clustering pass entirely:
-    0 sub-objects ever actually got linked on a real conversion, despite
-    the log claiming candidates existed. Confirmed real symptom (user):
-    differently-sourced parts of one building (materials/glass vs. shell)
-    getting terrain-fitted independently instead of moving together."""
-    import terrain_dem
-    import terrain_fit
-    # a spawned worker (Windows) starts without the parent's flat zones
+def _worker_terrain_setup(flat_zones, area):
+    """A spawned worker (Windows) starts without the parent's terrain
+    settings."""
     if flat_zones is not None and terrain_dem.flat_zones() != flat_zones:
         terrain_dem.set_flat_zones(flat_zones)
     if area is not None and terrain_dem.area() != tuple(round(float(v), 3) for v in area):
         terrain_dem.set_area(area)
-    group_key = (tuple(sorted(obj_stems)), round(base_lat, 6), round(base_lon, 6),
-                 round(heading_deg, 2), bool(skip_draped))
+
+
+def _model_extent_worker(obj_stems, obj_dir_str):
+    """Process-pool worker: terrain_fit.model_extent of one model."""
+    try:
+        return tuple(obj_stems), terrain_fit.model_extent(Path(obj_dir_str), list(obj_stems))
+    except Exception:
+        return tuple(obj_stems), None
+
+
+def _grid_block_worker(blocks, lat0, lon0, dlat, dlon, xplane_root_str, flat_zones=None, area=None):
+    """Process-pool worker: samples the terrain at the posts of some
+    ground-grid blocks. Returns {(bi, bj): heights}."""
+    _worker_terrain_setup(flat_zones, area)
+    grid = ground_grid.Grid(lat0, lon0, dlat, dlon)
+    root = Path(xplane_root_str)
+    grid.cover_blocks(blocks, lambda a, o: terrain_dem.get_elevation(root, a, o))
+    return grid.blocks
+
+
+def _terrain_fit_group_worker(obj_stems, base_lat, base_lon, heading_deg, skip_draped, obj_dir_str,
+                              xplane_root_str, flat_zones, area, grid_path, skirt_level, agl):
+    """Process-pool worker for one placement group's terrain fit (see
+    terrain_fit.get_or_create_fitted_group): loading each sub-object's
+    MeshIR, warping it onto the shared ground grid and writing the
+    `*_tfit_*` copy is CPU-bound, so it runs across processes. Returns
+    (group key, {stem: (result_stem, applied, reason)}, lift), or
+    (group key, None, 0.0) if the fit raised."""
+    _worker_terrain_setup(flat_zones, area)
+    key = terrain_fit.group_key(obj_stems, base_lat, base_lon, heading_deg, skip_draped)
     try:
         res = terrain_fit.get_or_create_fitted_group(
-            Path(obj_dir_str), list(obj_stems), base_lat, base_lon, heading_deg,
-            Path(xplane_root_str), skip_draped_positions=bool(skip_draped))
-        transform = terrain_fit.get_cached_transform(group_key)
-        return group_key, res, transform
+            Path(obj_dir_str), list(obj_stems), base_lat, base_lon, heading_deg, Path(xplane_root_str),
+            skip_draped_positions=bool(skip_draped), grid=ground_grid.load_cached(grid_path),
+            skirt_level=skirt_level, agl=agl)
+        return key, res, terrain_fit.group_lift(key)
     except Exception:
-        return group_key, None, None
+        return key, None, 0.0
 
 
 # Matches the TEXTURE/TEXTURE_NORMAL/TEXTURE_LIT lines mesh_convert.convert
@@ -2089,8 +1865,8 @@ class PipelineOptions:
     max_texture: int = 2048
     # Fallback, off by default: level the terrain inside the airport
     # boundary ("1302 flatten 1"), as MSFS does, so every model there stands
-    # on flat ground. Normally X-Plane's terrain is kept and props follow
-    # their buildings' floors instead (host_floor.py).
+    # on flat ground. Normally X-Plane's terrain is kept and every model is
+    # fitted onto it through one shared ground grid (ground_grid.py).
     flatten_airport: bool = False
     # Flat objects on the airport ground: drop small ones, drape large
     # sheets (runway_clutter.py).
@@ -2745,27 +2521,19 @@ def _run_pipeline(opts, hooks):
 
         library_substitution_count = 0
 
-        # --- terrain-fit pre-warm (multi-process) --------------------
-        # terrain_fit.get_or_create_fitted_group() is the expensive part
-        # of the placement loop below: pickle-loading each sub-object's
-        # MeshIR, sampling the DEM, warping the mesh, writing a
-        # *_tfit_*.obj copy. Now that py7zr lets it actually run here it
-        # otherwise makes step 4 a single-threaded slog over thousands
-        # of placements (~33 min at LHBP). That work is CPU/GIL-bound,
-        # so this runs it across a PROCESS pool (a thread pool measured
-        # ~1 core) -- same pattern as the mesh + KTX2 phases above.
-        # Jobs are de-duplicated by the exact group key terrain_fit
-        # itself uses, so no two workers write the same *_tfit_* path.
-        # Each worker writes its *_tfit_* files to the shared obj_dir
-        # and hands back the small result dict; the placement loop then
-        # reads precomputed_fits and never recomputes (the parent
-        # process's own terrain_fit._group_cache is not shared with the
-        # workers, so consuming the returned dict is what avoids the
-        # duplicate work).
+        # --- ground grid + terrain fit (multi-process) -----------------
+        # Every placement is fitted onto ONE shared grid of X-Plane terrain
+        # heights (ground_grid.py), so objects at the same place get the
+        # same height whatever they belong to. In order: each model's
+        # extent; grid posts around every placement; the grid levelled
+        # under buildings on steep ground (largest first); then each
+        # placement's fitted copies. The heavy steps run across processes.
         precomputed_fits = {}
+        precomputed_lifts = {}
+        ground = None        # the shared ground_grid.Grid
+        skirt_levels = {}    # group key -> level set under that placement
         if xplane_root is not None:
-            _seen_gk = set()
-            _tf_jobs = []
+            _jobs = {}
             for _p in all_placements:
                 _os = _resolve_original_stem(_p)
                 if not (_os and _os in converted_stems_map) or _os in jetway_models:
@@ -2774,55 +2542,82 @@ def _run_pipeline(opts, hooks):
                 _alat, _alon = geo_transform.local_offset_to_latlon(
                     _p["lat"], _p["lon"], _p["hdg"], _mx, _mz)
                 _stems = converted_stems_map[_os]
-                _gk = (tuple(sorted(_stems)), round(_alat, 6), round(_alon, 6),
-                       round(_p["hdg"], 2), bool(use_pol_polygons))
-                if _gk in _seen_gk:
-                    continue
-                _seen_gk.add(_gk)
-                _tf_jobs.append((_stems, _alat, _alon, _p["hdg"]))
-            if _tf_jobs:
-                _tf_workers = pool_worker_count()
-                hooks.log(f"Terrain-fit pre-warm: {len(_tf_jobs)} unique placement group(s) "
-                         f"across {_tf_workers} process(es)...", "info")
+                _gk = terrain_fit.group_key(_stems, _alat, _alon, _p["hdg"], use_pol_polygons)
+                _jobs.setdefault(_gk, (_stems, _alat, _alon, _p["hdg"], _p.get("height_offset", 0.0) + _my))
+            if _jobs:
+                _workers = pool_worker_count()
                 _obj_dir_s, _xp_s, _skip_d = str(obj_dir), str(xplane_root), bool(use_pol_polygons)
                 _flat_z = terrain_dem.flat_zones()
                 _area = terrain_dem.area()
                 # parse the drawn terrain mesh once here; the workers load it
-                terrain_dem.get_elevation(xplane_root, _tf_jobs[0][1], _tf_jobs[0][2])
+                _first = next(iter(_jobs.values()))
+                terrain_dem.get_elevation(xplane_root, _first[1], _first[2])
                 try:
-                    with ProcessPoolExecutor(max_workers=_tf_workers) as _ex:
+                    _models = {tuple(sorted(j[0])) for j in _jobs.values()}
+                    _extents = {}
+                    with ProcessPoolExecutor(max_workers=_workers) as _ex:
+                        for _f in as_completed([_ex.submit(_model_extent_worker, m, _obj_dir_s) for m in _models]):
+                            _m, _e = _f.result()
+                            _extents[_m] = _e
+
+                    _lats = [j[1] for j in _jobs.values()]
+                    _lons = [j[2] for j in _jobs.values()]
+                    ground = ground_grid.Grid.around((min(_lats) + max(_lats)) / 2, (min(_lons) + max(_lons)) / 2)
+                    _corners = {}
+                    _keys = set()
+                    for _gk, (_st, _la, _lo, _hd, _agl) in _jobs.items():
+                        _e = _extents.get(tuple(sorted(_st)))
+                        _ext = _e if _e is not None else {"x0": 0.0, "x1": 0.0, "z0": 0.0, "z1": 0.0}
+                        _cs = terrain_fit.footprint_corners(_la, _lo, _hd, _ext, margin=ground_grid.SPACING_M)
+                        _corners[_gk] = _cs
+                        _keys |= ground.blocks_touching(min(c[0] for c in _cs), max(c[0] for c in _cs),
+                                                        min(c[1] for c in _cs), max(c[1] for c in _cs))
+                    _keys = sorted(_keys)
+                    _chunk = max(1, len(_keys) // (_workers * 4) + 1)
+                    with ProcessPoolExecutor(max_workers=_workers) as _ex:
+                        _futs = [_ex.submit(_grid_block_worker, _keys[i:i + _chunk], ground.lat0, ground.lon0,
+                                            ground.dlat, ground.dlon, _xp_s, _flat_z, _area)
+                                 for i in range(0, len(_keys), _chunk)]
+                        for _f in as_completed(_futs):
+                            ground.add_blocks(_f.result())
+
+                    def _footprint_area(gk):
+                        e = _extents.get(gk[0])
+                        return 0.0 if e is None else (e["x1"] - e["x0"]) * (e["z1"] - e["z0"])
+                    for _gk in sorted(_jobs, key=_footprint_area, reverse=True):
+                        _st, _la, _lo, _hd, _agl = _jobs[_gk]
+                        _lv = terrain_fit.steep_level(ground, _la, _lo, _hd, _extents.get(tuple(sorted(_st))), _agl)
+                        if _lv is not None:
+                            ground.level(_corners[_gk], _lv)
+                            skirt_levels[_gk] = _lv
+                    hooks.log(f"Ground grid: {len(ground)} block(s) of {ground_grid.SPACING_M:g} m posts around "
+                              f"{len(_jobs)} placement(s); every object is fitted onto it"
+                              + (f", {len(skirt_levels)} building(s) on steep ground kept level with a skirt"
+                                 if skirt_levels else "") + ".", "info")
+
+                    _grid_path = temp_dir / "ground_grid.npz"
+                    ground.save(_grid_path)
+                    with ProcessPoolExecutor(max_workers=_workers) as _ex:
                         _futs = [
-                            _ex.submit(_terrain_fit_group_worker, _st, _la, _lo, _hd,
-                                       _skip_d, _obj_dir_s, _xp_s, _flat_z, _area)
-                            for (_st, _la, _lo, _hd) in _tf_jobs
+                            _ex.submit(_terrain_fit_group_worker, _st, _la, _lo, _hd, _skip_d, _obj_dir_s, _xp_s,
+                                       _flat_z, _area, str(_grid_path), skirt_levels.get(_gk), _agl)
+                            for _gk, (_st, _la, _lo, _hd, _agl) in _jobs.items()
                         ]
                         for _f in as_completed(_futs):
-                            _k, _r, _t = _f.result()
+                            _k, _r, _lift = _f.result()
                             if _r is not None:
                                 precomputed_fits[_k] = _r
-                                # Re-seed the PARENT process's own
-                                # transform cache from the worker's
-                                # result -- see _terrain_fit_group_
-                                # worker's docstring for why this is
-                                # required for the anchor-clustering
-                                # pass below to find anything at all.
-                                if _t is not None:
-                                    terrain_fit._group_transform_cache[_k] = _t
-                    hooks.log(f"Terrain-fit pre-warm complete: {len(precomputed_fits)}/{len(_tf_jobs)} "
-                             f"group(s) computed -- placement loop will read these.", "info")
+                                precomputed_lifts[_k] = _lift
+                    hooks.log(f"Terrain fit: {len(precomputed_fits)}/{len(_jobs)} placement group(s) fitted "
+                              f"across {_workers} process(es).", "info")
                 except Exception as e:
-                    hooks.log(f"Terrain-fit pre-warm pool failed ({e}) -- the placement loop will "
-                             f"compute each fit inline instead.", "warning")
+                    hooks.log(f"Ground grid / terrain fit pool failed ({e}) -- the placement loop will "
+                              f"fit each placement inline instead.", "warning")
                     precomputed_fits = {}
+                    precomputed_lifts = {}
+                    ground, skirt_levels = None, {}
 
-        # Anchor-clustering for terrain-fit: one real-world building
-        # instance can be split across multiple placements from
-        # different source paths (e.g. an SPB-attached exterior shell
-        # and a plain-BGL-placed interior at the same real-world
-        # anchor) that never share a model stem, so they never reach
-        # the same terrain_fit group_key. Collected per-placement
-        # below; resolved into cross-placement corrections in one pass
-        # after this loop, once every placement's own fit is known.
+        # Every converted placement, for the passes after the loop.
         _anchor_cluster_candidates = []
 
         # Per-object exclusion-zone footprints: collected here (real
@@ -2878,33 +2673,20 @@ def _run_pipeline(opts, hooks):
                 generated_stems = converted_stems_map[original_stem]
                 _footprint_exclusion_candidates.append((generated_stems, abs_lat, abs_lon, p["hdg"]))
 
-                # Rigid-object terrain fit: a rigid mesh assumes flat
-                # ground under its whole footprint, but real X-Plane
-                # terrain often isn't (see terrain_fit.py). Computed ONCE
-                # for the whole group of sibling .obj files one model+
-                # placement produced, sharing one footprint bbox and one
-                # sampled correction grid, so they move together as a
-                # single rigid body instead of each sub-object drifting
-                # independently. Only ever swaps in a distinct, per-
-                # placement-corrected copy of each .obj -- never mutates
-                # the shared originals other placements may still use.
-                #
-                # Also applied to AGL-mounted placements: the correction
-                # is already anchor-relative (each vertex's delta is
-                # real-elevation-at-that-vertex minus real-elevation-at-
-                # the-anchor, see _point_elevation_delta/origin_elev), so
-                # it accounts for terrain variation ACROSS the footprint
-                # without double-counting the AGL offset itself, which
-                # only sets the anchor's own height.
-                # Prefer the result the pre-warm pool already computed
-                # for this group; only compute inline on a miss.
-                _fit_gk = (tuple(sorted(generated_stems)), round(abs_lat, 6), round(abs_lon, 6),
-                           round(p["hdg"], 2), bool(use_pol_polygons))
+                # Terrain fit onto the shared ground grid (see the
+                # pre-pass above and terrain_fit.py). Every sibling .obj of
+                # one model+placement is fitted together; a fitted copy
+                # never replaces the shared original other placements use.
+                _fit_gk = terrain_fit.group_key(generated_stems, abs_lat, abs_lon, p["hdg"], use_pol_polygons)
                 fit_results = precomputed_fits.get(_fit_gk)
                 if fit_results is None:
                     fit_results = terrain_fit.get_or_create_fitted_group(
                         obj_dir, generated_stems, abs_lat, abs_lon, p["hdg"], xplane_root,
-                        skip_draped_positions=use_pol_polygons)
+                        skip_draped_positions=use_pol_polygons, grid=ground,
+                        skirt_level=skirt_levels.get(_fit_gk), agl=agl)
+                    ground_lift = terrain_fit.group_lift(_fit_gk)
+                else:
+                    ground_lift = precomputed_lifts.get(_fit_gk, 0.0)
 
                 warned_unavailable_this_group = False
                 group_any_applied = False
@@ -2946,7 +2728,7 @@ def _run_pipeline(opts, hooks):
                     part_is_draped = obj_stem in draped_stems or placed_stem in draped_stems
                     entry = {
                         "name": placed_stem, "lat": abs_lat, "lon": abs_lon, "hdg": p["hdg"],
-                        "agl": 0.0 if part_is_draped else agl,
+                        "agl": 0.0 if part_is_draped else agl + ground_lift,
                     }
                     if footprint_area is not None:
                         entry["footprint_area"] = footprint_area
@@ -2963,7 +2745,7 @@ def _run_pipeline(opts, hooks):
                     "mid_y": mid_y, "model": original_stem, "title": p.get("title") or "",
                     "source": p.get("source") or "", "is_agl": p.get("is_agl"), "alt": p.get("alt"),
                     "any_applied": group_any_applied, "stem_entries": _stem_entries,
-                    "rigid_group": p.get("group"),
+                    "ground_lift": ground_lift,
                 })
 
                 # A model split into many sub-object files (walls/roof/
@@ -3016,140 +2798,6 @@ def _run_pipeline(opts, hooks):
                         rec["positions"].append([round(float(p["lat"]), 7), round(float(p["lon"]), 7)])
                     unmatched_placements.append(p)
 
-        # Resolve anchor clusters: for every bucket of 2+ placements
-        # sharing a real-world anchor (position + heading, rounded to
-        # ~1m/0.1 degree -- tight on purpose, this only needs to catch
-        # "the same real-world instance decoded via two different
-        # paths", not "buildings near each other") but DIFFERENT model
-        # stems (so they never shared a terrain_fit group_key),
-        # propagate whichever member's vertical shift actually got
-        # applied onto every other member that came back disqualified/
-        # rigid_skip/negligible on its own. See terrain_fit.
-        # apply_shared_shift_to_group's own docstring for why sharing
-        # one anchor point makes reusing the identical shift correct
-        # regardless of each object's own local-frame convention.
-        #
-        # Bucket key is the RAW placement anchor (p["lat"]/p["lon"]),
-        # not each candidate's own recenter-compensated abs_lat/
-        # abs_lon: two placements from the same BGL/SPB record share
-        # the raw anchor exactly, but each is an independent source
-        # model with its own mesh_convert recenter offset, so their
-        # compensated positions differ by design and won't reliably
-        # land in the same rounded bucket.
-        _anchor_buckets = {}
-        for cand in _anchor_cluster_candidates:
-            key = (round(cand["raw_lat"], 5), round(cand["raw_lon"], 5), round(cand["hdg"], 1))
-            _anchor_buckets.setdefault(key, []).append(cand)
-
-        _linked_count = 0
-        _multi_group_buckets = [b for b in _anchor_buckets.values() if len({c["group_key"] for c in b}) >= 2]
-        if _multi_group_buckets:
-            _with_ref = sum(1 for b in _multi_group_buckets if any(c["any_applied"] for c in b))
-            hooks.log(f"Anchor clustering: {len(_multi_group_buckets)} real-world anchor(s) are shared by "
-                     f"2+ differently-named placements ({_with_ref} of them have at least one member with "
-                     f"an applied terrain-fit shift to share with the others).", "info")
-        for bucket in _anchor_buckets.values():
-            distinct_gks = {c["group_key"] for c in bucket}
-            if len(distinct_gks) < 2:
-                continue
-            # CONFIRMED REAL REGRESSION: picking "whichever member
-            # happened to independently qualify first" as the
-            # reference, then only overwriting members that came back
-            # disqualified, was correct back when a small sibling part
-            # (glass shell, interior, attached canopy) could never
-            # independently qualify at all -- terrain_fit's own former
-            # footprint size gate guaranteed only the genuinely large
-            # part of a split building ever got its own shift, so
-            # every other part always fell through to share it. Now
-            # that gate is gone (see terrain_fit.py's own docstring),
-            # a small sibling routinely qualifies on its own too --
-            # from a much smaller, noisier sample grid than its
-            # sibling's -- and the old "already applied -> never
-            # touch it" rule let that noisy number stand uncontested,
-            # producing two parts of ONE real building moving by two
-            # different amounts (the reported "half the building
-            # underground, like it's tilted" symptom). Fix: always
-            # pick the member with the LARGEST sampled footprint as
-            # the anchor's one canonical shift (more ground sampled
-            # -> less exposed to a single DEM/DSF spike), and apply
-            # that same number to EVERY member at this anchor,
-            # overriding even ones that already applied their own --
-            # a shared real-world anchor is one physical object; it
-            # must move as one rigid body, not each decoded part
-            # trusting its own independent estimate.
-            best_gk, best_transform, best_area = None, None, -1.0
-            for gk in distinct_gks:
-                t = terrain_fit.get_cached_transform(gk)
-                if t is None or t.get("vertical_shift") is None:
-                    continue
-                area = t.get("footprint_area_m2", 0.0)
-                if area > best_area:
-                    best_gk, best_transform, best_area = gk, t, area
-            if best_transform is None:
-                continue
-
-            for cand in bucket:
-                if cand["group_key"] == best_gk:
-                    continue
-                # A stem that already got the module's own precise
-                # per-vertex warp (applied_rigid_warp -- small
-                # footprint or real local slope, see terrain_fit.py's
-                # own docstring) must NOT be overridden here: it
-                # already sampled real terrain at its own vertices,
-                # which is strictly more accurate than borrowing the
-                # canonical sibling's single averaged shift value.
-                # Only a plain shift (or no correction at all) is
-                # worth replacing with a more reliable shared number.
-                linkable_stems = [
-                    stem for stem, (entry, fit_applied, part_is_draped, fit_reason) in cand["stem_entries"].items()
-                    if not part_is_draped and fit_reason != "applied_rigid_warp"
-                ]
-                if not linkable_stems:
-                    continue
-                # No anchor-delta bookkeeping needed here (unlike the
-                # rotation this replaced): the shift is a property of
-                # the shared real-world anchor point, not of either
-                # candidate's own local-frame convention -- see
-                # apply_shared_shift_to_group's own docstring. Always
-                # starts from each stem's ORIGINAL unwarped geometry
-                # (_load_ir there is keyed by the original obj_stem,
-                # not any prior per-group correction), so overriding
-                # an already-applied member replaces its shift rather
-                # than stacking a second one on top.
-                linked_results = terrain_fit.apply_shared_shift_to_group(
-                    obj_dir, linkable_stems, best_transform, xplane_root)
-                for stem in linkable_stems:
-                    new_name, linked_applied, _linked_reason = linked_results[stem]
-                    if linked_applied:
-                        entry, _, _, _ = cand["stem_entries"][stem]
-                        entry["name"] = new_name
-                        cand["linked_shift"] = best_transform["vertical_shift"]
-                        _linked_count += 1
-
-        if _linked_count:
-            hooks.log(f"{_linked_count} placement sub-object(s) linked to a sibling placement's terrain-fit "
-                     f"shift at the same real-world anchor.", "info")
-
-        # Seats, people, counters... inside a building: on its floor, not
-        # on the X-Plane ground under each of them (see host_floor.py).
-        if xplane_root is not None and _anchor_cluster_candidates:
-            try:
-                _gc, _go = _level_rigid_groups(_anchor_cluster_candidates, xplane_root)
-                if _go:
-                    hooks.log(f"{_go} object(s) of {_gc} placed container cluster(s) set as rigid builds: one "
-                              f"ground level each, every object at its MSFS height, none fitted on its own.",
-                              "info")
-                _parts = _attach_parts_to_buildings(_anchor_cluster_candidates, obj_dir, xplane_root)
-                if _parts:
-                    hooks.log(f"{_parts} building part(s) placed with their building's terrain fit, so the "
-                              f"parts of one building meet.", "info")
-                _hosts, _on_floor = _place_props_on_host_floors(_anchor_cluster_candidates, obj_dir, xplane_root)
-                if _on_floor:
-                    hooks.log(f"{_on_floor} placement(s) inside {_hosts} building(s) set on their building's "
-                              f"floor instead of the terrain under them.", "info")
-            except Exception as e:
-                hooks.log(f"(couldn't set props on their buildings' floors: {e})", "warning")
-
         # Flat objects on the airport ground hover over X-Plane's terrain:
         # small ones are dropped, large sheets draped (runway_clutter.py).
         if opts.remove_runway_clutter and apt_native.is_usable(native_airport_layout):
@@ -3180,7 +2828,7 @@ def _run_pipeline(opts, hooks):
         # Looping paths (vehicles driving round) follow the X-Plane ground.
         if xplane_root is not None:
             try:
-                _paths = _paths_on_terrain(dsf_tiles, obj_dir, xplane_root)
+                _paths = _paths_on_terrain(dsf_tiles, obj_dir, _ground_at(ground, xplane_root))
                 if _paths:
                     hooks.log(f"{_paths} moving object(s) set to follow the terrain along their path.", "info")
             except Exception as e:

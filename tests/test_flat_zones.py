@@ -16,7 +16,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
 from dsf_fixture import build_elevation_dsf  # noqa: E402
 import test_terrain_fit  # noqa: E402  (module, not the class: unittest would re-run it here)
 
-import mesh_convert
 
 
 def _write_bumpy_terrain(root, tile_lat, tile_lon, bump_scale):
@@ -35,7 +34,8 @@ class TestFlatZones(unittest.TestCase):
     def tearDown(self):
         terrain_dem.set_flat_zones([])
         terrain_fit._group_cache.clear()
-        terrain_fit._group_transform_cache.clear()
+        terrain_fit._lift_cache.clear()
+        terrain_fit._ir_cache.clear()
 
     def test_inside_reports_the_zone_level_outside_the_raster(self):
         with tempfile.TemporaryDirectory() as td:
@@ -64,15 +64,14 @@ class TestFlatZones(unittest.TestCase):
             xplane_root = td / "XPlaneRoot"
             _write_bumpy_terrain(xplane_root, 47, 8, bump_scale=1500.0)
             obj_dir = td / "objects"
-            tex_dir = td / "textures"
             obj_dir.mkdir()
-            tex_dir.mkdir()
-            glb = td / "building.glb"
-            test_terrain_fit.TestTerrainFit._build_box_glb(None, glb, "BigBuilding", "BuildingTex", half_size=15.0)
-            stem = mesh_convert.convert(glb, obj_dir, tex_dir, tex_dir, "0.0", "0.0", "0.0")[0].stem
+            test_terrain_fit._save(obj_dir, test_terrain_fit._quad_ir("BigBuilding", 15, 15, walls=6.0))
+            stem = "BigBuilding"
 
             # the same building on the same bump IS fitted without the zone
-            # (test_terrain_fit.test_large_building_on_steep_terrain_gets_the_precise_warp)
+            self.assertTrue(terrain_fit.get_or_create_fitted_group(
+                obj_dir, [stem], 47.5, 8.5, 0.0, xplane_root)[stem][1])
+            terrain_fit._group_cache.clear()
             terrain_dem.set_flat_zones([(SQUARE, 30.0)])
             result_stem, applied, reason = terrain_fit.get_or_create_fitted_group(
                 obj_dir, [stem], 47.5, 8.5, 0.0, xplane_root)[stem]

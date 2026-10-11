@@ -2316,14 +2316,9 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
     # same amount no matter how well the single-point-sampled tilt is
     # fit). That's exactly the more common real problem (confirmed: an
     # un-rotated object sitting at a flat-out wrong height, not a tilted
-    # one) and terrain_fit.py's own uniform vertical SHIFT already exists
-    # to fix it correctly, with real multi-point sampling + outlier
-    # rejection -- CONFIRMED bug this replaces: the shift used to be
-    # gated to only large objects (>=300m2), leaving TILTED as the ONLY
-    # correction for anything smaller, silently failing on exactly the
-    # anchor-offset case it can't fix. TILTED is never written anywhere
-    # now; terrain_fit.py's shift applies to every qualifying rigid group
-    # regardless of size instead (see its own module docstring).
+    # one) and terrain_fit.py fits every placed object onto the shared
+    # ground grid vertex by vertex instead (see its module docstring), so
+    # TILTED is never written anywhere now.
     #
     # file_is_rigid is still needed on its own: it also gates horizontal
     # re-centering (a rigid/non-draped-only step -- draped multi-layer
@@ -2653,8 +2648,8 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                         # for material_stats/debugging); the material falls
                         # through to the normal rigid path, so it renders and
                         # -- like every other rigid object since TILTED was
-                        # removed -- is eligible for terrain_fit's vertical
-                        # shift if its group qualifies. For
+                        # removed -- is fitted onto the ground grid by
+                        # terrain_fit like everything else. For
                         # material_stats in compute_file_flatness_and_
                         # reference's own docstring for the full real-world
                         # case this covers -- ground-layer models with one
@@ -3488,9 +3483,9 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
     # footprint center, and lift it so its lowest point sits at Y=0 if any
     # vertex is below that -- a sensible, predictable local origin instead
     # of leaving the pivot wherever the source export's arbitrary local
-    # origin was, independent of whatever terrain_fit.py's uniform shift
-    # later does with the whole rigid object (a pure translation, so it
-    # doesn't care where the local origin sits).
+    # origin was, independent of terrain_fit.py's later fit (which works
+    # in placed positions, so it doesn't care where the local origin
+    # sits).
     #
     # Must NOT double-move rotation-animated sub-objects: their vertices
     # are already stored PIVOT-relative (see anim_pivot handling above),
@@ -4012,11 +4007,9 @@ def convert(glb_path, objects_dir, textures_dir, external_textures_dir, pitch=0.
                 indices=np.array(flat_indices, dtype=np.int64),
                 texture=(f"../textures/{builder.texture_name}" if builder.texture_name else None),
                 # TILTED is never written (see file_is_rigid's own
-                # comment above) -- terrain_fit.py's uniform vertical
-                # shift replaces it for every qualifying rigid group
-                # regardless of size, draped siblings get the per-vertex
-                # warp, and this field just has to agree with what
-                # actually got written to the .obj (nothing).
+                # comment above) -- terrain_fit.py's ground-grid fit
+                # replaces it, and this field just has to agree with
+                # what actually got written to the .obj (nothing).
                 tilted=False,
                 draped=builder_is_draped,
                 draped_layer_offset=(draped_layer_offsets.get(builder_key) if builder_is_draped else None),
